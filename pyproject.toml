@@ -1,0 +1,9 @@
+[project]
+name = "quant-futures-system"
+version = "0.1.0"
+description = "Crypto perpetual futures quantitative trading system"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
