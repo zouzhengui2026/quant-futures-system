@@ -1,4 +1,4 @@
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -200,8 +200,42 @@ def test_engine_rejects_invalid_input_or_policy_output_without_publishing() -> N
         def decide(self, candidate: AlphaCandidate) -> DecisionIntent:
             other = candidate_for(generated_at=GENERATED_AT - timedelta(hours=1))
             return intent_for(other, policy_name=self.name)
-    with pytest.raises(ValueError, match="input alpha candidate"):
+    with pytest.raises(ValueError, match="input AlphaCandidate object"):
         DecisionEngine(bus, policy=OtherCandidate()).decide(candidate_for())
+    assert received == []
+
+
+def test_engine_rejects_policy_renaming_itself_during_decide_without_publishing() -> None:
+    bus, received, candidate = EventBus(), [], candidate_for()
+    bus.subscribe(EventType.DECISION_CREATED, received.append)
+
+    class RenamingPolicy:
+        name = "before"
+
+        def decide(self, supplied: AlphaCandidate) -> DecisionIntent:
+            self.name = "after"
+            return intent_for(supplied, policy_name="before")
+
+    with pytest.raises(ValueError, match="must not change during decide"):
+        DecisionEngine(bus, policy=RenamingPolicy()).decide(candidate)
+    assert received == []
+
+
+def test_engine_requires_the_same_alpha_candidate_object_without_publishing() -> None:
+    bus, received, candidate = EventBus(), [], candidate_for()
+    bus.subscribe(EventType.DECISION_CREATED, received.append)
+    clone = replace(candidate)
+    assert clone == candidate
+    assert clone is not candidate
+
+    class CloningPolicy:
+        name = "cloning"
+
+        def decide(self, supplied: AlphaCandidate) -> DecisionIntent:
+            return intent_for(clone, policy_name=self.name)
+
+    with pytest.raises(ValueError, match="input AlphaCandidate object"):
+        DecisionEngine(bus, policy=CloningPolicy()).decide(candidate)
     assert received == []
 
 
