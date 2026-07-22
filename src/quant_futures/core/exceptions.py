@@ -11,3 +11,7 @@ class DomainValidationError(QuantFuturesError, ValueError):
 
 class EventBusError(QuantFuturesError):
     """Raised for invalid event bus operations."""
+
+
+class MarketDataError(QuantFuturesError):
+    """Raised when market data cannot be normalized or safely collected."""

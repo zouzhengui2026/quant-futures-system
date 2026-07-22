@@ -28,6 +28,8 @@ class EventType(str, Enum):
     extension without requiring a core release.
     """
 
+    MARKET_DATA_RECEIVED = "market_data.received"
+    MARKET_DATA_REJECTED = "market_data.rejected"
     MARKET_SNAPSHOT = "observation.market_snapshot"
     OBSERVATION_UPDATED = "observation.updated"
     ALPHA_GENERATED = "alpha.generated"

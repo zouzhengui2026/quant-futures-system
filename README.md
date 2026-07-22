@@ -36,7 +36,11 @@ Attribution & Improvement
 
 ## Development Status
 
-Phase 0: Architecture and trading principles.
+Phase 2: A read-only market-data collection boundary is available. It accepts
+validated, exchange-neutral OHLCV, funding, open-interest, mark/index-price,
+liquidation, and instrument-metadata observations, stores their latest values,
+and emits runtime events. Exchange adapters remain read-only; no order or
+trading capability exists.
 
 No live trading capability exists at this stage.
 
