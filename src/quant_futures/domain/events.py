@@ -1,14 +1,11 @@
-"""Domain events.
+"""Backward-compatible domain event imports.
 
-All important system decisions will become auditable events.
+Runtime events are defined in :mod:`quant_futures.core.events` so all layers
+share one transport-neutral event contract.
 """
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from quant_futures.core.events import Event
 
+SystemEvent = Event
 
-@dataclass(frozen=True)
-class SystemEvent:
-    event_type: str
-    payload: dict
-    timestamp: datetime = datetime.now(timezone.utc)
+__all__ = ["Event", "SystemEvent"]
