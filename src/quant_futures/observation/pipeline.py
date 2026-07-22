@@ -30,8 +30,8 @@ class ObservationPipeline:
             source="derived",
             price=price,
             trend_regime={
-                MarketRegime.TREND_UP: TrendRegime.UP,
-                MarketRegime.TREND_DOWN: TrendRegime.DOWN,
+                MarketRegime.TREND_UP: TrendRegime.UPTREND,
+                MarketRegime.TREND_DOWN: TrendRegime.DOWNTREND,
             }.get(regime, TrendRegime.RANGE),
             volatility_regime=(
                 VolatilityRegime.HIGH if features.volatility_level > 0.7 else VolatilityRegime.NORMAL

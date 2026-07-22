@@ -36,7 +36,7 @@ def test_regime_detector_classifies_all_three_dimensions() -> None:
     moved = builder.build(record({"price": 105.0, "high": 110.0, "low": 100.0, "bid": 90.0, "ask": 110.0}))
     regimes = RegimeDetector().detect_regimes(moved)
 
-    assert regimes.trend is TrendRegime.UP
+    assert regimes.trend is TrendRegime.UPTREND
     assert regimes.volatility is VolatilityRegime.HIGH
     assert regimes.liquidity is LiquidityRegime.STRESSED
     assert features.liquidity_stress > 0
@@ -61,3 +61,8 @@ def test_engine_returns_observation_and_publishes_created_event() -> None:
 def test_engine_requires_a_price_field() -> None:
     with pytest.raises(ValueError, match="positive"):
         ObservationEngine(EventBus()).observe(record({"volume": 10.0}))
+
+
+def test_short_trend_regime_names_remain_compatible_aliases() -> None:
+    assert TrendRegime.UP is TrendRegime.UPTREND
+    assert TrendRegime.DOWN is TrendRegime.DOWNTREND

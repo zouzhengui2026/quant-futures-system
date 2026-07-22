@@ -56,8 +56,8 @@ class RegimeDetector:
     def detect_regimes(self, features: MarketFeatures) -> RegimeSnapshot:
         """Detect independent trend, volatility, and liquidity regimes."""
         trend = (
-            TrendRegime.UP if features.price_return >= self.trend_threshold else
-            TrendRegime.DOWN if features.price_return <= -self.trend_threshold else TrendRegime.RANGE
+            TrendRegime.UPTREND if features.price_return >= self.trend_threshold else
+            TrendRegime.DOWNTREND if features.price_return <= -self.trend_threshold else TrendRegime.RANGE
         )
         volatility = (
             VolatilityRegime.HIGH if features.volatility_level >= self.high_volatility_threshold else
@@ -76,8 +76,8 @@ class RegimeDetector:
         regimes = self.detect_regimes(features)
         if regimes.volatility is VolatilityRegime.HIGH and regimes.liquidity is LiquidityRegime.STRESSED:
             return RegimeResult(MarketRegime.PANIC, 0.8)
-        if regimes.trend is TrendRegime.UP:
+        if regimes.trend is TrendRegime.UPTREND:
             return RegimeResult(MarketRegime.TREND_UP, 0.7)
-        if regimes.trend is TrendRegime.DOWN:
+        if regimes.trend is TrendRegime.DOWNTREND:
             return RegimeResult(MarketRegime.TREND_DOWN, 0.7)
         return RegimeResult(MarketRegime.RANGE, 0.5)

@@ -13,9 +13,13 @@ from quant_futures.core.exceptions import DomainValidationError
 class TrendRegime(str, Enum):
     """Describes directionality only; it is not a trading recommendation."""
 
-    UP = "trend_up"
-    DOWN = "trend_down"
+    UPTREND = "trend_up"
+    DOWNTREND = "trend_down"
     RANGE = "range"
+
+    # Legacy aliases preserve callers that used the original short names.
+    UP = UPTREND
+    DOWN = DOWNTREND
 
 
 class VolatilityRegime(str, Enum):

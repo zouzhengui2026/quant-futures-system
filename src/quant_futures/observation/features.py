@@ -29,7 +29,9 @@ class FeatureBuilder:
 
     The builder keeps the prior price and volume per source/symbol, allowing it
     to calculate a simple return and relative volume without external services.
-    Missing optional fields deliberately produce neutral values.
+    ``_previous_price`` and ``_previous_volume`` are intentionally short-lived
+    runtime state: they are not a historical database and are reset with the
+    builder instance. Missing optional fields deliberately produce neutral values.
     """
 
     def __init__(self) -> None:
