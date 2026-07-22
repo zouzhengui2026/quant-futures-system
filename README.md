@@ -39,3 +39,9 @@ Attribution & Improvement
 Phase 0: Architecture and trading principles.
 
 No live trading capability exists at this stage.
+
+## Runtime Communication
+
+`EventBus` is an internal, in-process runtime communication mechanism for
+decoupling system layers. It transports events between components but does not
+connect to exchanges, submit orders, or perform trading execution.

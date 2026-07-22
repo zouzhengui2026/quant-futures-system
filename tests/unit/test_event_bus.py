@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from quant_futures.core.events import Event, EventBus
+from quant_futures.core.events import Event, EventBus, EventType
 from quant_futures.core.exceptions import EventBusError
 
 
@@ -15,6 +15,16 @@ def test_event_bus_delivers_events_to_subscribers() -> None:
 
     assert bus.publish(event) == 1
     assert received == [event]
+
+
+def test_event_bus_accepts_centralized_event_type() -> None:
+    bus = EventBus()
+    received: list[Event] = []
+
+    bus.subscribe(EventType.RISK_UPDATED, received.append)
+
+    assert bus.publish(Event(EventType.RISK_UPDATED)) == 1
+    assert received[0].event_type is EventType.RISK_UPDATED
 
 
 def test_event_bus_unsubscribe_stops_delivery() -> None:
