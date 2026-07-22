@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from quant_futures.observation.features import MarketFeatures
 from quant_futures.observation.pipeline import ObservationPipeline
@@ -22,7 +22,7 @@ def test_observation_pipeline_builds_state():
         ),
         regime=MarketRegime.TREND_UP,
         flow_state=FlowState.HEALTHY_EXPANSION,
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
     )
 
     assert observation.symbol == "BTCUSDT"
