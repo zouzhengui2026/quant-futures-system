@@ -78,6 +78,11 @@ def test_alpha_candidate_rejects_naive_datetime() -> None:
         candidate_for(timing(), generated_at=datetime(2026, 1, 1))
 
 
+def test_alpha_candidate_rejects_nonzero_strength_for_neutral_direction() -> None:
+    with pytest.raises(ValueError, match="neutral candidates"):
+        candidate_for(timing(), direction=AlphaDirection.NEUTRAL, strength=0.1)
+
+
 def test_alpha_candidate_rejects_mismatched_timing_observation() -> None:
     assessment = timing()
     with pytest.raises(ValueError, match="match timing_assessment.observation"):
@@ -118,6 +123,12 @@ def test_baseline_strength_and_confidence_are_deterministic_and_bounded() -> Non
     assert 0.0 <= first.confidence <= 1.0
 
 
+@pytest.mark.parametrize("invalid_strength", [float("nan"), float("inf"), float("-inf"), True, "invalid"])
+def test_baseline_rejects_non_finite_or_non_numeric_trend_strength(invalid_strength: object) -> None:
+    with pytest.raises(ValueError, match="trend_strength"):
+        RegimeDirectionalAlphaModel().generate(timing(strength=invalid_strength))  # type: ignore[arg-type]
+
+
 def test_engine_publishes_alpha_generated_event() -> None:
     bus = EventBus()
     received = []
@@ -145,12 +156,47 @@ def test_engine_accepts_injected_alpha_model() -> None:
         name = "custom"
 
         def generate(self, timing: TimingAssessment) -> AlphaCandidate:
-            return candidate_for(timing, model_name=self.name, direction=AlphaDirection.NEUTRAL)
+            return candidate_for(timing, model_name=self.name, direction=AlphaDirection.NEUTRAL, strength=0.0)
 
     candidate = AlphaEngine(EventBus(), model=CustomModel()).generate(assessment)
 
     assert candidate.model_name == "custom"
     assert candidate.direction is AlphaDirection.NEUTRAL
+
+
+def test_engine_rejects_forged_model_attribution_without_publishing_event() -> None:
+    assessment = timing()
+    bus = EventBus()
+    received = []
+    bus.subscribe(EventType.ALPHA_GENERATED, received.append)
+
+    class ForgedNameModel:
+        name = "configured-model"
+
+        def generate(self, timing: TimingAssessment) -> AlphaCandidate:
+            return candidate_for(timing, model_name="forged-model")
+
+    with pytest.raises(ValueError, match="model_name must match"):
+        AlphaEngine(bus, model=ForgedNameModel()).generate(assessment)
+
+    assert received == []
+
+
+def test_engine_rejects_model_without_non_empty_name_without_publishing_event() -> None:
+    bus = EventBus()
+    received = []
+    bus.subscribe(EventType.ALPHA_GENERATED, received.append)
+
+    class UnnamedModel:
+        name = ""
+
+        def generate(self, timing: TimingAssessment) -> AlphaCandidate:
+            return candidate_for(timing)
+
+    with pytest.raises(ValueError, match="AlphaModel.name"):
+        AlphaEngine(bus, model=UnnamedModel()).generate(timing())
+
+    assert received == []
 
 
 def test_alpha_candidate_has_no_decision_risk_or_execution_fields() -> None:

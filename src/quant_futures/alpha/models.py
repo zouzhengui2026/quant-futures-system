@@ -53,6 +53,8 @@ class AlphaCandidate:
         self._validate_timestamp("generated_at", self.generated_at)
         self._validate_score("strength", self.strength)
         self._validate_score("confidence", self.confidence)
+        if self.direction is AlphaDirection.NEUTRAL and self.strength != 0.0:
+            raise DomainValidationError("neutral candidates must have strength equal to 0.0")
         if not isinstance(self.reasons, tuple) or not self.reasons:
             raise DomainValidationError("reasons must be a non-empty tuple")
         if not all(isinstance(reason, str) and reason.strip() for reason in self.reasons):
