@@ -32,6 +32,7 @@ class EventType(str, Enum):
     MARKET_DATA_REJECTED = "market_data.rejected"
     MARKET_SNAPSHOT = "observation.market_snapshot"
     OBSERVATION_UPDATED = "observation.updated"
+    OBSERVATION_CREATED = "observation.created"
     ALPHA_GENERATED = "alpha.generated"
     DECISION_CREATED = "decision.created"
     RISK_UPDATED = "risk.updated"

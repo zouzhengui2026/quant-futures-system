@@ -1,21 +1,9 @@
-from dataclasses import dataclass
-from datetime import datetime
+"""Deprecated compatibility module; canonical observation models live in ``models``.
 
+This module defines no models and only re-exports ``MarketObservation`` for
+existing callers. New code must import from :mod:`quant_futures.observation.models`.
+"""
 
-@dataclass(frozen=True)
-class MarketObservation:
-    """Aggregated market state.
+from quant_futures.observation.models import MarketObservation
 
-    This object represents the system's observation of the market,
-    not a trading decision.
-    """
-
-    symbol: str
-    price: float
-    trend_state: str
-    volatility_state: str
-    funding_state: str
-    open_interest_state: str
-    liquidity_state: str
-    crowding_state: str
-    timestamp: datetime
+__all__ = ["MarketObservation"]

@@ -3,7 +3,9 @@ from dataclasses import dataclass
 from quant_futures.observation.features import MarketFeatures
 from quant_futures.observation.flow import FlowState
 from quant_futures.observation.regime import MarketRegime
-from quant_futures.observation.state import MarketObservation
+from quant_futures.observation.models import (
+    LiquidityRegime, MarketObservation, TrendRegime, VolatilityRegime,
+)
 
 
 @dataclass
@@ -25,13 +27,19 @@ class ObservationPipeline:
     ) -> MarketObservation:
         return MarketObservation(
             symbol=symbol,
+            source="derived",
             price=price,
-            trend_state=regime.value,
-            volatility_state=self._volatility_state(features),
-            funding_state=self._funding_state(features),
-            open_interest_state=self._oi_state(features),
-            liquidity_state=self._liquidity_state(features),
-            crowding_state=self._crowding_state(features, flow_state),
+            trend_regime={
+                MarketRegime.TREND_UP: TrendRegime.UPTREND,
+                MarketRegime.TREND_DOWN: TrendRegime.DOWNTREND,
+            }.get(regime, TrendRegime.RANGE),
+            volatility_regime=(
+                VolatilityRegime.HIGH if features.volatility_level > 0.7 else VolatilityRegime.NORMAL
+            ),
+            liquidity_regime=(
+                LiquidityRegime.STRESSED if features.liquidity_stress > 0.7 else LiquidityRegime.LIQUID
+            ),
+            features=features,
             timestamp=timestamp,
         )
 
