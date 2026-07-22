@@ -18,6 +18,8 @@ class TimingStatusFilter:
     def classify(self, evaluations: Sequence[RuleEvaluation]) -> TimingStatus:
         if not evaluations:
             raise ValueError("at least one rule evaluation is required")
+        if not all(isinstance(evaluation, RuleEvaluation) for evaluation in evaluations):
+            raise TypeError("evaluations must contain RuleEvaluation instances")
         if any(evaluation.outcome is RuleOutcome.FAIL for evaluation in evaluations):
             return TimingStatus.UNFAVORABLE
         if all(evaluation.outcome is RuleOutcome.PASS for evaluation in evaluations):

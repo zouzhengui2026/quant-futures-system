@@ -87,3 +87,31 @@ def test_engine_waits_for_unconfirmed_conditions_and_rejects_unsafe_ones() -> No
 
     assert waiting.status is TimingStatus.WAITING
     assert unfavorable.status is TimingStatus.UNFAVORABLE
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("status", "favorable", "TimingStatus"),
+        ("evaluations", [], "non-empty tuple"),
+        ("assessed_at", datetime(2026, 1, 1), "timezone-aware"),
+    ],
+)
+def test_timing_assessment_rejects_invalid_fields(field: str, value: object, message: str) -> None:
+    item = observation()
+    fields: dict[str, object] = {
+        "observation": item,
+        "status": TimingStatus.FAVORABLE,
+        "evaluations": (TrendAlignmentRule().evaluate(item),),
+        "assessed_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+    }
+    fields[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        TimingAssessment(**fields)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("rule", [TrendAlignmentRule(), VolatilityConditionRule(), LiquidityConditionRule()])
+def test_rules_reject_invalid_observation(rule: object) -> None:
+    with pytest.raises(TypeError, match="MarketObservation"):
+        rule.evaluate(None)  # type: ignore[union-attr]

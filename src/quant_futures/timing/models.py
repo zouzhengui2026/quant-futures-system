@@ -44,10 +44,12 @@ class RuleEvaluation:
     reason: str
 
     def __post_init__(self) -> None:
-        if not self.rule.strip():
-            raise DomainValidationError("rule must not be empty")
-        if not self.reason.strip():
-            raise DomainValidationError("reason must not be empty")
+        if not isinstance(self.rule, str) or not self.rule.strip():
+            raise DomainValidationError("rule must be a non-empty string")
+        if not isinstance(self.outcome, RuleOutcome):
+            raise DomainValidationError("outcome must be a RuleOutcome")
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise DomainValidationError("reason must be a non-empty string")
 
     @property
     def passed(self) -> bool:
@@ -70,10 +72,14 @@ class TimingAssessment:
     def __post_init__(self) -> None:
         if not isinstance(self.observation, MarketObservation):
             raise DomainValidationError("observation must be a MarketObservation")
-        if not self.evaluations:
-            raise DomainValidationError("evaluations must not be empty")
-        if self.assessed_at.tzinfo is None:
-            raise DomainValidationError("assessed_at must be timezone-aware")
+        if not isinstance(self.status, TimingStatus):
+            raise DomainValidationError("status must be a TimingStatus")
+        if not isinstance(self.evaluations, tuple) or not self.evaluations:
+            raise DomainValidationError("evaluations must be a non-empty tuple")
+        if not all(isinstance(evaluation, RuleEvaluation) for evaluation in self.evaluations):
+            raise DomainValidationError("evaluations must contain RuleEvaluation instances")
+        if not isinstance(self.assessed_at, datetime) or self.assessed_at.tzinfo is None:
+            raise DomainValidationError("assessed_at must be a timezone-aware datetime")
 
     @property
     def state(self) -> TimingStatus:

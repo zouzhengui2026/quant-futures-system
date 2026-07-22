@@ -14,6 +14,11 @@ from quant_futures.observation.models import (
 from .models import RuleEvaluation, RuleOutcome
 
 
+def _require_observation(observation: MarketObservation) -> None:
+    if not isinstance(observation, MarketObservation):
+        raise TypeError("evaluate expects a MarketObservation")
+
+
 class TimingRule(Protocol):
     """Protocol implemented by rules that inspect a market observation."""
 
@@ -27,6 +32,7 @@ class TrendAlignmentRule:
     name = "trend_alignment"
 
     def evaluate(self, observation: MarketObservation) -> RuleEvaluation:
+        _require_observation(observation)
         if observation.trend_regime in (TrendRegime.UPTREND, TrendRegime.DOWNTREND):
             return RuleEvaluation(self.name, RuleOutcome.PASS, "market has a directional trend regime")
         return RuleEvaluation(self.name, RuleOutcome.NEUTRAL, "market is range-bound; await directional alignment")
@@ -38,6 +44,7 @@ class VolatilityConditionRule:
     name = "volatility_condition"
 
     def evaluate(self, observation: MarketObservation) -> RuleEvaluation:
+        _require_observation(observation)
         if observation.volatility_regime is VolatilityRegime.NORMAL:
             return RuleEvaluation(self.name, RuleOutcome.PASS, "volatility is within the normal range")
         if observation.volatility_regime is VolatilityRegime.HIGH:
@@ -51,6 +58,7 @@ class LiquidityConditionRule:
     name = "liquidity_condition"
 
     def evaluate(self, observation: MarketObservation) -> RuleEvaluation:
+        _require_observation(observation)
         if observation.liquidity_regime is LiquidityRegime.LIQUID:
             return RuleEvaluation(self.name, RuleOutcome.PASS, "market liquidity is sufficient")
         if observation.liquidity_regime is LiquidityRegime.STRESSED:
