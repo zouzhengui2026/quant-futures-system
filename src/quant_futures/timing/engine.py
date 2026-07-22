@@ -38,6 +38,7 @@ class TimingEngine:
             status=self.status_filter.classify(evaluations),
             evaluations=evaluations,
             assessed_at=self.clock(),
+            confidence=self.status_filter.confidence(evaluations),
         )
         self.event_bus.publish(Event(TIMING_CREATED, {"assessment": assessment, "observation": observation}))
         return assessment

@@ -16,10 +16,7 @@ class TimingStatusFilter:
     """
 
     def classify(self, evaluations: Sequence[RuleEvaluation]) -> TimingStatus:
-        if not evaluations:
-            raise ValueError("at least one rule evaluation is required")
-        if not all(isinstance(evaluation, RuleEvaluation) for evaluation in evaluations):
-            raise TypeError("evaluations must contain RuleEvaluation instances")
+        self._validate_evaluations(evaluations)
         if any(evaluation.outcome is RuleOutcome.FAIL for evaluation in evaluations):
             return TimingStatus.UNFAVORABLE
         if all(evaluation.outcome is RuleOutcome.PASS for evaluation in evaluations):
@@ -27,3 +24,20 @@ class TimingStatusFilter:
         if any(evaluation.outcome is RuleOutcome.PASS for evaluation in evaluations):
             return TimingStatus.WATCHING
         return TimingStatus.WAITING
+
+    def confidence(self, evaluations: Sequence[RuleEvaluation]) -> float:
+        """Return the deterministic mean readiness score of rule outcomes.
+
+        Passing conditions contribute ``1.0``, neutral descriptions contribute
+        ``0.5``, and blocking safety failures contribute ``0.0``.
+        """
+        self._validate_evaluations(evaluations)
+        scores = {RuleOutcome.PASS: 1.0, RuleOutcome.NEUTRAL: 0.5, RuleOutcome.FAIL: 0.0}
+        return sum(scores[evaluation.outcome] for evaluation in evaluations) / len(evaluations)
+
+    @staticmethod
+    def _validate_evaluations(evaluations: Sequence[RuleEvaluation]) -> None:
+        if not evaluations:
+            raise ValueError("at least one rule evaluation is required")
+        if not all(isinstance(evaluation, RuleEvaluation) for evaluation in evaluations):
+            raise TypeError("evaluations must contain RuleEvaluation instances")

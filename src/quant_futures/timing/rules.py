@@ -39,7 +39,7 @@ class TrendAlignmentRule:
 
 
 class VolatilityConditionRule:
-    """Prefer normal volatility and reject a high-volatility environment."""
+    """Describe volatility without treating high volatility as a safety failure."""
 
     name = "volatility_condition"
 
@@ -48,8 +48,8 @@ class VolatilityConditionRule:
         if observation.volatility_regime is VolatilityRegime.NORMAL:
             return RuleEvaluation(self.name, RuleOutcome.PASS, "volatility is within the normal range")
         if observation.volatility_regime is VolatilityRegime.HIGH:
-            return RuleEvaluation(self.name, RuleOutcome.FAIL, "volatility is elevated")
-        return RuleEvaluation(self.name, RuleOutcome.NEUTRAL, "volatility is low; await more active conditions")
+            return RuleEvaluation(self.name, RuleOutcome.NEUTRAL, "volatility is elevated")
+        return RuleEvaluation(self.name, RuleOutcome.NEUTRAL, "volatility is low")
 
 
 class LiquidityConditionRule:

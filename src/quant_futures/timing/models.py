@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from math import isfinite
 
 from quant_futures.core.exceptions import DomainValidationError
 from quant_futures.observation.models import MarketObservation
@@ -68,6 +69,7 @@ class TimingAssessment:
     status: TimingStatus
     evaluations: tuple[RuleEvaluation, ...]
     assessed_at: datetime
+    confidence: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.observation, MarketObservation):
@@ -80,6 +82,13 @@ class TimingAssessment:
             raise DomainValidationError("evaluations must contain RuleEvaluation instances")
         if not isinstance(self.assessed_at, datetime) or self.assessed_at.tzinfo is None:
             raise DomainValidationError("assessed_at must be a timezone-aware datetime")
+        if (
+            not isinstance(self.confidence, (int, float))
+            or isinstance(self.confidence, bool)
+            or not isfinite(self.confidence)
+            or not 0.0 <= self.confidence <= 1.0
+        ):
+            raise DomainValidationError("confidence must be a finite number between 0.0 and 1.0")
 
     @property
     def state(self) -> TimingStatus:
