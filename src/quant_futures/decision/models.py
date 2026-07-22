@@ -10,6 +10,7 @@ from numbers import Real
 
 from quant_futures.alpha.models import AlphaCandidate, AlphaDirection
 from quant_futures.core.exceptions import DomainValidationError
+from quant_futures.timing.models import TimingStatus
 
 
 class DecisionAction(str, Enum):
@@ -35,6 +36,10 @@ class DecisionIntent:
     alpha_candidate: AlphaCandidate
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Revalidate all invariants before an intent crosses a layer boundary."""
         self._validate_non_empty_string("symbol", self.symbol)
         self._validate_non_empty_string("source", self.source)
         self._validate_non_empty_string("policy_name", self.policy_name)
@@ -60,6 +65,11 @@ class DecisionIntent:
             raise DomainValidationError("decision confidence must not exceed alpha_candidate.confidence")
 
         direction = self.alpha_candidate.direction
+        if self.alpha_candidate.timing_assessment.status is TimingStatus.UNFAVORABLE:
+            if self.action is not DecisionAction.ABSTAIN:
+                raise DomainValidationError("unfavorable timing may only produce ABSTAIN")
+            if self.strength != 0.0 or self.confidence != 0.0:
+                raise DomainValidationError("unfavorable timing ABSTAIN decisions must have zero strength and confidence")
         if direction is AlphaDirection.NEUTRAL and self.action is not DecisionAction.ABSTAIN:
             raise DomainValidationError("neutral alpha candidates may only produce ABSTAIN")
         if self.action is DecisionAction.ABSTAIN:

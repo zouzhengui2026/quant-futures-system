@@ -1,4 +1,4 @@
-from dataclasses import fields, replace
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -124,12 +124,43 @@ def test_baseline_passes_exact_threshold_without_amplifying_and_is_deterministic
     assert (first.strength, first.confidence) == (candidate.strength, candidate.confidence)
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True, -0.1, 1.1])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True, "invalid", -0.1, 1.1])
 def test_threshold_configuration_fails_closed(value: object) -> None:
     with pytest.raises(ValueError, match="finite number"):
         ThresholdDecisionPolicy(minimum_strength=value)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="finite number"):
         ThresholdDecisionPolicy(minimum_confidence=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("minimum_strength", float("nan"), "minimum_strength"),
+        ("minimum_confidence", float("inf"), "minimum_confidence"),
+        ("minimum_strength", True, "minimum_strength"),
+        ("minimum_confidence", "invalid", "minimum_confidence"),
+        ("minimum_strength", -0.1, "minimum_strength"),
+        ("minimum_confidence", 1.1, "minimum_confidence"),
+        ("name", "", "name must be a non-empty string"),
+        ("clock", None, "clock must be callable"),
+    ],
+)
+def test_threshold_policy_revalidates_tampered_runtime_configuration(field: str, value: object, message: str) -> None:
+    policy = ThresholdDecisionPolicy(clock=lambda: CREATED_AT)
+    with pytest.raises(AttributeError):
+        setattr(policy, field, value)
+    object.__setattr__(policy, field, value)
+    with pytest.raises(ValueError, match=message):
+        policy.decide(candidate_for())
+
+
+@pytest.mark.parametrize("field", ["minimum_strength", "minimum_confidence"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True, "invalid", -0.1, 1.1])
+def test_threshold_policy_rejects_every_invalid_runtime_threshold(field: str, value: object) -> None:
+    policy = ThresholdDecisionPolicy(clock=lambda: CREATED_AT)
+    object.__setattr__(policy, field, value)
+    with pytest.raises(ValueError, match=field):
+        policy.decide(candidate_for())
 
 
 def test_engine_publishes_complete_canonical_event_and_accepts_injected_policy() -> None:
@@ -184,7 +215,7 @@ def test_engine_rejects_forged_direction_or_amplified_output_without_publishing(
             decision = intent_for(value, policy_name=self.name)
             object.__setattr__(decision, "action", DecisionAction.PROPOSE_SHORT)
             return decision
-    with pytest.raises(ValueError, match="action must match LONG"):
+    with pytest.raises(ValueError, match="PROPOSE_SHORT requires a SHORT"):
         DecisionEngine(bus, policy=ForgedAction()).decide(candidate)
 
     class Amplified:
@@ -193,6 +224,59 @@ def test_engine_rejects_forged_direction_or_amplified_output_without_publishing(
             decision = intent_for(value, policy_name=self.name)
             object.__setattr__(decision, "strength", 0.9)
             return decision
-    with pytest.raises(ValueError, match="must not amplify"):
+    with pytest.raises(ValueError, match="must not exceed"):
         DecisionEngine(bus, policy=Amplified()).decide(candidate)
+    assert received == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("strength", 0.1, "ABSTAIN"),
+        ("confidence", 0.1, "ABSTAIN"),
+        ("reasons", (), "non-empty tuple"),
+        ("reasons", ("",), "non-empty strings"),
+        ("created_at", datetime(2026, 1, 1), "timezone-aware"),
+        ("created_at", GENERATED_AT - timedelta(seconds=1), "not be earlier"),
+        ("strength", float("nan"), "finite number"),
+        ("confidence", float("inf"), "finite number"),
+        ("symbol", "ETHUSDT", "symbol and source"),
+        ("source", "other", "symbol and source"),
+    ],
+)
+def test_engine_revalidates_tampered_intent_without_publishing(field: str, value: object, message: str) -> None:
+    candidate = candidate_for()
+    bus, received = EventBus(), []
+    bus.subscribe(EventType.DECISION_CREATED, received.append)
+
+    class TamperingPolicy:
+        name = "tampering"
+
+        def decide(self, supplied: AlphaCandidate) -> DecisionIntent:
+            decision = intent_for(supplied, policy_name=self.name, action=DecisionAction.ABSTAIN, strength=0.0, confidence=0.0)
+            object.__setattr__(decision, field, value)
+            return decision
+
+    with pytest.raises(ValueError, match=message):
+        DecisionEngine(bus, policy=TamperingPolicy()).decide(candidate)
+    assert received == []
+
+
+def test_engine_rejects_unfavorable_directional_policy_output_without_publishing() -> None:
+    candidate = candidate_for(status=TimingStatus.UNFAVORABLE)
+    bus, received = EventBus(), []
+    bus.subscribe(EventType.DECISION_CREATED, received.append)
+
+    class UnsafePolicy:
+        name = "unsafe"
+
+        def decide(self, supplied: AlphaCandidate) -> DecisionIntent:
+            decision = intent_for(supplied, policy_name=self.name, action=DecisionAction.ABSTAIN, strength=0.0, confidence=0.0)
+            object.__setattr__(decision, "action", DecisionAction.PROPOSE_LONG)
+            object.__setattr__(decision, "strength", supplied.strength)
+            object.__setattr__(decision, "confidence", supplied.confidence)
+            return decision
+
+    with pytest.raises(ValueError, match="unfavorable timing"):
+        DecisionEngine(bus, policy=UnsafePolicy()).decide(candidate)
     assert received == []

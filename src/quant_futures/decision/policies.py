@@ -15,7 +15,7 @@ from quant_futures.timing.models import TimingStatus
 from .models import DecisionAction, DecisionIntent
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ThresholdDecisionPolicy:
     """Propose directional alpha only when timing and configured thresholds allow.
 
@@ -29,6 +29,9 @@ class ThresholdDecisionPolicy:
     name: str = "threshold_decision_baseline"
 
     def __post_init__(self) -> None:
+        self._validate_configuration()
+
+    def _validate_configuration(self) -> None:
         self._validate_threshold("minimum_strength", self.minimum_strength)
         self._validate_threshold("minimum_confidence", self.minimum_confidence)
         if not isinstance(self.name, str) or not self.name.strip():
@@ -37,6 +40,7 @@ class ThresholdDecisionPolicy:
             raise DomainValidationError("clock must be callable")
 
     def decide(self, candidate: AlphaCandidate) -> DecisionIntent:
+        self._validate_configuration()
         if not isinstance(candidate, AlphaCandidate):
             raise TypeError("decide expects an AlphaCandidate")
         if candidate.timing_assessment.status is TimingStatus.UNFAVORABLE:

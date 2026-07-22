@@ -31,6 +31,7 @@ class DecisionEngine:
         decision = self.policy.decide(candidate)
         if not isinstance(decision, DecisionIntent):
             raise TypeError("DecisionPolicy.decide must return a DecisionIntent")
+        decision.validate()
         if decision.alpha_candidate != candidate:
             raise ValueError("DecisionPolicy output must reference the input alpha candidate")
         if decision.policy_name != policy_name:
