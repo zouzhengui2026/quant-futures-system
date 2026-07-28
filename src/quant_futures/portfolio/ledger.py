@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from threading import RLock, local
+from weakref import WeakKeyDictionary
 
 from quant_futures.core.events import Event, EventBus, EventType
 from quant_futures.core.exceptions import DomainValidationError, PortfolioLedgerError
@@ -58,16 +59,16 @@ class _CommittedIdentity:
 class _LedgerAnchor:
     """Instance-external authorities that callbacks cannot replace."""
 
-    owner: PortfolioLedger
     lock: object
     event_bus: EventBus
-    committed_identity: dict[str, _CommittedIdentity]
+    working_committed_identity: dict[str, _CommittedIdentity]
+    authoritative_committed_identity: dict[str, _CommittedIdentity]
 
 
-_LEDGER_ANCHORS: dict[int, _LedgerAnchor] = {}
+_LEDGER_ANCHORS: WeakKeyDictionary[PortfolioLedger, _LedgerAnchor] = WeakKeyDictionary()
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False, weakref_slot=True)
 class PortfolioLedger:
     event_bus: EventBus
     _positions: dict[tuple[str, str], PositionSnapshot] = field(init=False, repr=False)
@@ -86,8 +87,8 @@ class PortfolioLedger:
         self._committed_identity = {}
         self._lock = RLock()
         self._transition_active = False
-        _LEDGER_ANCHORS[id(self)] = _LedgerAnchor(
-            self, self._lock, self.event_bus, self._committed_identity)
+        _LEDGER_ANCHORS[self] = _LedgerAnchor(
+            self._lock, self.event_bus, self._committed_identity, {})
 
     def apply(self, execution_report: PaperExecutionReport) -> PositionUpdate:
         """Validate and atomically commit one fill.
@@ -133,7 +134,7 @@ class PortfolioLedger:
             decision = risk.decision_intent
             alpha = decision.alpha_candidate
             timing = alpha.timing_assessment
-            self._committed_identity[order_id] = _CommittedIdentity(
+            identity = _CommittedIdentity(
                 update=update,
                 report=execution_report,
                 report_order=execution_report.order,
@@ -149,6 +150,8 @@ class PortfolioLedger:
                 portfolio_snapshot=portfolio,
                 portfolio_positions=portfolio.positions,
             )
+            self._committed_identity[order_id] = identity
+            self._anchor().authoritative_committed_identity[order_id] = identity
             self._publish(update)
             return update
 
@@ -156,8 +159,14 @@ class PortfolioLedger:
         """Fail closed unless the complete committed audit graph is intact."""
         try:
             anchor = self._anchor()
-            if self._committed_identity is not anchor.committed_identity:
+            if self._committed_identity is not anchor.working_committed_identity:
                 raise PortfolioLedgerError("identity commitment anchor was replaced")
+            authority = anchor.authoritative_committed_identity
+            if set(self._committed_identity) != set(authority):
+                raise PortfolioLedgerError("identity commitments differ from authority")
+            if any(self._committed_identity[order_id] is not identity
+                   for order_id, identity in authority.items()):
+                raise PortfolioLedgerError("identity commitment entry was replaced")
             if set(self._positions) != set(self._history):
                 raise PortfolioLedgerError("position and history keys must match")
             seen: dict[str, PositionUpdate] = {}
@@ -185,7 +194,7 @@ class PortfolioLedger:
                     if order_id in seen:
                         raise PortfolioLedgerError("history order IDs must be globally unique")
                     seen[order_id] = update
-                    identity = self._committed_identity.get(order_id)
+                    identity = authority.get(order_id)
                     if identity is None or identity.update is not update:
                         raise PortfolioLedgerError("stored update identity was replaced")
                     report = update.execution_report
@@ -321,8 +330,8 @@ class PortfolioLedger:
                 _ACTIVE_PORTFOLIO_LEDGERS.reset(token)
 
     def _anchor(self) -> _LedgerAnchor:
-        anchor = _LEDGER_ANCHORS.get(id(self))
-        if anchor is None or anchor.owner is not self:
+        anchor = _LEDGER_ANCHORS.get(self)
+        if anchor is None:
             raise PortfolioLedgerError("portfolio ledger authority is unavailable")
         return anchor
 

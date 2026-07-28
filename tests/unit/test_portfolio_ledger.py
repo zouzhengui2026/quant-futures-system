@@ -2,7 +2,9 @@ from copy import deepcopy
 from contextvars import Context
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
+import gc
 from threading import Barrier, Event as ThreadEvent, RLock, Thread
+import weakref
 
 import pytest
 
@@ -14,6 +16,7 @@ from quant_futures.execution import FixedQuantityExecutionPolicy, PaperExecution
 from quant_futures.portfolio import (
     PortfolioLedger, PortfolioSnapshot, PositionSide, PositionSnapshot, PositionUpdate,
 )
+from quant_futures.portfolio.ledger import _LEDGER_ANCHORS
 
 from test_paper_execution_engine import NOW, intent
 from test_execution_engine import risk_for
@@ -156,6 +159,67 @@ def test_instance_dictionary_rewrite_cannot_forge_audit_anchor() -> None:
     assert "anchor-third" not in ledger._processed
     assert len(ledger._history[key]) == 2
     assert len(events) == 2
+
+
+def test_in_place_commitment_rewrite_cannot_forge_audit_anchor() -> None:
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
+    ledger = PortfolioLedger(bus)
+    first = ledger.apply(filled("forge-one", 100.0))
+    ledger.apply(filled("forge-two", 101.0, when=NOW + timedelta(seconds=1)))
+    forged = replace(first)
+    key = (first.current_position.source, first.current_position.symbol)
+    order_id = first.execution_report.order.order_id
+    positions = dict(ledger._positions)
+    history_length = len(ledger._history[key])
+    processed_keys = set(ledger._processed)
+
+    ledger._history[key][0] = forged
+    ledger._processed[order_id] = forged
+    ledger._committed_identity[order_id] = replace(
+        ledger._committed_identity[order_id], update=forged,
+    )
+
+    with pytest.raises(PortfolioLedgerError, match="commitment entry was replaced"):
+        ledger.apply(filled("forge-three", 102.0, when=NOW + timedelta(seconds=2)))
+    assert ledger._positions == positions
+    assert len(ledger._history[key]) == history_length
+    assert set(ledger._processed) == processed_keys
+    assert "forge-three" not in ledger._processed
+    assert len(events) == 2
+
+
+@pytest.mark.parametrize("mutation", ["add", "remove", "wrong"])
+def test_in_place_commitment_mapping_mutation_is_detected(mutation) -> None:
+    ledger = PortfolioLedger(EventBus())
+    first = ledger.apply(filled("commitment-one", 100.0))
+    order_id = first.execution_report.order.order_id
+    if mutation == "add":
+        ledger._committed_identity["unexpected"] = ledger._committed_identity[order_id]
+    elif mutation == "remove":
+        del ledger._committed_identity[order_id]
+    else:
+        ledger._committed_identity[order_id] = replace(
+            ledger._committed_identity[order_id])
+
+    with pytest.raises(PortfolioLedgerError, match="commitment"):
+        ledger.apply(filled("commitment-two", 101.0, when=NOW + timedelta(seconds=1)))
+    assert "commitment-two" not in ledger._processed
+
+
+def test_ledger_authority_registry_uses_weak_ownership() -> None:
+    gc.collect()
+    baseline = len(_LEDGER_ANCHORS)
+    ledger = PortfolioLedger(EventBus())
+    assert ledger in _LEDGER_ANCHORS
+    assert len(_LEDGER_ANCHORS) == baseline + 1
+    ledger_ref = weakref.ref(ledger)
+
+    del ledger
+    gc.collect()
+
+    assert ledger_ref() is None
+    assert len(_LEDGER_ANCHORS) == baseline
 
 
 def test_long_average_cost_reduce_close_and_flat_history() -> None:
