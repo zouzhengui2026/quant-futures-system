@@ -256,6 +256,57 @@ def test_clock_cannot_replace_history_list_or_report_with_equal_clone(replacemen
     assert engine.get("paper-1") is submitted
 
 
+def test_clock_cannot_replace_current_execution_intent_with_equal_clone() -> None:
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.EXECUTION_UPDATED, events.append)
+    original_intent = intent()
+    engine = PaperExecutionEngine(bus, lambda: NOW)
+    submitted = engine.submit(original_intent)
+    clone = None
+
+    def clock() -> datetime:
+        nonlocal clone
+        clone = replace(submitted.execution_intent)
+        object.__setattr__(submitted, "execution_intent", clone)
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises(DomainValidationError, match="execution intent"):
+        engine.fill("paper-1", 1.0)
+    assert clone is not None and clone is not original_intent
+    assert engine.get("paper-1") is submitted
+    assert engine.history("paper-1") == (submitted,)
+    assert engine.history("paper-1")[0] is submitted
+    assert submitted.execution_intent is original_intent
+    assert len(events) == 1
+    assert all(event.payload["order"].status is not OrderStatus.FILLED for event in events)
+
+
+def test_clock_cannot_replace_current_order_with_equal_clone() -> None:
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.EXECUTION_UPDATED, events.append)
+    engine = PaperExecutionEngine(bus, lambda: NOW)
+    submitted = engine.submit(intent())
+    original_submitted_order = submitted.order
+    clone = None
+
+    def clock() -> datetime:
+        nonlocal clone
+        clone = replace(submitted.order)
+        object.__setattr__(submitted, "order", clone)
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises(DomainValidationError, match="current report order"):
+        engine.fill("paper-1", 1.0)
+    assert clone is not None and clone is not original_submitted_order
+    assert engine.get("paper-1") is submitted
+    assert engine.history("paper-1") == (submitted,)
+    assert engine.history("paper-1")[0] is submitted
+    assert submitted.order is original_submitted_order
+    assert len(events) == 1
+
+
 def test_clock_exception_releases_guard_without_committing_or_publishing() -> None:
     bus, events = EventBus(), []
     bus.subscribe(EventType.EXECUTION_UPDATED, events.append)

@@ -129,13 +129,33 @@ class PaperExecutionEngine:
         current = self._lookup(order_id)
         if current.order.status is not OrderStatus.SUBMITTED:
             raise OrderLifecycleError("only a SUBMITTED order may be filled or cancelled")
+        current_before = current
+        intent_before = current.execution_intent
+        order_before = current.order
+        current_value_snapshot = deepcopy(current)
         history_before = self._history[order_id]
         reports_before = tuple(history_before)
         history_snapshot = deepcopy(history_before)
         snapshot, identities = self._capture_integrity(current.execution_intent)
-        occurred_at = self._read_clock()
-        if self._current.get(order_id) is not current:
+        try:
+            occurred_at = self._read_clock()
+        except BaseException:
+            self._restore_current_report(current, intent_before, order_before)
+            raise
+        if self._current.get(order_id) is not current_before:
+            self._restore_current_report(current, intent_before, order_before)
             raise OrderLifecycleError("current order changed during transition")
+        if current.execution_intent is not intent_before:
+            self._restore_current_report(current, intent_before, order_before)
+            raise DomainValidationError(
+                "clock must not replace the current report execution intent"
+            )
+        if current.order is not order_before:
+            self._restore_current_report(current, intent_before, order_before)
+            raise DomainValidationError("clock must not replace the current report order")
+        if current != current_value_snapshot:
+            self._restore_current_report(current, intent_before, order_before)
+            raise DomainValidationError("clock must not mutate the current paper execution report")
         self._verify_integrity(current.execution_intent, snapshot, identities)
         if self._history.get(order_id) is not history_before:
             raise DomainValidationError("clock must not replace the paper execution history list")
@@ -198,6 +218,7 @@ class PaperExecutionEngine:
         decision = risk.decision_intent
         alpha = decision.alpha_candidate
         return deepcopy(intent), (
+            intent,
             intent.order,
             risk,
             decision,
@@ -216,11 +237,31 @@ class PaperExecutionEngine:
         risk = intent.risk_assessment
         decision = risk.decision_intent
         alpha = decision.alpha_candidate
-        after = (intent.order, risk, decision, alpha, alpha.timing_assessment, alpha.observation)
+        after = (
+            intent,
+            intent.order,
+            risk,
+            decision,
+            alpha,
+            alpha.timing_assessment,
+            alpha.observation,
+        )
         if intent != snapshot:
             raise DomainValidationError("clock must not mutate ExecutionIntent or its lineage")
         if any(left is not right for left, right in zip(after, identities, strict=True)):
             raise DomainValidationError("clock must not replace ExecutionIntent lineage objects")
+
+    @staticmethod
+    def _restore_current_report(
+        current: PaperExecutionReport,
+        intent: ExecutionIntent,
+        order: Order,
+    ) -> None:
+        """Undo only illegal callback replacement of a current report's fields."""
+        if current.execution_intent is not intent:
+            object.__setattr__(current, "execution_intent", intent)
+        if current.order is not order:
+            object.__setattr__(current, "order", order)
 
     def _lookup(self, order_id: str) -> PaperExecutionReport:
         try:
