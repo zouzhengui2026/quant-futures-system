@@ -142,7 +142,7 @@ def test_callback_infrastructure_replacement_is_repaired_after_publication() -> 
 
 def test_transition_retains_weakly_anchored_event_bus_through_cleanup() -> None:
     ledger = PortfolioLedger(EventBus())
-    original = ledger.event_bus
+    original_ref = weakref.ref(ledger.event_bus)
     replacement = EventBus()
     original_events, replacement_events = [], []
 
@@ -150,7 +150,7 @@ def test_transition_retains_weakly_anchored_event_bus_through_cleanup() -> None:
         original_events.append(event)
         ledger.event_bus = replacement
 
-    original.subscribe(EventType.PORTFOLIO_UPDATED, replace_event_bus)
+    ledger.event_bus.subscribe(EventType.PORTFOLIO_UPDATED, replace_event_bus)
     replacement.subscribe(EventType.PORTFOLIO_UPDATED, replacement_events.append)
 
     first = ledger.apply(filled("retained-bus-first", 100.0))
@@ -159,7 +159,7 @@ def test_transition_retains_weakly_anchored_event_bus_through_cleanup() -> None:
     assert ledger.history(first.current_position.source, first.current_position.symbol) == (first,)
     assert len(original_events) == 1
     assert original_events[0].payload["position_update"] is first
-    assert ledger.event_bus is original
+    assert ledger.event_bus is original_ref()
     assert replacement_events == []
 
     second = ledger.apply(
@@ -169,7 +169,7 @@ def test_transition_retains_weakly_anchored_event_bus_through_cleanup() -> None:
     assert len(ledger.history(second.current_position.source, second.current_position.symbol)) == 2
     assert len(original_events) == 2
     assert original_events[1].payload["position_update"] is second
-    assert ledger.event_bus is original
+    assert ledger.event_bus is original_ref()
     assert replacement_events == []
 
 
