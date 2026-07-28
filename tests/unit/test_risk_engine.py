@@ -222,3 +222,136 @@ def test_engine_rejects_renaming_policy_and_tampered_decision_without_event() ->
     with pytest.raises(ValueError):
         RiskEngine(bus).assess(decision)
     assert events == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda decision: object.__setattr__(decision, "reasons", ("rewritten",)),
+        lambda decision: object.__setattr__(decision, "policy_name", "rewritten_policy"),
+        lambda decision: object.__setattr__(decision.alpha_candidate, "reasons", ("rewritten alpha",)),
+        lambda decision: object.__setattr__(
+            decision, "alpha_candidate", replace(decision.alpha_candidate)
+        ),
+        lambda decision: object.__setattr__(
+            decision.alpha_candidate,
+            "timing_assessment",
+            replace(decision.alpha_candidate.timing_assessment),
+        ),
+    ],
+    ids=["decision-reasons", "decision-policy-name", "alpha-reasons", "alpha-clone", "timing-clone"],
+)
+def test_engine_rejects_policy_mutation_of_decision_lineage_without_event(mutation: object) -> None:
+    decision, bus, events = decision_for(), EventBus(), []
+    bus.subscribe(EventType.RISK_UPDATED, events.append)
+
+    class MutatingPolicy:
+        name = "risk"
+
+        def assess(self, supplied: DecisionIntent) -> RiskAssessment:
+            mutation(supplied)  # type: ignore[operator]
+            return assessment_for(supplied)
+
+    with pytest.raises(ValueError, match="must not mutate|must not replace"):
+        RiskEngine(bus, MutatingPolicy()).assess(decision)
+    assert events == []
+
+
+def test_engine_rejects_equal_observation_replacement_without_event() -> None:
+    decision, bus, events = decision_for(), EventBus(), []
+    bus.subscribe(EventType.RISK_UPDATED, events.append)
+
+    class ObservationReplacingPolicy:
+        name = "risk"
+
+        def assess(self, supplied: DecisionIntent) -> RiskAssessment:
+            candidate = supplied.alpha_candidate
+            observation_clone = replace(candidate.observation)
+            timing_clone = replace(candidate.timing_assessment, observation=observation_clone)
+            object.__setattr__(candidate, "observation", observation_clone)
+            object.__setattr__(candidate, "timing_assessment", timing_clone)
+            return assessment_for(supplied)
+
+    with pytest.raises(ValueError, match="must not replace|must not mutate"):
+        RiskEngine(bus, ObservationReplacingPolicy()).assess(decision)
+    assert events == []
+
+
+def test_engine_rejects_same_named_policy_object_replacement_without_event() -> None:
+    decision, bus, events = decision_for(), EventBus(), []
+    bus.subscribe(EventType.RISK_UPDATED, events.append)
+
+    class OtherPolicy:
+        name = "risk"
+
+    class ReplacementPolicy:
+        name = "risk"
+
+        def assess(self, supplied: DecisionIntent) -> RiskAssessment:
+            result = assessment_for(supplied)
+            engine.policy = OtherPolicy()  # type: ignore[assignment]
+            return result
+
+    engine = RiskEngine(bus, ReplacementPolicy())
+    with pytest.raises(ValueError, match="RiskEngine.policy must not change"):
+        engine.assess(decision)
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("symbol", "ETHUSDT"),
+        ("source", "forged"),
+        ("assessed_at", datetime(2026, 1, 1)),
+        ("assessed_at", CREATED - timedelta(seconds=1)),
+        ("outcome", "approved"),
+        ("reasons", ()),
+        ("reasons", ("",)),
+    ],
+)
+def test_engine_revalidates_tampered_assessment_fields_without_event(field: str, value: object) -> None:
+    decision, bus, events = decision_for(), EventBus(), []
+    bus.subscribe(EventType.RISK_UPDATED, events.append)
+    output = assessment_for(decision)
+    object.__setattr__(output, field, value)
+
+    class Policy:
+        name = "risk"
+        def assess(self, supplied: DecisionIntent) -> RiskAssessment: return output
+
+    with pytest.raises(ValueError):
+        RiskEngine(bus, Policy()).assess(decision)
+    assert events == []
+
+
+@pytest.mark.parametrize("status", [TimingStatus.FAVORABLE, TimingStatus.UNFAVORABLE])
+def test_engine_rejects_forged_approval_and_replaced_decision_without_event(status: TimingStatus) -> None:
+    direction = AlphaDirection.NEUTRAL if status is TimingStatus.FAVORABLE else AlphaDirection.LONG
+    decision, bus, events = decision_for(direction, status=status), EventBus(), []
+    bus.subscribe(EventType.RISK_UPDATED, events.append)
+    output = assessment_for(decision, outcome=RiskOutcome.REJECTED)
+    object.__setattr__(output, "outcome", RiskOutcome.APPROVED)
+
+    class Policy:
+        name = "risk"
+        def assess(self, supplied: DecisionIntent) -> RiskAssessment: return output
+
+    with pytest.raises(ValueError):
+        RiskEngine(bus, Policy()).assess(decision)
+    assert events == []
+
+
+def test_engine_rejects_tampered_assessment_decision_reference_without_event() -> None:
+    decision, bus, events = decision_for(), EventBus(), []
+    bus.subscribe(EventType.RISK_UPDATED, events.append)
+    output = assessment_for(decision)
+    object.__setattr__(output, "decision_intent", replace(decision))
+
+    class Policy:
+        name = "risk"
+        def assess(self, supplied: DecisionIntent) -> RiskAssessment: return output
+
+    with pytest.raises(ValueError, match="input DecisionIntent object"):
+        RiskEngine(bus, Policy()).assess(decision)
+    assert events == []

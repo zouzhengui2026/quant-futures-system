@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 from quant_futures.core.events import Event, EventBus, EventType
@@ -25,11 +26,30 @@ class RiskEngine:
         if not isinstance(decision, DecisionIntent):
             raise TypeError("assess expects a DecisionIntent")
         decision.validate()
-        name_before = self._policy_name()
-        assessment = self.policy.assess(decision)
-        name_after = self._policy_name()
+
+        decision_snapshot = deepcopy(decision)
+        candidate_before = decision.alpha_candidate
+        timing_before = candidate_before.timing_assessment
+        observation_before = candidate_before.observation
+        policy_before = self.policy
+        name_before = self._validated_policy_name(policy_before)
+
+        assessment = policy_before.assess(decision)
+
+        if self.policy is not policy_before:
+            raise DomainValidationError("RiskEngine.policy must not change during assess")
+        name_after = self._validated_policy_name(policy_before)
         if name_before != name_after:
             raise DomainValidationError("RiskPolicy.name must not change during assess")
+        decision.validate()
+        if decision != decision_snapshot:
+            raise DomainValidationError("RiskPolicy must not mutate the input DecisionIntent or its lineage")
+        if decision.alpha_candidate is not candidate_before:
+            raise DomainValidationError("RiskPolicy must not replace the input DecisionIntent alpha_candidate")
+        if decision.alpha_candidate.timing_assessment is not timing_before:
+            raise DomainValidationError("RiskPolicy must not replace the input DecisionIntent timing_assessment")
+        if decision.alpha_candidate.observation is not observation_before:
+            raise DomainValidationError("RiskPolicy must not replace the input DecisionIntent observation")
         if not isinstance(assessment, RiskAssessment):
             raise TypeError("RiskPolicy.assess must return a RiskAssessment")
         assessment.validate()
@@ -59,8 +79,9 @@ class RiskEngine:
         )
         return assessment
 
-    def _policy_name(self) -> str:
-        name = getattr(self.policy, "name", None)
+    @staticmethod
+    def _validated_policy_name(policy: object) -> str:
+        name = getattr(policy, "name", None)
         if not isinstance(name, str) or not name.strip():
             raise DomainValidationError("RiskPolicy.name must be a non-empty string")
         return name
