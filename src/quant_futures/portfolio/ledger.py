@@ -39,13 +39,15 @@ class _CommittedIdentity:
 
     update: PositionUpdate
     report: PaperExecutionReport
-    order: Order
+    report_order: Order
+    intent_order: Order
     execution_intent: ExecutionIntent
     risk_assessment: RiskAssessment
     decision_intent: DecisionIntent
     alpha_candidate: AlphaCandidate
     timing_assessment: TimingAssessment
-    observation: MarketObservation
+    alpha_observation: MarketObservation
+    timing_observation: MarketObservation
     current_position: PositionSnapshot
     portfolio_snapshot: PortfolioSnapshot
     portfolio_positions: tuple[PositionSnapshot, ...]
@@ -91,6 +93,10 @@ class PortfolioLedger:
             if order_id in self._processed:
                 raise PortfolioLedgerError(f"order_id already processed: {order_id}")
             intent = execution_report.execution_intent
+            alpha = intent.risk_assessment.decision_intent.alpha_candidate
+            if alpha.observation is not alpha.timing_assessment.observation:
+                raise PortfolioLedgerError(
+                    "alpha and timing observations must share identity")
             key = (intent.source, intent.symbol)
             previous = self._positions.get(key)
             if previous is not None and execution_report.occurred_at < previous.updated_at:
@@ -110,16 +116,19 @@ class PortfolioLedger:
             risk = intent.risk_assessment
             decision = risk.decision_intent
             alpha = decision.alpha_candidate
+            timing = alpha.timing_assessment
             self._committed_identity[order_id] = _CommittedIdentity(
                 update=update,
                 report=execution_report,
-                order=execution_report.order,
+                report_order=execution_report.order,
+                intent_order=intent.order,
                 execution_intent=intent,
                 risk_assessment=risk,
                 decision_intent=decision,
                 alpha_candidate=alpha,
-                timing_assessment=alpha.timing_assessment,
-                observation=alpha.observation,
+                timing_assessment=timing,
+                alpha_observation=alpha.observation,
+                timing_observation=timing.observation,
                 current_position=current,
                 portfolio_snapshot=portfolio,
                 portfolio_positions=portfolio.positions,
@@ -165,15 +174,19 @@ class PortfolioLedger:
                     risk = intent.risk_assessment
                     decision = risk.decision_intent
                     alpha = decision.alpha_candidate
+                    timing = alpha.timing_assessment
                     portfolio = update.portfolio_snapshot
                     if (identity.report is not report
-                            or identity.order is not report.order
+                            or identity.report_order is not report.order
+                            or identity.intent_order is not intent.order
                             or identity.execution_intent is not intent
                             or identity.risk_assessment is not risk
                             or identity.decision_intent is not decision
                             or identity.alpha_candidate is not alpha
-                            or identity.timing_assessment is not alpha.timing_assessment
-                            or identity.observation is not alpha.observation
+                            or identity.timing_assessment is not timing
+                            or identity.alpha_observation is not alpha.observation
+                            or identity.timing_observation is not timing.observation
+                            or alpha.observation is not timing.observation
                             or identity.current_position is not update.current_position
                             or identity.portfolio_snapshot is not portfolio):
                         raise PortfolioLedgerError("stored audit object identity was replaced")

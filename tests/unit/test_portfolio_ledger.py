@@ -605,6 +605,38 @@ def test_equal_lineage_clone_is_rejected_before_subsequent_commit(lineage_field)
     assert ledger._committed_identity == committed_records
 
 
+@pytest.mark.parametrize("lineage_path", [
+    "execution_intent.order",
+    "timing_assessment.observation",
+])
+def test_equal_duplicate_lineage_child_clone_is_rejected(lineage_path):
+    ledger, events, first, _ = _two_fill_ledger()
+    intent = first.execution_report.execution_intent
+    alpha = intent.risk_assessment.decision_intent.alpha_candidate
+    if lineage_path == "execution_intent.order":
+        owner, field, original = intent, "order", intent.order
+    else:
+        owner, field, original = (
+            alpha.timing_assessment, "observation",
+            alpha.timing_assessment.observation,
+        )
+    positions = ledger._positions
+    history = ledger._history
+    processed = ledger._processed
+    commitments = ledger._committed_identity
+    history_list = ledger._history[("replay", "BTCUSDT")]
+    updates = tuple(history_list)
+    object.__setattr__(owner, field, replace(original))
+
+    _assert_audit_corruption_rejects_third(ledger, events)
+    assert ledger._positions is positions
+    assert ledger._history is history
+    assert ledger._processed is processed
+    assert ledger._committed_identity is commitments
+    assert ledger._history[("replay", "BTCUSDT")] is history_list
+    assert tuple(history_list) == updates
+
+
 def test_equal_non_current_portfolio_position_clone_is_rejected():
     bus, events = EventBus(), []
     bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
