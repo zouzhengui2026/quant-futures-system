@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from math import isclose, isfinite
+from math import fsum, isclose, isfinite
 from numbers import Real
 
 from quant_futures.core.exceptions import DomainValidationError
@@ -36,6 +36,15 @@ def _aware(name: str, value: object) -> None:
         raise DomainValidationError(f"{name} must be a timezone-aware datetime") from exc
     if value.tzinfo is None or offset is None:
         raise DomainValidationError(f"{name} must be a timezone-aware datetime")
+
+
+def _normalize_zero(value: float) -> float:
+    return 0.0 if abs(value) <= ZERO_TOLERANCE else value
+
+
+def _realized_total(positions: tuple[PositionSnapshot, ...]) -> float:
+    """Return the canonical stable portfolio aggregation."""
+    return _normalize_zero(fsum(position.realized_pnl for position in positions))
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +110,7 @@ class PortfolioSnapshot:
         if keys != sorted(keys):
             raise DomainValidationError("positions must be sorted by source and symbol")
         _finite("total_realized_pnl", self.total_realized_pnl)
-        expected_total = sum(position.realized_pnl for position in self.positions)
+        expected_total = _realized_total(self.positions)
         if not isclose(self.total_realized_pnl, expected_total, rel_tol=0.0, abs_tol=ZERO_TOLERANCE):
             raise DomainValidationError("total_realized_pnl must equal position realized PnL")
         _aware("updated_at", self.updated_at)
@@ -141,18 +150,22 @@ class PositionUpdate:
         current = self.current_position
         if (current.source, current.symbol) != (intent.source, intent.symbol):
             raise DomainValidationError("current position must match execution intent")
-        previous_pnl = 0.0
         if self.previous_position is not None:
             if not isinstance(self.previous_position, PositionSnapshot):
                 raise DomainValidationError("previous_position must be a PositionSnapshot")
             self.previous_position.validate()
             if (self.previous_position.source, self.previous_position.symbol) != (current.source, current.symbol):
                 raise DomainValidationError("previous position must have the current position key")
-            previous_pnl = self.previous_position.realized_pnl
         _finite("realized_pnl_delta", self.realized_pnl_delta)
-        if not isclose(current.realized_pnl, previous_pnl + self.realized_pnl_delta,
-                       rel_tol=0.0, abs_tol=ZERO_TOLERANCE):
-            raise DomainValidationError("current realized PnL must include the update delta")
+        expected, expected_delta = _account_position(self.previous_position, report)
+        accounting_fields = (
+            "source", "symbol", "signed_quantity", "side", "average_entry_price",
+            "realized_pnl", "updated_at", "last_order_id",
+        )
+        if any(getattr(current, name) != getattr(expected, name) for name in accounting_fields):
+            raise DomainValidationError("current position must equal the accounting transition")
+        if self.realized_pnl_delta != expected_delta:
+            raise DomainValidationError("realized_pnl_delta must equal the accounting transition")
         _aware("applied_at", self.applied_at)
         if self.applied_at != report.occurred_at or current.updated_at != self.applied_at:
             raise DomainValidationError("update timestamps must match the execution report")
@@ -165,3 +178,42 @@ class PositionUpdate:
                    if (position.source, position.symbol) == (current.source, current.symbol)]
         if len(matches) != 1 or matches[0] is not current:
             raise DomainValidationError("portfolio snapshot must contain the exact current position")
+
+
+def _account_position(previous: PositionSnapshot | None,
+                      report: PaperExecutionReport) -> tuple[PositionSnapshot, float]:
+    """Apply one validated fill using average-cost accounting without ledger state."""
+    if previous is not None:
+        previous.validate()
+    quantity = float(report.filled_quantity)
+    price = float(report.average_fill_price)
+    x = quantity if report.order.side.value == "buy" else -quantity
+    q = previous.signed_quantity if previous else 0.0
+    old_average = previous.average_entry_price if previous else None
+    cumulative = previous.realized_pnl if previous else 0.0
+    delta = 0.0
+    if q == 0.0:
+        new_quantity, new_average = x, price
+    elif q * x > 0:
+        new_quantity = q + x
+        new_average = (abs(q) * old_average + abs(x) * price) / abs(new_quantity)
+    else:
+        closed = min(abs(q), abs(x))
+        delta = ((price - old_average) if q > 0 else (old_average - price)) * closed
+        new_quantity = q + x
+        if abs(new_quantity) <= ZERO_TOLERANCE:
+            new_quantity, new_average = 0.0, None
+        elif q * new_quantity > 0:
+            new_average = old_average
+        else:
+            new_average = price
+    delta = _normalize_zero(delta)
+    realized = _normalize_zero(fsum((cumulative, delta)))
+    side = PositionSide.FLAT if new_quantity == 0.0 else (
+        PositionSide.LONG if new_quantity > 0 else PositionSide.SHORT
+    )
+    intent = report.execution_intent
+    return PositionSnapshot(
+        intent.source, intent.symbol, new_quantity, side, new_average, realized,
+        report.occurred_at, report.order.order_id,
+    ), delta

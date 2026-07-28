@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from math import fsum
 from threading import RLock
 
 from quant_futures.core.events import Event, EventBus, EventType
@@ -15,11 +14,12 @@ from quant_futures.domain.order import OrderSide, OrderStatus
 from quant_futures.execution.paper.models import PaperExecutionReport
 from quant_futures.portfolio.models import (
     EMPTY_PORTFOLIO_TIMESTAMP,
-    ZERO_TOLERANCE,
     PortfolioSnapshot,
     PositionSide,
     PositionSnapshot,
     PositionUpdate,
+    _account_position,
+    _realized_total,
 )
 
 _ACTIVE_PORTFOLIO_LEDGERS: ContextVar[frozenset[int]] = ContextVar(
@@ -58,6 +58,11 @@ class PortfolioLedger:
             intent = execution_report.execution_intent
             key = (intent.source, intent.symbol)
             previous = self._positions.get(key)
+            if previous is not None:
+                previous.validate()
+                # Revalidate the committed audit record as well as the snapshot;
+                # this detects semantically valid-looking object.__setattr__ edits.
+                self._history[key][-1].validate()
             if previous is not None and execution_report.occurred_at < previous.updated_at:
                 raise PortfolioLedgerError("fill occurred before the current position update")
             current, delta = self._account(previous, execution_report)
@@ -110,48 +115,12 @@ class PortfolioLedger:
     @staticmethod
     def _account(previous: PositionSnapshot | None,
                  report: PaperExecutionReport) -> tuple[PositionSnapshot, float]:
-        quantity = float(report.filled_quantity)
-        price = float(report.average_fill_price)
-        x = quantity if report.order.side is OrderSide.BUY else -quantity
-        q = previous.signed_quantity if previous else 0.0
-        old_average = previous.average_entry_price if previous else None
-        cumulative = previous.realized_pnl if previous else 0.0
-        delta = 0.0
-        if q == 0.0:
-            new_quantity, new_average = x, price
-        elif q * x > 0:
-            new_quantity = q + x
-            new_average = (abs(q) * old_average + abs(x) * price) / abs(new_quantity)
-        else:
-            closed = min(abs(q), abs(x))
-            delta = ((price - old_average) if q > 0 else (old_average - price)) * closed
-            new_quantity = q + x
-            if abs(new_quantity) <= ZERO_TOLERANCE:
-                new_quantity, new_average = 0.0, None
-            elif q * new_quantity > 0:
-                new_average = old_average
-            else:
-                new_average = price
-        if abs(delta) <= ZERO_TOLERANCE:
-            delta = 0.0
-        realized = cumulative + delta
-        if abs(realized) <= ZERO_TOLERANCE:
-            realized = 0.0
-        side = PositionSide.FLAT if new_quantity == 0.0 else (
-            PositionSide.LONG if new_quantity > 0 else PositionSide.SHORT
-        )
-        intent = report.execution_intent
-        return PositionSnapshot(
-            intent.source, intent.symbol, new_quantity, side, new_average, realized,
-            report.occurred_at, report.order.order_id,
-        ), delta
+        return _account_position(previous, report)
 
     @staticmethod
     def _make_snapshot(positions: dict[tuple[str, str], PositionSnapshot]) -> PortfolioSnapshot:
         ordered = tuple(positions[key] for key in sorted(positions))
-        total = fsum(position.realized_pnl for position in ordered)
-        if abs(total) <= ZERO_TOLERANCE:
-            total = 0.0
+        total = _realized_total(ordered)
         updated_at = max((position.updated_at for position in ordered),
                          default=EMPTY_PORTFOLIO_TIMESTAMP)
         return PortfolioSnapshot(ordered, total, updated_at)
