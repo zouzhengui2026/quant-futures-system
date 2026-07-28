@@ -1,6 +1,6 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, Thread
+from threading import Barrier, Event as ThreadEvent, Thread
 
 import pytest
 
@@ -154,3 +154,140 @@ def test_concurrent_fill_cancel_has_exactly_one_winner() -> None:
         worker.join()
     assert sorted(outcomes) == ["lifecycle", "ok"]
     assert len(engine.history("paper-1")) == 2
+
+
+@pytest.mark.parametrize("operation", ["submit", "reject", "fill", "cancel"])
+def test_clock_reentrant_transitions_are_rejected_and_outer_transition_is_atomic(
+    operation: str,
+) -> None:
+    original = intent()
+    holder = {}
+
+    def clock() -> datetime:
+        engine = holder["engine"]
+        calls = {
+            "submit": lambda: engine.submit(intent(order_id="nested")),
+            "reject": lambda: engine.reject(intent(order_id="nested"), "nested"),
+            "fill": lambda: engine.fill("missing", 1.0),
+            "cancel": lambda: engine.cancel("missing", "nested"),
+        }
+        calls[operation]()
+        return NOW
+
+    engine = PaperExecutionEngine(EventBus(), clock)
+    holder["engine"] = engine
+    with pytest.raises(OrderLifecycleError, match="re-entered"):
+        engine.submit(original)
+    with pytest.raises(OrderLifecycleError, match="unknown"):
+        engine.get("paper-1")
+
+
+@pytest.mark.parametrize("operation", ["submit", "reject", "fill", "cancel"])
+def test_subscriber_reentrant_transitions_are_rejected_until_publish_finishes(
+    operation: str,
+) -> None:
+    bus = EventBus()
+    engine = PaperExecutionEngine(bus, lambda: NOW)
+    nested_errors = []
+
+    def subscriber(_event) -> None:
+        calls = {
+            "submit": lambda: engine.submit(intent(order_id="nested")),
+            "reject": lambda: engine.reject(intent(order_id="nested"), "nested"),
+            "fill": lambda: engine.fill("paper-1", 1.0),
+            "cancel": lambda: engine.cancel("paper-1", "nested"),
+        }
+        try:
+            calls[operation]()
+        except OrderLifecycleError as exc:
+            nested_errors.append(exc)
+
+    bus.subscribe(EventType.EXECUTION_UPDATED, subscriber)
+    report = engine.submit(intent())
+    assert report.order.status is OrderStatus.SUBMITTED
+    assert len(nested_errors) == 1
+    assert "re-entered" in str(nested_errors[0])
+    assert engine.history("paper-1") == (report,)
+
+
+def test_event_publication_is_serialized_in_history_order() -> None:
+    bus = EventBus()
+    first_event_entered = ThreadEvent()
+    release_first_event = ThreadEvent()
+    published = []
+
+    def subscriber(event) -> None:
+        published.append(event.payload["paper_execution_report"])
+        if len(published) == 1:
+            first_event_entered.set()
+            assert release_first_event.wait(timeout=2)
+
+    bus.subscribe(EventType.EXECUTION_UPDATED, subscriber)
+    engine = PaperExecutionEngine(bus, lambda: NOW)
+    first = Thread(target=lambda: engine.submit(intent()))
+    second = Thread(target=lambda: engine.fill("paper-1", 1.0))
+    first.start()
+    assert first_event_entered.wait(timeout=2)
+    second.start()
+    assert len(published) == 1
+    assert second.is_alive()
+    release_first_event.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    assert published == list(engine.history("paper-1"))
+
+
+@pytest.mark.parametrize("replacement", ["list", "report"])
+def test_clock_cannot_replace_history_list_or_report_with_equal_clone(replacement: str) -> None:
+    engine = PaperExecutionEngine(EventBus(), lambda: NOW)
+    submitted = engine.submit(intent())
+    original_history = engine._history["paper-1"]
+
+    def clock() -> datetime:
+        if replacement == "list":
+            engine._history["paper-1"] = list(original_history)
+        else:
+            original_history[0] = replace(submitted)
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises(DomainValidationError, match="replace"):
+        engine.fill("paper-1", 1.0)
+    assert engine.get("paper-1") is submitted
+
+
+def test_clock_exception_releases_guard_without_committing_or_publishing() -> None:
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.EXECUTION_UPDATED, events.append)
+
+    def broken_clock() -> datetime:
+        raise RuntimeError("clock failed")
+
+    engine = PaperExecutionEngine(bus, broken_clock)
+    with pytest.raises(RuntimeError, match="clock failed"):
+        engine.submit(intent())
+    assert events == []
+    engine.clock = lambda: NOW
+    assert engine.submit(intent()).order.status is OrderStatus.SUBMITTED
+
+
+@pytest.mark.parametrize("terminal", ["filled", "cancelled", "rejected"])
+def test_all_terminal_states_reject_further_transitions(terminal: str) -> None:
+    engine = PaperExecutionEngine(EventBus(), lambda: NOW)
+    original = intent()
+    if terminal == "rejected":
+        engine.reject(original, "terminal")
+    else:
+        engine.submit(original)
+        if terminal == "filled":
+            engine.fill("paper-1", 1.0)
+        else:
+            engine.cancel("paper-1", "terminal")
+    for transition in (
+        lambda: engine.submit(original),
+        lambda: engine.reject(original, "again"),
+        lambda: engine.fill("paper-1", 1.0),
+        lambda: engine.cancel("paper-1", "again"),
+    ):
+        with pytest.raises(OrderLifecycleError):
+            transition()

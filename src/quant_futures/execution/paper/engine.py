@@ -1,6 +1,8 @@
 """Thread-safe, in-memory paper order lifecycle orchestration."""
 
 from copy import deepcopy
+from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import isfinite
@@ -25,6 +27,7 @@ class PaperExecutionEngine:
     _current: dict[str, PaperExecutionReport] = field(init=False, repr=False)
     _history: dict[str, list[PaperExecutionReport]] = field(init=False, repr=False)
     _lock: RLock = field(init=False, repr=False)
+    _transition_active: bool = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.event_bus, EventBus):
@@ -34,27 +37,40 @@ class PaperExecutionEngine:
         self._current = {}
         self._history = {}
         self._lock = RLock()
+        self._transition_active = False
 
     def submit(self, execution_intent: ExecutionIntent) -> PaperExecutionReport:
-        return self._register(execution_intent, OrderStatus.SUBMITTED)
+        with self._transition_guard():
+            report = self._register(execution_intent, OrderStatus.SUBMITTED)
+            self._publish(report)
+            return report
 
     def reject(self, execution_intent: ExecutionIntent, reason: str) -> PaperExecutionReport:
-        self._validate_reason(reason)
-        return self._register(execution_intent, OrderStatus.REJECTED, reason)
+        with self._transition_guard():
+            self._validate_reason(reason)
+            report = self._register(execution_intent, OrderStatus.REJECTED, reason)
+            self._publish(report)
+            return report
 
     def fill(self, order_id: str, fill_price: float) -> PaperExecutionReport:
-        if (
-            not isinstance(fill_price, Real)
-            or isinstance(fill_price, bool)
-            or not isfinite(fill_price)
-            or fill_price <= 0
-        ):
-            raise DomainValidationError("fill_price must be a finite positive number")
-        return self._advance(order_id, OrderStatus.FILLED, fill_price=fill_price)
+        with self._transition_guard():
+            if (
+                not isinstance(fill_price, Real)
+                or isinstance(fill_price, bool)
+                or not isfinite(fill_price)
+                or fill_price <= 0
+            ):
+                raise DomainValidationError("fill_price must be a finite positive number")
+            report = self._advance(order_id, OrderStatus.FILLED, fill_price=fill_price)
+            self._publish(report)
+            return report
 
     def cancel(self, order_id: str, reason: str) -> PaperExecutionReport:
-        self._validate_reason(reason)
-        return self._advance(order_id, OrderStatus.CANCELLED, reason=reason)
+        with self._transition_guard():
+            self._validate_reason(reason)
+            report = self._advance(order_id, OrderStatus.CANCELLED, reason=reason)
+            self._publish(report)
+            return report
 
     def get(self, order_id: str) -> PaperExecutionReport:
         self._validate_order_id(order_id)
@@ -80,27 +96,25 @@ class PaperExecutionEngine:
     ) -> PaperExecutionReport:
         if not isinstance(intent, ExecutionIntent):
             raise DomainValidationError("execution_intent must be an ExecutionIntent")
-        with self._lock:
-            intent.validate()
-            order_id = intent.order.order_id
-            if order_id in self._current:
-                raise OrderLifecycleError(f"order_id already exists: {order_id}")
-            snapshot, identities = self._capture_integrity(intent)
-            occurred_at = self._read_clock()
-            self._verify_integrity(intent, snapshot, identities)
-            if order_id in self._current:
-                raise OrderLifecycleError(f"order_id already exists: {order_id}")
-            report = PaperExecutionReport(
-                intent,
-                self._copy_order(intent.order, status),
-                OrderStatus.CREATED,
-                occurred_at,
-                reason=reason,
-            )
-            report.validate()
-            self._current[order_id] = report
-            self._history[order_id] = [report]
-        self._publish(report)
+        intent.validate()
+        order_id = intent.order.order_id
+        if order_id in self._current or order_id in self._history:
+            raise OrderLifecycleError(f"order_id already exists: {order_id}")
+        snapshot, identities = self._capture_integrity(intent)
+        occurred_at = self._read_clock()
+        self._verify_integrity(intent, snapshot, identities)
+        if order_id in self._current or order_id in self._history:
+            raise OrderLifecycleError("clock must not modify paper execution ledgers")
+        report = PaperExecutionReport(
+            intent,
+            self._copy_order(intent.order, status),
+            OrderStatus.CREATED,
+            occurred_at,
+            reason=reason,
+        )
+        report.validate()
+        self._current[order_id] = report
+        self._history[order_id] = [report]
         return report
 
     def _advance(
@@ -112,36 +126,54 @@ class PaperExecutionEngine:
         fill_price: float | None = None,
     ) -> PaperExecutionReport:
         self._validate_order_id(order_id)
-        with self._lock:
-            current = self._lookup(order_id)
-            if current.order.status is not OrderStatus.SUBMITTED:
-                raise OrderLifecycleError("only a SUBMITTED order may be filled or cancelled")
-            lineage_snapshot = deepcopy(self._history[order_id])
-            snapshot, identities = self._capture_integrity(current.execution_intent)
-            current_before = current
-            occurred_at = self._read_clock()
-            if self._current.get(order_id) is not current_before:
-                raise OrderLifecycleError("current order changed during transition")
-            self._verify_integrity(current.execution_intent, snapshot, identities)
-            if self._history[order_id] != lineage_snapshot:
-                raise DomainValidationError("clock must not mutate paper execution history")
-            current.validate()
-            if occurred_at < current.occurred_at:
-                raise DomainValidationError("occurred_at must not precede the previous report")
-            report = PaperExecutionReport(
-                current.execution_intent,
-                self._copy_order(current.order, status),
-                OrderStatus.SUBMITTED,
-                occurred_at,
-                reason=reason,
-                filled_quantity=current.order.quantity if status is OrderStatus.FILLED else None,
-                average_fill_price=fill_price,
-            )
-            report.validate()
-            self._current[order_id] = report
-            self._history[order_id].append(report)
-        self._publish(report)
+        current = self._lookup(order_id)
+        if current.order.status is not OrderStatus.SUBMITTED:
+            raise OrderLifecycleError("only a SUBMITTED order may be filled or cancelled")
+        history_before = self._history[order_id]
+        reports_before = tuple(history_before)
+        history_snapshot = deepcopy(history_before)
+        snapshot, identities = self._capture_integrity(current.execution_intent)
+        occurred_at = self._read_clock()
+        if self._current.get(order_id) is not current:
+            raise OrderLifecycleError("current order changed during transition")
+        self._verify_integrity(current.execution_intent, snapshot, identities)
+        if self._history.get(order_id) is not history_before:
+            raise DomainValidationError("clock must not replace the paper execution history list")
+        if len(history_before) != len(reports_before) or any(
+            actual is not expected
+            for actual, expected in zip(history_before, reports_before, strict=True)
+        ):
+            raise DomainValidationError("clock must not replace paper execution history reports")
+        if history_before != history_snapshot:
+            raise DomainValidationError("clock must not mutate paper execution history")
+        current.validate()
+        if occurred_at < current.occurred_at:
+            raise DomainValidationError("occurred_at must not precede the previous report")
+        report = PaperExecutionReport(
+            current.execution_intent,
+            self._copy_order(current.order, status),
+            OrderStatus.SUBMITTED,
+            occurred_at,
+            reason=reason,
+            filled_quantity=current.order.quantity if status is OrderStatus.FILLED else None,
+            average_fill_price=fill_price,
+        )
+        report.validate()
+        self._current[order_id] = report
+        history_before.append(report)
         return report
+
+    @contextmanager
+    def _transition_guard(self) -> Iterator[None]:
+        """Serialize transitions and reject callback-driven lifecycle re-entry."""
+        with self._lock:
+            if self._transition_active:
+                raise OrderLifecycleError("paper lifecycle transitions must not be re-entered")
+            self._transition_active = True
+            try:
+                yield
+            finally:
+                self._transition_active = False
 
     def _read_clock(self) -> datetime:
         clock_before = self.clock
