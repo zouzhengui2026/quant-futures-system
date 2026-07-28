@@ -10,8 +10,12 @@ from threading import RLock
 
 from quant_futures.core.events import Event, EventBus, EventType
 from quant_futures.core.exceptions import DomainValidationError, PortfolioLedgerError
-from quant_futures.domain.order import OrderSide, OrderStatus
+from quant_futures.alpha.models import AlphaCandidate
+from quant_futures.decision.models import DecisionIntent
+from quant_futures.domain.order import Order, OrderSide, OrderStatus
+from quant_futures.execution.models import ExecutionIntent
 from quant_futures.execution.paper.models import PaperExecutionReport
+from quant_futures.observation.models import MarketObservation
 from quant_futures.portfolio.models import (
     EMPTY_PORTFOLIO_TIMESTAMP,
     PortfolioSnapshot,
@@ -21,10 +25,30 @@ from quant_futures.portfolio.models import (
     _account_position,
     _realized_total,
 )
+from quant_futures.risk.models import RiskAssessment
+from quant_futures.timing.models import TimingAssessment
 
 _ACTIVE_PORTFOLIO_LEDGERS: ContextVar[frozenset[int]] = ContextVar(
     "_ACTIVE_PORTFOLIO_LEDGERS", default=frozenset()
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _CommittedIdentity:
+    """Exact object references for one committed execution lineage."""
+
+    update: PositionUpdate
+    report: PaperExecutionReport
+    order: Order
+    execution_intent: ExecutionIntent
+    risk_assessment: RiskAssessment
+    decision_intent: DecisionIntent
+    alpha_candidate: AlphaCandidate
+    timing_assessment: TimingAssessment
+    observation: MarketObservation
+    current_position: PositionSnapshot
+    portfolio_snapshot: PortfolioSnapshot
+    portfolio_positions: tuple[PositionSnapshot, ...]
 
 
 @dataclass(slots=True)
@@ -33,9 +57,7 @@ class PortfolioLedger:
     _positions: dict[tuple[str, str], PositionSnapshot] = field(init=False, repr=False)
     _history: dict[tuple[str, str], list[PositionUpdate]] = field(init=False, repr=False)
     _processed: dict[str, PositionUpdate] = field(init=False, repr=False)
-    _committed_identity: dict[str, tuple[PositionUpdate, PaperExecutionReport,
-                                         PositionSnapshot, PortfolioSnapshot]] = field(
-                                             init=False, repr=False)
+    _committed_identity: dict[str, _CommittedIdentity] = field(init=False, repr=False)
     _lock: RLock = field(init=False, repr=False)
     _transition_active: bool = field(init=False, repr=False)
 
@@ -85,8 +107,22 @@ class PortfolioLedger:
             self._positions[key] = current
             self._history.setdefault(key, []).append(update)
             self._processed[order_id] = update
-            self._committed_identity[order_id] = (
-                update, execution_report, current, portfolio,
+            risk = intent.risk_assessment
+            decision = risk.decision_intent
+            alpha = decision.alpha_candidate
+            self._committed_identity[order_id] = _CommittedIdentity(
+                update=update,
+                report=execution_report,
+                order=execution_report.order,
+                execution_intent=intent,
+                risk_assessment=risk,
+                decision_intent=decision,
+                alpha_candidate=alpha,
+                timing_assessment=alpha.timing_assessment,
+                observation=alpha.observation,
+                current_position=current,
+                portfolio_snapshot=portfolio,
+                portfolio_positions=portfolio.positions,
             )
             self._publish(update)
             return update
@@ -122,12 +158,30 @@ class PortfolioLedger:
                         raise PortfolioLedgerError("history order IDs must be globally unique")
                     seen[order_id] = update
                     identity = self._committed_identity.get(order_id)
-                    if identity is None or identity[0] is not update:
+                    if identity is None or identity.update is not update:
                         raise PortfolioLedgerError("stored update identity was replaced")
-                    if (identity[1] is not update.execution_report
-                            or identity[2] is not update.current_position
-                            or identity[3] is not update.portfolio_snapshot):
+                    report = update.execution_report
+                    intent = report.execution_intent
+                    risk = intent.risk_assessment
+                    decision = risk.decision_intent
+                    alpha = decision.alpha_candidate
+                    portfolio = update.portfolio_snapshot
+                    if (identity.report is not report
+                            or identity.order is not report.order
+                            or identity.execution_intent is not intent
+                            or identity.risk_assessment is not risk
+                            or identity.decision_intent is not decision
+                            or identity.alpha_candidate is not alpha
+                            or identity.timing_assessment is not alpha.timing_assessment
+                            or identity.observation is not alpha.observation
+                            or identity.current_position is not update.current_position
+                            or identity.portfolio_snapshot is not portfolio):
                         raise PortfolioLedgerError("stored audit object identity was replaced")
+                    if (len(portfolio.positions) != len(identity.portfolio_positions)
+                            or any(actual is not committed for actual, committed in zip(
+                                portfolio.positions, identity.portfolio_positions))):
+                        raise PortfolioLedgerError(
+                            "stored portfolio position identities were replaced")
                     previous_update = update
                 if self._positions[key] is not history[-1].current_position:
                     raise PortfolioLedgerError("position must be the last history position")

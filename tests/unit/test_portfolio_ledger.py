@@ -568,3 +568,65 @@ def test_valid_complete_multi_fill_audit_state_continues_to_apply():
     assert ledger.history("replay", "BTCUSDT") == (first, second, third)
     assert ledger.processed("audit-three") is third
     assert len(events) == 3
+
+
+@pytest.mark.parametrize("lineage_field", [
+    "order",
+    "execution_intent",
+    "risk_assessment",
+    "decision_intent",
+    "alpha_candidate",
+    "timing_assessment",
+    "observation",
+])
+def test_equal_lineage_clone_is_rejected_before_subsequent_commit(lineage_field):
+    ledger, events, first, _ = _two_fill_ledger()
+    report = first.execution_report
+    execution_intent = report.execution_intent
+    risk = execution_intent.risk_assessment
+    decision = risk.decision_intent
+    alpha = decision.alpha_candidate
+    owners = {
+        "order": (report, report.order),
+        "execution_intent": (report, execution_intent),
+        "risk_assessment": (execution_intent, risk),
+        "decision_intent": (risk, decision),
+        "alpha_candidate": (decision, alpha),
+        "timing_assessment": (alpha, alpha.timing_assessment),
+        "observation": (alpha, alpha.observation),
+    }
+    owner, original = owners[lineage_field]
+    committed_identity = ledger._committed_identity
+    committed_records = dict(committed_identity)
+    object.__setattr__(owner, lineage_field, replace(original))
+
+    _assert_audit_corruption_rejects_third(ledger, events)
+    assert ledger._committed_identity is committed_identity
+    assert ledger._committed_identity == committed_records
+
+
+def test_equal_non_current_portfolio_position_clone_is_rejected():
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
+    ledger = PortfolioLedger(bus)
+    first = ledger.apply(filled_for("multi-a", 100, "alpha", "BTCUSDT"))
+    second = ledger.apply(filled_for("multi-b", 200, "zeta", "ETHUSDT"))
+    portfolio = second.portfolio_snapshot
+    assert portfolio.positions == (first.current_position, second.current_position)
+    object.__setattr__(portfolio, "positions", (
+        replace(first.current_position), second.current_position,
+    ))
+    positions = ledger._positions
+    history = ledger._history
+    processed = ledger._processed
+    committed_identity = ledger._committed_identity
+
+    with pytest.raises((DomainValidationError, PortfolioLedgerError)):
+        ledger.apply(filled_for(
+            "multi-c", 210, "zeta", "ETHUSDT", when=NOW + timedelta(seconds=1)))
+    assert ledger._positions is positions
+    assert ledger._history is history
+    assert ledger._processed is processed
+    assert ledger._committed_identity is committed_identity
+    assert "multi-c" not in processed
+    assert len(events) == 2
