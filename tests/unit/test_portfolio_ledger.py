@@ -189,6 +189,33 @@ def test_in_place_commitment_rewrite_cannot_forge_audit_anchor() -> None:
     assert len(events) == 2
 
 
+def test_working_commitment_wrapper_mutation_cannot_forge_authority() -> None:
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
+    ledger = PortfolioLedger(bus)
+    first = ledger.apply(filled("wrapper-one", 100.0))
+    ledger.apply(filled(
+        "wrapper-two", 101.0, when=NOW + timedelta(seconds=1)))
+    forged = replace(first)
+    key = (first.current_position.source, first.current_position.symbol)
+    order_id = first.execution_report.order.order_id
+    working = ledger._committed_identity[order_id]
+    authority = _LEDGER_ANCHORS[ledger].authoritative_committed_identity[order_id]
+    assert working is not authority
+
+    ledger._history[key][0] = forged
+    ledger._processed[order_id] = forged
+    object.__setattr__(working, "update", forged)
+
+    with pytest.raises(PortfolioLedgerError, match="commitment entry was replaced"):
+        ledger.apply(filled(
+            "wrapper-three", 102.0, when=NOW + timedelta(seconds=2)))
+    assert authority.update is first
+    assert "wrapper-three" not in ledger._processed
+    assert len(ledger._history[key]) == 2
+    assert len(events) == 2
+
+
 @pytest.mark.parametrize("mutation", ["add", "remove", "wrong"])
 def test_in_place_commitment_mapping_mutation_is_detected(mutation) -> None:
     ledger = PortfolioLedger(EventBus())
@@ -219,6 +246,30 @@ def test_ledger_authority_registry_uses_weak_ownership() -> None:
     gc.collect()
 
     assert ledger_ref() is None
+    assert len(_LEDGER_ANCHORS) == baseline
+
+
+def test_subscriber_cycle_cannot_retain_ledger_anchor_or_event_bus() -> None:
+    gc.collect()
+    baseline = len(_LEDGER_ANCHORS)
+    bus = EventBus()
+    ledger = PortfolioLedger(bus)
+
+    def subscriber(_event, captured_ledger=ledger) -> None:
+        captured_ledger.positions()
+
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, subscriber)
+    ledger_ref = weakref.ref(ledger)
+    bus_ref = weakref.ref(bus)
+    subscriber_ref = weakref.ref(subscriber)
+    assert ledger in _LEDGER_ANCHORS
+
+    del subscriber, ledger, bus
+    gc.collect()
+
+    assert ledger_ref() is None
+    assert bus_ref() is None
+    assert subscriber_ref() is None
     assert len(_LEDGER_ANCHORS) == baseline
 
 

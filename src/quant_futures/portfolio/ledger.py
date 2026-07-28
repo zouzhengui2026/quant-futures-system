@@ -7,7 +7,7 @@ from contextvars import ContextVar
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from threading import RLock, local
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from quant_futures.core.events import Event, EventBus, EventType
 from quant_futures.core.exceptions import DomainValidationError, PortfolioLedgerError
@@ -60,12 +60,40 @@ class _LedgerAnchor:
     """Instance-external authorities that callbacks cannot replace."""
 
     lock: object
-    event_bus: EventBus
+    event_bus_ref: ReferenceType[EventBus]
     working_committed_identity: dict[str, _CommittedIdentity]
+    committed_working_entries: dict[str, _CommittedIdentity]
     authoritative_committed_identity: dict[str, _CommittedIdentity]
 
 
 _LEDGER_ANCHORS: WeakKeyDictionary[PortfolioLedger, _LedgerAnchor] = WeakKeyDictionary()
+
+
+def _anchor_for(ledger: PortfolioLedger) -> _LedgerAnchor:
+    """Return module-private authority without exposing it via the instance."""
+    anchor = _LEDGER_ANCHORS.get(ledger)
+    if anchor is None:
+        raise PortfolioLedgerError("portfolio ledger authority is unavailable")
+    return anchor
+
+
+def _event_bus_for(ledger: PortfolioLedger) -> EventBus:
+    event_bus = _anchor_for(ledger).event_bus_ref()
+    if event_bus is None:
+        raise PortfolioLedgerError("portfolio ledger event bus is unavailable")
+    return event_bus
+
+
+def _authority_insert(ledger: PortfolioLedger, order_id: str,
+                      identity: _CommittedIdentity) -> None:
+    """Commit an independent wrapper to the instance-external authority."""
+    anchor = _anchor_for(ledger)
+    anchor.committed_working_entries[order_id] = identity
+    authority = anchor.authoritative_committed_identity
+    authority[order_id] = _CommittedIdentity(
+        **{field_name: getattr(identity, field_name)
+           for field_name in _CommittedIdentity.__dataclass_fields__}
+    )
 
 
 @dataclass(slots=True, eq=False, weakref_slot=True)
@@ -88,7 +116,7 @@ class PortfolioLedger:
         self._lock = RLock()
         self._transition_active = False
         _LEDGER_ANCHORS[self] = _LedgerAnchor(
-            self._lock, self.event_bus, self._committed_identity, {})
+            self._lock, ref(self.event_bus), self._committed_identity, {}, {})
 
     def apply(self, execution_report: PaperExecutionReport) -> PositionUpdate:
         """Validate and atomically commit one fill.
@@ -151,22 +179,29 @@ class PortfolioLedger:
                 portfolio_positions=portfolio.positions,
             )
             self._committed_identity[order_id] = identity
-            self._anchor().authoritative_committed_identity[order_id] = identity
+            _authority_insert(self, order_id, identity)
             self._publish(update)
             return update
 
     def _validate_committed_state(self) -> None:
         """Fail closed unless the complete committed audit graph is intact."""
         try:
-            anchor = self._anchor()
+            anchor = _anchor_for(self)
             if self._committed_identity is not anchor.working_committed_identity:
                 raise PortfolioLedgerError("identity commitment anchor was replaced")
             authority = anchor.authoritative_committed_identity
-            if set(self._committed_identity) != set(authority):
+            expected_working = anchor.committed_working_entries
+            if (set(self._committed_identity) != set(authority)
+                    or set(expected_working) != set(authority)):
                 raise PortfolioLedgerError("identity commitments differ from authority")
-            if any(self._committed_identity[order_id] is not identity
-                   for order_id, identity in authority.items()):
-                raise PortfolioLedgerError("identity commitment entry was replaced")
+            for order_id, authoritative in authority.items():
+                working = self._committed_identity[order_id]
+                if (working is not expected_working[order_id]
+                        or working is authoritative or any(
+                    getattr(working, field_name) is not getattr(authoritative, field_name)
+                    for field_name in _CommittedIdentity.__dataclass_fields__
+                )):
+                    raise PortfolioLedgerError("identity commitment entry was replaced")
             if set(self._positions) != set(self._history):
                 raise PortfolioLedgerError("position and history keys must match")
             seen: dict[str, PositionUpdate] = {}
@@ -240,19 +275,19 @@ class PortfolioLedger:
 
     def get(self, source: str, symbol: str) -> PositionSnapshot:
         key = self._validate_key(source, symbol)
-        with self._anchor().lock:
+        with _anchor_for(self).lock:
             try:
                 return self._positions[key]
             except KeyError as exc:
                 raise PortfolioLedgerError(f"unknown position: {source}/{symbol}") from exc
 
     def positions(self) -> tuple[PositionSnapshot, ...]:
-        with self._anchor().lock:
+        with _anchor_for(self).lock:
             return tuple(self._positions[key] for key in sorted(self._positions))
 
     def history(self, source: str, symbol: str) -> tuple[PositionUpdate, ...]:
         key = self._validate_key(source, symbol)
-        with self._anchor().lock:
+        with _anchor_for(self).lock:
             try:
                 return tuple(self._history[key])
             except KeyError as exc:
@@ -260,14 +295,14 @@ class PortfolioLedger:
 
     def processed(self, order_id: str) -> PositionUpdate:
         self._non_empty("order_id", order_id)
-        with self._anchor().lock:
+        with _anchor_for(self).lock:
             try:
                 return self._processed[order_id]
             except KeyError as exc:
                 raise PortfolioLedgerError(f"unknown order_id: {order_id}") from exc
 
     def snapshot(self) -> PortfolioSnapshot:
-        with self._anchor().lock:
+        with _anchor_for(self).lock:
             return self._make_snapshot(self._positions)
 
     @staticmethod
@@ -289,7 +324,7 @@ class PortfolioLedger:
         risk = intent.risk_assessment
         decision = risk.decision_intent
         alpha = decision.alpha_candidate
-        self._anchor().event_bus.publish(Event(EventType.PORTFOLIO_UPDATED, {
+        _event_bus_for(self).publish(Event(EventType.PORTFOLIO_UPDATED, {
             "position_update": update,
             "execution_report": report,
             "previous_position": update.previous_position,
@@ -306,7 +341,7 @@ class PortfolioLedger:
     @contextmanager
     def _transition_guard(self) -> Iterator[None]:
         ledger_id = id(self)
-        anchor = self._anchor()
+        anchor = _anchor_for(self)
         thread_active = getattr(_THREAD_ACTIVE_PORTFOLIO_LEDGERS, "active", frozenset())
         if ledger_id in thread_active:
             raise PortfolioLedgerError("portfolio transitions must not be re-entered")
@@ -325,15 +360,9 @@ class PortfolioLedger:
             finally:
                 self._transition_active = False
                 self._lock = anchor.lock
-                self.event_bus = anchor.event_bus
+                self.event_bus = _event_bus_for(self)
                 _THREAD_ACTIVE_PORTFOLIO_LEDGERS.active = thread_active
                 _ACTIVE_PORTFOLIO_LEDGERS.reset(token)
-
-    def _anchor(self) -> _LedgerAnchor:
-        anchor = _LEDGER_ANCHORS.get(self)
-        if anchor is None:
-            raise PortfolioLedgerError("portfolio ledger authority is unavailable")
-        return anchor
 
     @classmethod
     def _validate_key(cls, source: object, symbol: object) -> tuple[str, str]:
