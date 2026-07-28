@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from threading import Barrier, Event as ThreadEvent, Thread
@@ -241,6 +242,7 @@ def test_event_publication_is_serialized_in_history_order() -> None:
 def test_clock_cannot_replace_history_list_or_report_with_equal_clone(replacement: str) -> None:
     engine = PaperExecutionEngine(EventBus(), lambda: NOW)
     submitted = engine.submit(intent())
+    original_history_dict = engine._history
     original_history = engine._history["paper-1"]
 
     def clock() -> datetime:
@@ -254,6 +256,10 @@ def test_clock_cannot_replace_history_list_or_report_with_equal_clone(replacemen
     with pytest.raises(DomainValidationError, match="replace"):
         engine.fill("paper-1", 1.0)
     assert engine.get("paper-1") is submitted
+    assert engine._history is original_history_dict
+    assert engine._history["paper-1"] is original_history
+    assert engine._history["paper-1"][0] is submitted
+    assert engine.history("paper-1") == (submitted,)
 
 
 def test_clock_cannot_replace_current_execution_intent_with_equal_clone() -> None:
@@ -342,3 +348,185 @@ def test_all_terminal_states_reject_further_transitions(terminal: str) -> None:
     ):
         with pytest.raises(OrderLifecycleError):
             transition()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: object.__setattr__(report, "occurred_at", NOW + timedelta(days=1)),
+        lambda report: object.__setattr__(report, "reason", "tampered"),
+        lambda report: object.__setattr__(report, "previous_status", OrderStatus.REJECTED),
+        lambda report: object.__setattr__(report.order, "quantity", 99.0),
+        lambda report: object.__setattr__(report.order, "status", OrderStatus.FILLED),
+        lambda report: object.__setattr__(
+            report.execution_intent, "created_at", NOW + timedelta(days=1)
+        ),
+        lambda report: object.__setattr__(report.execution_intent.order, "quantity", 99.0),
+    ],
+)
+def test_clock_in_place_current_report_tampering_is_fully_rolled_back(mutate) -> None:
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.EXECUTION_UPDATED, events.append)
+    engine = PaperExecutionEngine(bus, lambda: NOW)
+    submitted = engine.submit(intent())
+    value_snapshot = deepcopy(submitted)
+    original_order = submitted.order
+    original_intent = submitted.execution_intent
+
+    def clock() -> datetime:
+        mutate(submitted)
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises(DomainValidationError):
+        engine.fill("paper-1", 1.0)
+    assert engine.get("paper-1") is submitted
+    assert engine.history("paper-1")[0] is submitted
+    assert submitted == value_snapshot
+    assert submitted.order is original_order
+    assert submitted.execution_intent is original_intent
+    submitted.validate()
+    assert len(events) == 1
+
+
+@pytest.mark.parametrize(
+    "selector,field,value",
+    [
+        (lambda report: report.execution_intent.risk_assessment, "policy_name", "tampered"),
+        (
+            lambda report: report.execution_intent.risk_assessment.decision_intent,
+            "policy_name",
+            "tampered",
+        ),
+        (
+            lambda report: report.execution_intent.risk_assessment.decision_intent.alpha_candidate,
+            "model_name",
+            "tampered",
+        ),
+        (
+            lambda report: report.execution_intent.risk_assessment.decision_intent.alpha_candidate.timing_assessment,
+            "confidence",
+            0.1,
+        ),
+        (
+            lambda report: report.execution_intent.risk_assessment.decision_intent.alpha_candidate.observation,
+            "price",
+            1.0,
+        ),
+    ],
+)
+def test_clock_lineage_tampering_restores_values_and_identities(selector, field, value) -> None:
+    engine = PaperExecutionEngine(EventBus(), lambda: NOW)
+    submitted = engine.submit(intent())
+    lineage = (
+        submitted.execution_intent.risk_assessment,
+        submitted.execution_intent.risk_assessment.decision_intent,
+        submitted.execution_intent.risk_assessment.decision_intent.alpha_candidate,
+        submitted.execution_intent.risk_assessment.decision_intent.alpha_candidate.timing_assessment,
+        submitted.execution_intent.risk_assessment.decision_intent.alpha_candidate.observation,
+    )
+    snapshots = tuple(deepcopy(item) for item in lineage)
+
+    def clock() -> datetime:
+        object.__setattr__(selector(submitted), field, value)
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises(DomainValidationError):
+        engine.cancel("paper-1", "cancel")
+    restored = (
+        submitted.execution_intent.risk_assessment,
+        submitted.execution_intent.risk_assessment.decision_intent,
+        submitted.execution_intent.risk_assessment.decision_intent.alpha_candidate,
+        submitted.execution_intent.risk_assessment.decision_intent.alpha_candidate.timing_assessment,
+        submitted.execution_intent.risk_assessment.decision_intent.alpha_candidate.observation,
+    )
+    assert all(actual is original for actual, original in zip(restored, lineage, strict=True))
+    assert restored == snapshots
+    submitted.validate()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["history_dict", "history_list", "report_clone", "report_time", "order_quantity",
+     "intent_clone", "insert_report", "delete_report"],
+)
+def test_every_history_tampering_mode_is_transactionally_restored(mutation: str) -> None:
+    engine = PaperExecutionEngine(EventBus(), lambda: NOW)
+    submitted = engine.submit(intent())
+    history_dict = engine._history
+    history_list = history_dict["paper-1"]
+    value_snapshot = deepcopy(submitted)
+
+    def clock() -> datetime:
+        if mutation == "history_dict":
+            engine._history = dict(engine._history)
+        elif mutation == "history_list":
+            engine._history["paper-1"] = list(history_list)
+        elif mutation == "report_clone":
+            history_list[0] = replace(submitted)
+        elif mutation == "report_time":
+            object.__setattr__(submitted, "occurred_at", NOW + timedelta(days=1))
+        elif mutation == "order_quantity":
+            object.__setattr__(submitted.order, "quantity", 99.0)
+        elif mutation == "intent_clone":
+            object.__setattr__(submitted, "execution_intent", replace(submitted.execution_intent))
+        elif mutation == "insert_report":
+            history_list.append(replace(submitted))
+        else:
+            history_list.clear()
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises((DomainValidationError, OrderLifecycleError)):
+        engine.fill("paper-1", 1.0)
+    assert engine._history is history_dict
+    assert engine._history["paper-1"] is history_list
+    assert history_list == [submitted]
+    assert history_list[0] is submitted
+    assert submitted == value_snapshot
+
+
+@pytest.mark.parametrize("phase", ["register", "advance"])
+@pytest.mark.parametrize("mutation", ["insert", "delete", "current", "list", "report"])
+def test_unrelated_ledger_tampering_is_transactionally_restored(
+    phase: str, mutation: str
+) -> None:
+    engine = PaperExecutionEngine(EventBus(), lambda: NOW)
+    unrelated = engine.submit(intent(order_id="unrelated"))
+    target = engine.submit(intent(order_id="target")) if phase == "advance" else None
+    current_dict, history_dict = engine._current, engine._history
+    unrelated_list = history_dict["unrelated"]
+
+    def clock() -> datetime:
+        if mutation == "insert":
+            engine._current["intruder"] = unrelated
+            engine._history["intruder"] = [unrelated]
+        elif mutation == "delete":
+            del engine._current["unrelated"]
+            del engine._history["unrelated"]
+        elif mutation == "current":
+            engine._current["unrelated"] = replace(unrelated)
+        elif mutation == "list":
+            engine._history["unrelated"] = list(unrelated_list)
+        else:
+            object.__setattr__(unrelated, "reason", "tampered")
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises(DomainValidationError):
+        if phase == "register":
+            engine.submit(intent(order_id="target"))
+        else:
+            engine.fill("target", 1.0)
+    assert engine._current is current_dict
+    assert engine._history is history_dict
+    expected_keys = {"unrelated", "target"} if phase == "advance" else {"unrelated"}
+    assert set(current_dict) == expected_keys
+    assert set(history_dict) == expected_keys
+    assert current_dict["unrelated"] is unrelated
+    assert history_dict["unrelated"] is unrelated_list
+    assert unrelated_list == [unrelated]
+    assert unrelated.reason is None
+    if target is not None:
+        assert current_dict["target"] is target

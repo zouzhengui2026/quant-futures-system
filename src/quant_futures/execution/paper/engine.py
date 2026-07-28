@@ -3,7 +3,7 @@
 from copy import deepcopy
 from contextlib import contextmanager
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
 from math import isfinite
 from numbers import Real
@@ -16,6 +16,26 @@ from quant_futures.domain.order import Order, OrderStatus
 from quant_futures.execution.models import ExecutionIntent
 
 from .models import PaperExecutionReport
+
+
+@dataclass(slots=True)
+class _ObjectSnapshot:
+    value: object
+    field_values: dict[str, object]
+    value_snapshot: object
+
+
+@dataclass(slots=True)
+class _LedgerSnapshot:
+    current_dict: dict[str, PaperExecutionReport]
+    history_dict: dict[str, list[PaperExecutionReport]]
+    current_items: dict[str, PaperExecutionReport]
+    history_items: dict[str, list[PaperExecutionReport]]
+    history_reports: dict[str, tuple[PaperExecutionReport, ...]]
+    current_value_snapshot: dict[str, PaperExecutionReport]
+    history_value_snapshot: dict[str, list[PaperExecutionReport]]
+    object_snapshots: tuple[_ObjectSnapshot, ...]
+    clock: Callable[[], datetime]
 
 
 @dataclass(slots=True)
@@ -100,19 +120,21 @@ class PaperExecutionEngine:
         order_id = intent.order.order_id
         if order_id in self._current or order_id in self._history:
             raise OrderLifecycleError(f"order_id already exists: {order_id}")
-        snapshot, identities = self._capture_integrity(intent)
-        occurred_at = self._read_clock()
-        self._verify_integrity(intent, snapshot, identities)
-        if order_id in self._current or order_id in self._history:
-            raise OrderLifecycleError("clock must not modify paper execution ledgers")
-        report = PaperExecutionReport(
-            intent,
-            self._copy_order(intent.order, status),
-            OrderStatus.CREATED,
-            occurred_at,
-            reason=reason,
-        )
-        report.validate()
+        callback_snapshot = self._capture_callback_state(intent)
+        try:
+            occurred_at = self._read_clock()
+            self._validate_callback_state(callback_snapshot)
+            report = PaperExecutionReport(
+                intent,
+                self._copy_order(intent.order, status),
+                OrderStatus.CREATED,
+                occurred_at,
+                reason=reason,
+            )
+            report.validate()
+        except BaseException:
+            self._rollback_callback(callback_snapshot)
+            raise
         self._current[order_id] = report
         self._history[order_id] = [report]
         return report
@@ -133,52 +155,39 @@ class PaperExecutionEngine:
         intent_before = current.execution_intent
         order_before = current.order
         current_value_snapshot = deepcopy(current)
-        history_before = self._history[order_id]
-        reports_before = tuple(history_before)
-        history_snapshot = deepcopy(history_before)
-        snapshot, identities = self._capture_integrity(current.execution_intent)
+        callback_snapshot = self._capture_callback_state()
         try:
             occurred_at = self._read_clock()
-        except BaseException:
-            self._restore_current_report(current, intent_before, order_before)
-            raise
-        if self._current.get(order_id) is not current_before:
-            self._restore_current_report(current, intent_before, order_before)
-            raise OrderLifecycleError("current order changed during transition")
-        if current.execution_intent is not intent_before:
-            self._restore_current_report(current, intent_before, order_before)
-            raise DomainValidationError(
-                "clock must not replace the current report execution intent"
+            if self._current.get(order_id) is not current_before:
+                raise OrderLifecycleError("current order changed during transition")
+            if current.execution_intent is not intent_before:
+                raise DomainValidationError(
+                    "clock must not replace the current report execution intent"
+                )
+            if current.order is not order_before:
+                raise DomainValidationError("clock must not replace the current report order")
+            if current != current_value_snapshot:
+                raise DomainValidationError(
+                    "clock must not mutate the current paper execution report"
+                )
+            self._validate_callback_state(callback_snapshot)
+            current.validate()
+            if occurred_at < current.occurred_at:
+                raise DomainValidationError("occurred_at must not precede the previous report")
+            report = PaperExecutionReport(
+                current.execution_intent,
+                self._copy_order(current.order, status),
+                OrderStatus.SUBMITTED,
+                occurred_at,
+                reason=reason,
+                filled_quantity=current.order.quantity if status is OrderStatus.FILLED else None,
+                average_fill_price=fill_price,
             )
-        if current.order is not order_before:
-            self._restore_current_report(current, intent_before, order_before)
-            raise DomainValidationError("clock must not replace the current report order")
-        if current != current_value_snapshot:
-            self._restore_current_report(current, intent_before, order_before)
-            raise DomainValidationError("clock must not mutate the current paper execution report")
-        self._verify_integrity(current.execution_intent, snapshot, identities)
-        if self._history.get(order_id) is not history_before:
-            raise DomainValidationError("clock must not replace the paper execution history list")
-        if len(history_before) != len(reports_before) or any(
-            actual is not expected
-            for actual, expected in zip(history_before, reports_before, strict=True)
-        ):
-            raise DomainValidationError("clock must not replace paper execution history reports")
-        if history_before != history_snapshot:
-            raise DomainValidationError("clock must not mutate paper execution history")
-        current.validate()
-        if occurred_at < current.occurred_at:
-            raise DomainValidationError("occurred_at must not precede the previous report")
-        report = PaperExecutionReport(
-            current.execution_intent,
-            self._copy_order(current.order, status),
-            OrderStatus.SUBMITTED,
-            occurred_at,
-            reason=reason,
-            filled_quantity=current.order.quantity if status is OrderStatus.FILLED else None,
-            average_fill_price=fill_price,
-        )
-        report.validate()
+            report.validate()
+        except BaseException:
+            self._rollback_callback(callback_snapshot)
+            raise
+        history_before = self._history[order_id]
         self._current[order_id] = report
         history_before.append(report)
         return report
@@ -212,56 +221,105 @@ class PaperExecutionEngine:
             raise DomainValidationError("clock must return a timezone-aware datetime")
         return occurred_at
 
-    @staticmethod
-    def _capture_integrity(intent: ExecutionIntent) -> tuple[ExecutionIntent, tuple[object, ...]]:
-        risk = intent.risk_assessment
-        decision = risk.decision_intent
-        alpha = decision.alpha_candidate
-        return deepcopy(intent), (
-            intent,
-            intent.order,
-            risk,
-            decision,
-            alpha,
-            alpha.timing_assessment,
-            alpha.observation,
+    def _capture_callback_state(self, *extra_roots: object) -> _LedgerSnapshot:
+        object_snapshots: dict[int, _ObjectSnapshot] = {}
+
+        def capture(value: object) -> None:
+            if is_dataclass(value) and not isinstance(value, type):
+                if id(value) in object_snapshots:
+                    return
+                values = {item.name: getattr(value, item.name) for item in fields(value)}
+                object_snapshots[id(value)] = _ObjectSnapshot(value, values, deepcopy(value))
+                for child in values.values():
+                    capture(child)
+            elif isinstance(value, dict):
+                for key, child in value.items():
+                    capture(key)
+                    capture(child)
+            elif isinstance(value, (tuple, list)):
+                for child in value:
+                    capture(child)
+
+        for report in self._current.values():
+            capture(report)
+        for reports in self._history.values():
+            capture(reports)
+        for root in extra_roots:
+            capture(root)
+        return _LedgerSnapshot(
+            current_dict=self._current,
+            history_dict=self._history,
+            current_items=dict(self._current),
+            history_items=dict(self._history),
+            history_reports={key: tuple(value) for key, value in self._history.items()},
+            current_value_snapshot=deepcopy(self._current),
+            history_value_snapshot=deepcopy(self._history),
+            object_snapshots=tuple(object_snapshots.values()),
+            clock=self.clock,
         )
 
-    @staticmethod
-    def _verify_integrity(
-        intent: ExecutionIntent,
-        snapshot: ExecutionIntent,
-        identities: tuple[object, ...],
-    ) -> None:
-        intent.validate()
-        risk = intent.risk_assessment
-        decision = risk.decision_intent
-        alpha = decision.alpha_candidate
-        after = (
-            intent,
-            intent.order,
-            risk,
-            decision,
-            alpha,
-            alpha.timing_assessment,
-            alpha.observation,
-        )
-        if intent != snapshot:
-            raise DomainValidationError("clock must not mutate ExecutionIntent or its lineage")
-        if any(left is not right for left, right in zip(after, identities, strict=True)):
-            raise DomainValidationError("clock must not replace ExecutionIntent lineage objects")
+    def _validate_callback_state(self, snapshot: _LedgerSnapshot) -> None:
+        if self.clock is not snapshot.clock:
+            raise DomainValidationError("clock must not be replaced during a transition")
+        if self._current is not snapshot.current_dict:
+            raise DomainValidationError("clock must not replace the current ledger dictionary")
+        if self._history is not snapshot.history_dict:
+            raise DomainValidationError("clock must not replace the paper execution history dictionary")
+        if set(self._current) != set(snapshot.current_items):
+            raise DomainValidationError("clock must not add or remove current ledger orders")
+        if any(self._current[key] is not value for key, value in snapshot.current_items.items()):
+            raise DomainValidationError("clock must not replace current ledger reports")
+        if set(self._history) != set(snapshot.history_items):
+            raise DomainValidationError("clock must not add or remove history ledger orders")
+        for key, reports in snapshot.history_items.items():
+            if self._history[key] is not reports:
+                raise DomainValidationError("clock must not replace the paper execution history list")
+            expected = snapshot.history_reports[key]
+            if len(reports) != len(expected) or any(
+                actual is not original
+                for actual, original in zip(reports, expected, strict=True)
+            ):
+                raise DomainValidationError("clock must not replace paper execution history reports")
+        if self._current != snapshot.current_value_snapshot:
+            raise DomainValidationError("clock must not mutate current ledger reports")
+        if self._history != snapshot.history_value_snapshot:
+            raise DomainValidationError("clock must not mutate paper execution history")
+        for item in snapshot.object_snapshots:
+            if item.value != item.value_snapshot:
+                raise DomainValidationError("clock must not mutate the paper execution object graph")
+            for name, original in item.field_values.items():
+                value = getattr(item.value, name)
+                if self._identity_value(original) and value is not original:
+                    raise DomainValidationError("clock must not replace paper execution object graph members")
+
+    def _rollback_callback(self, snapshot: _LedgerSnapshot) -> None:
+        self.clock = snapshot.clock
+        self._current = snapshot.current_dict
+        snapshot.current_dict.clear()
+        snapshot.current_dict.update(snapshot.current_items)
+        self._history = snapshot.history_dict
+        snapshot.history_dict.clear()
+        snapshot.history_dict.update(snapshot.history_items)
+        for key, reports in snapshot.history_items.items():
+            reports[:] = snapshot.history_reports[key]
+        for item in snapshot.object_snapshots:
+            for name, original in item.field_values.items():
+                object.__setattr__(item.value, name, original)
+        self._validate_callback_state(snapshot)
+        for item in snapshot.object_snapshots:
+            validate = getattr(item.value, "validate", None)
+            if callable(validate):
+                validate()
+            else:
+                post_init = getattr(item.value, "__post_init__", None)
+                if callable(post_init):
+                    post_init()
 
     @staticmethod
-    def _restore_current_report(
-        current: PaperExecutionReport,
-        intent: ExecutionIntent,
-        order: Order,
-    ) -> None:
-        """Undo only illegal callback replacement of a current report's fields."""
-        if current.execution_intent is not intent:
-            object.__setattr__(current, "execution_intent", intent)
-        if current.order is not order:
-            object.__setattr__(current, "order", order)
+    def _identity_value(value: object) -> bool:
+        return is_dataclass(value) and not isinstance(value, type) or isinstance(
+            value, (tuple, list, dict)
+        )
 
     def _lookup(self, order_id: str) -> PaperExecutionReport:
         try:
