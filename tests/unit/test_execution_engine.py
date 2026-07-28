@@ -108,6 +108,114 @@ def test_policy_is_deterministic_and_calls_factories_once() -> None:
     assert first == second
 
 
+CALLBACK_MUTATIONS = [
+    ("clock", "quantity"),
+    ("clock", "price"),
+    ("clock", "name"),
+    ("clock", "order_id_factory"),
+    ("order_id_factory", "quantity"),
+    ("order_id_factory", "price"),
+    ("order_id_factory", "clock"),
+]
+
+
+def mutating_policy(phase: str, field: str) -> tuple[FixedQuantityExecutionPolicy, dict[str, int]]:
+    holder: dict[str, FixedQuantityExecutionPolicy] = {}
+    calls = {"clock": 0, "order_id_factory": 0}
+
+    def replacement_clock() -> datetime:
+        return CREATED
+
+    def replacement_identifier() -> str:
+        return "order-1"
+
+    replacements: dict[str, object] = {
+        "quantity": 2.0,
+        "price": 60_000.0,
+        "name": "changed_but_valid",
+        "clock": replacement_clock,
+        "order_id_factory": replacement_identifier,
+    }
+
+    def clock() -> datetime:
+        calls["clock"] += 1
+        if phase == "clock":
+            object.__setattr__(holder["policy"], field, replacements[field])
+        return CREATED
+
+    def identifier() -> str:
+        calls["order_id_factory"] += 1
+        if phase == "order_id_factory":
+            object.__setattr__(holder["policy"], field, replacements[field])
+        return "order-1"
+
+    result = FixedQuantityExecutionPolicy(
+        quantity=1.0,
+        price=None,
+        clock=clock,
+        order_id_factory=identifier,
+        name="captured_name",
+    )
+    holder["policy"] = result
+    return result, calls
+
+
+@pytest.mark.parametrize("phase,field", CALLBACK_MUTATIONS)
+def test_policy_rejects_valid_configuration_mutation_during_callbacks(
+    phase: str, field: str
+) -> None:
+    configured, calls = mutating_policy(phase, field)
+    with pytest.raises(
+        ValueError,
+        match="configuration must not change during create_intent",
+    ):
+        configured.create_intent(risk_for())
+    assert calls["clock"] == 1
+    assert calls["order_id_factory"] == (0 if phase == "clock" else 1)
+
+
+@pytest.mark.parametrize("phase,field", CALLBACK_MUTATIONS)
+def test_engine_does_not_publish_when_callback_mutates_valid_configuration(
+    phase: str, field: str
+) -> None:
+    configured, calls = mutating_policy(phase, field)
+    bus, events = EventBus(), []
+    bus.subscribe(EXECUTION_UPDATED, events.append)
+    with pytest.raises(
+        ValueError,
+        match="configuration must not change during create_intent",
+    ):
+        ExecutionEngine(bus, configured).create_intent(risk_for())
+    assert calls["clock"] == 1
+    assert calls["order_id_factory"] == (0 if phase == "clock" else 1)
+    assert events == []
+
+
+def test_policy_normal_output_uses_captured_configuration_once() -> None:
+    calls = {"clock": 0, "order_id_factory": 0}
+
+    def clock() -> datetime:
+        calls["clock"] += 1
+        return CREATED
+
+    def identifier() -> str:
+        calls["order_id_factory"] += 1
+        return "captured-order"
+
+    configured = FixedQuantityExecutionPolicy(
+        quantity=3.0,
+        price=61_000.0,
+        clock=clock,
+        order_id_factory=identifier,
+        name="captured_policy",
+    )
+    intent = configured.create_intent(risk_for())
+    assert calls == {"clock": 1, "order_id_factory": 1}
+    assert intent.order.quantity == 3.0
+    assert intent.order.price == 61_000.0
+    assert intent.policy_name == "captured_policy"
+
+
 @pytest.mark.parametrize("field,value", [
     ("quantity", 0), ("quantity", True), ("quantity", float("nan")),
     ("price", -1), ("price", "1"), ("clock", None),
@@ -243,12 +351,24 @@ def test_engine_rejects_non_intent_rename_and_engine_policy_replacement_without_
     lambda intent: object.__setattr__(intent, "policy_name", "forged"),
     lambda intent: object.__setattr__(intent, "symbol", "ETHUSDT"),
     lambda intent: object.__setattr__(intent, "source", "forged"),
+    lambda intent: object.__setattr__(intent.order, "symbol", "ETHUSDT"),
+    lambda intent: object.__setattr__(intent.order, "side", OrderSide.SELL),
     lambda intent: object.__setattr__(intent.order, "quantity", 0),
     lambda intent: object.__setattr__(intent.order, "price", -1),
     lambda intent: object.__setattr__(intent.order, "order_id", ""),
     lambda intent: object.__setattr__(intent.order, "created_at", datetime(2026, 1, 1)),
+    lambda intent: object.__setattr__(intent, "created_at", datetime(2026, 1, 1)),
+    lambda intent: object.__setattr__(intent, "created_at", ASSESSED - timedelta(seconds=1)),
+    lambda intent: object.__setattr__(intent.order, "created_at", ASSESSED - timedelta(seconds=1)),
+    lambda intent: object.__setattr__(intent.order, "status", OrderStatus.SUBMITTED),
     lambda intent: object.__setattr__(intent.order, "status", OrderStatus.FILLED),
-], ids=["policy-name", "symbol", "source", "quantity", "price", "order-id", "order-time", "status"])
+    lambda intent: object.__setattr__(intent.order, "status", OrderStatus.CANCELLED),
+    lambda intent: object.__setattr__(intent.order, "status", OrderStatus.REJECTED),
+], ids=[
+    "policy-name", "symbol", "source", "order-symbol", "order-side", "quantity",
+    "price", "order-id", "naive-order-time", "naive-intent-time", "early-intent-time",
+    "early-order-time", "submitted", "filled", "cancelled", "rejected",
+])
 def test_engine_rejects_forged_output_without_event(mutation: object) -> None:
     bus, events, risk = EventBus(), [], risk_for()
     bus.subscribe(EXECUTION_UPDATED, events.append)

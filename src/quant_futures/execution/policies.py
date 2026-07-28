@@ -31,7 +31,18 @@ class FixedQuantityExecutionPolicy:
         self._validate_configuration()
 
     def create_intent(self, risk_assessment: RiskAssessment) -> ExecutionIntent:
-        self._validate_configuration()
+        quantity_before = self.quantity
+        price_before = self.price
+        clock_before = self.clock
+        order_id_factory_before = self.order_id_factory
+        name_before = self.name
+        self._validate_configuration_values(
+            quantity_before,
+            price_before,
+            clock_before,
+            order_id_factory_before,
+            name_before,
+        )
         if not isinstance(risk_assessment, RiskAssessment):
             raise TypeError("create_intent expects a RiskAssessment")
         risk_assessment.validate()
@@ -45,16 +56,30 @@ class FixedQuantityExecutionPolicy:
         if action not in sides:
             raise DomainValidationError("only a directional proposal may create an intent")
 
-        created_at = self.clock()
-        order_id = self.order_id_factory()
+        created_at = clock_before()
+        self._verify_configuration_stability(
+            quantity_before,
+            price_before,
+            clock_before,
+            order_id_factory_before,
+            name_before,
+        )
+        order_id = order_id_factory_before()
+        self._verify_configuration_stability(
+            quantity_before,
+            price_before,
+            clock_before,
+            order_id_factory_before,
+            name_before,
+        )
         if not isinstance(order_id, str) or not order_id.strip():
             raise DomainValidationError("order_id_factory must return a non-empty string")
         order = Order(
             order_id=order_id,
             symbol=risk_assessment.symbol,
             side=sides[action],
-            quantity=self.quantity,
-            price=self.price,
+            quantity=quantity_before,
+            price=price_before,
             status=OrderStatus.CREATED,
             created_at=created_at,
         )
@@ -62,21 +87,64 @@ class FixedQuantityExecutionPolicy:
             symbol=risk_assessment.symbol,
             source=risk_assessment.source,
             created_at=created_at,
-            policy_name=self.name,
+            policy_name=name_before,
             order=order,
             risk_assessment=risk_assessment,
         )
 
     def _validate_configuration(self) -> None:
-        self._positive("quantity", self.quantity)
-        if self.price is not None:
-            self._positive("price", self.price)
-        if not callable(self.clock):
+        self._validate_configuration_values(
+            self.quantity,
+            self.price,
+            self.clock,
+            self.order_id_factory,
+            self.name,
+        )
+
+    @classmethod
+    def _validate_configuration_values(
+        cls,
+        quantity: object,
+        price: object,
+        clock: object,
+        order_id_factory: object,
+        name: object,
+    ) -> None:
+        cls._positive("quantity", quantity)
+        if price is not None:
+            cls._positive("price", price)
+        if not callable(clock):
             raise DomainValidationError("clock must be callable")
-        if not callable(self.order_id_factory):
+        if not callable(order_id_factory):
             raise DomainValidationError("order_id_factory must be callable")
-        if not isinstance(self.name, str) or not self.name.strip():
+        if not isinstance(name, str) or not name.strip():
             raise DomainValidationError("name must be a non-empty string")
+
+    def _verify_configuration_stability(
+        self,
+        quantity_before: object,
+        price_before: object,
+        clock_before: object,
+        order_id_factory_before: object,
+        name_before: object,
+    ) -> None:
+        try:
+            unchanged = (
+                self.quantity == quantity_before
+                and self.price == price_before
+                and self.clock is clock_before
+                and self.order_id_factory is order_id_factory_before
+                and self.name == name_before
+            )
+        except Exception as exc:
+            raise DomainValidationError(
+                "FixedQuantityExecutionPolicy configuration must not change during create_intent"
+            ) from exc
+        if not unchanged:
+            raise DomainValidationError(
+                "FixedQuantityExecutionPolicy configuration must not change during create_intent"
+            )
+        self._validate_configuration()
 
     @staticmethod
     def _positive(name: str, value: object) -> None:
