@@ -1,6 +1,7 @@
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
-from datetime import timedelta
-from threading import Barrier, Thread
+from datetime import datetime, timedelta, timezone, tzinfo
+from threading import Barrier, Event as ThreadEvent, Thread
 
 import pytest
 
@@ -24,6 +25,27 @@ def filled(order_id: str, price: float, *, direction=None, when=NOW, quantity=2.
         quantity=quantity, clock=lambda: intent(order_id=order_id).created_at,
         order_id_factory=lambda: order_id,
     ).create_intent(risk)
+    engine.submit(value)
+    return engine.fill(order_id, price)
+
+
+def filled_for(order_id: str, price: float, source: str, symbol: str, *, when=NOW):
+    """Build a valid report for an arbitrary accounting key."""
+    base = risk_for()
+    observation = replace(base.decision_intent.alpha_candidate.observation,
+                          source=source, symbol=symbol)
+    timing = replace(base.decision_intent.alpha_candidate.timing_assessment,
+                     observation=observation)
+    alpha = replace(base.decision_intent.alpha_candidate, source=source, symbol=symbol,
+                    observation=observation, timing_assessment=timing)
+    decision = replace(base.decision_intent, source=source, symbol=symbol,
+                       alpha_candidate=alpha)
+    risk = replace(base, source=source, symbol=symbol, decision_intent=decision)
+    value = FixedQuantityExecutionPolicy(
+        quantity=2.0, clock=lambda: intent(order_id=order_id).created_at,
+        order_id_factory=lambda: order_id,
+    ).create_intent(risk)
+    engine = PaperExecutionEngine(EventBus(), lambda: when)
     engine.submit(value)
     return engine.fill(order_id, price)
 
@@ -195,11 +217,29 @@ def test_tampered_stored_previous_fails_atomically(field, value):
     bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
     ledger = PortfolioLedger(bus)
     previous = ledger.apply(filled(f"tamper-first-{field}", 100)).current_position
-    before = state(ledger)
+    positions_dict, history_dict, processed_dict = (
+        ledger._positions, ledger._history, ledger._processed)
+    key = (previous.source, previous.symbol)
+    history_list = ledger._history[key]
+    original_updates = tuple(history_list)
+    before_values = deepcopy(state(ledger))
     object.__setattr__(previous, field, value)
+    # Detection is fail-closed, not restoration of adversarial pre-existing edits.
+    tampered_values = deepcopy(state(ledger))
     with pytest.raises(DomainValidationError):
         ledger.apply(filled(f"tamper-next-{field}", 110, when=NOW + timedelta(seconds=2)))
-    assert state(ledger) == before
+    assert ledger._positions is positions_dict
+    assert ledger._history is history_dict
+    assert ledger._processed is processed_dict
+    assert ledger._history[key] is history_list
+    assert ledger._positions[key] is previous
+    assert tuple(ledger._history[key]) == original_updates
+    assert all(actual is expected for actual, expected in zip(history_list, original_updates))
+    assert ledger._processed[original_updates[0].execution_report.order.order_id] is original_updates[0]
+    assert len(ledger._positions) == len(positions_dict) == 1
+    assert len(ledger._processed) == len(processed_dict) == 1
+    assert state(ledger) == tampered_values
+    assert state(ledger) != before_values
     assert len(events) == 1
 
 
@@ -234,7 +274,7 @@ def test_rejects_every_non_filled_report_status(status):
         PortfolioLedger(EventBus()).apply(report)
 
 
-def test_concurrent_duplicate_has_one_success_and_different_fills_are_serialized():
+def test_concurrent_same_report_has_exactly_one_success():
     ledger, barrier, outcomes = PortfolioLedger(EventBus()), Barrier(3), []
     report = filled("race", 100)
     def run():
@@ -259,3 +299,181 @@ def test_all_models_are_frozen_slotted_and_repeatably_validate():
         model.validate(); model.validate()
         with pytest.raises((FrozenInstanceError, AttributeError)):
             setattr(model, next(iter(model.__dataclass_fields__)), None)
+
+
+def test_identical_symbols_from_different_sources_are_independent():
+    ledger = PortfolioLedger(EventBus())
+    first = ledger.apply(filled_for("source-a", 100, "a", "BTCUSDT"))
+    second = ledger.apply(filled_for("source-b", 200, "b", "BTCUSDT"))
+    assert ledger.positions() == (first.current_position, second.current_position)
+    assert ledger.history("a", "BTCUSDT") == (first,)
+    assert ledger.history("b", "BTCUSDT") == (second,)
+
+
+@pytest.mark.parametrize("operation,args", [
+    ("get", ("", "BTCUSDT")), ("get", (" ", "BTCUSDT")),
+    ("get", (1, "BTCUSDT")), ("get", ("replay", "")),
+    ("get", ("replay", "\t")), ("get", ("replay", object())),
+    ("history", ("", "BTCUSDT")), ("history", ("replay", " ")),
+    ("processed", ("",)), ("processed", (" \n",)), ("processed", (False,)),
+])
+def test_query_strings_are_strictly_validated(operation, args):
+    with pytest.raises(DomainValidationError):
+        getattr(PortfolioLedger(EventBus()), operation)(*args)
+
+
+def test_non_report_and_unknown_history_are_rejected():
+    ledger = PortfolioLedger(EventBus())
+    with pytest.raises(DomainValidationError):
+        ledger.apply(object())
+    with pytest.raises(PortfolioLedgerError, match="unknown position"):
+        ledger.history("replay", "missing")
+
+
+@pytest.mark.parametrize("quantity,side,average", [
+    (2.0, PositionSide.LONG, 10.0),
+    (-2.0, PositionSide.SHORT, 10.0),
+    (0.0, PositionSide.FLAT, None),
+])
+def test_position_snapshot_accepts_all_valid_sides(quantity, side, average):
+    PositionSnapshot("source", "symbol", quantity, side, average, 0.0, NOW, "order").validate()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("source", ""), ("source", "  "), ("source", 1),
+    ("symbol", ""), ("symbol", None), ("last_order_id", "\t"),
+    ("signed_quantity", True), ("signed_quantity", float("nan")),
+    ("signed_quantity", float("inf")), ("realized_pnl", float("-inf")),
+    ("updated_at", datetime(2026, 1, 1)),
+])
+def test_position_snapshot_rejects_invalid_scalars(field, value):
+    values = dict(source="s", symbol="x", signed_quantity=1.0,
+                  side=PositionSide.LONG, average_entry_price=10.0,
+                  realized_pnl=0.0, updated_at=NOW, last_order_id="o")
+    values[field] = value
+    with pytest.raises(DomainValidationError):
+        PositionSnapshot(**values)
+
+
+class _BrokenTimezone(tzinfo):
+    def utcoffset(self, dt):
+        raise ValueError("broken timezone")
+
+
+def test_position_snapshot_rejects_timezone_that_cannot_compute_offset():
+    with pytest.raises(DomainValidationError):
+        PositionSnapshot("s", "x", 1, PositionSide.LONG, 10, 0,
+                         datetime(2026, 1, 1, tzinfo=_BrokenTimezone()), "o")
+
+
+@pytest.mark.parametrize("quantity,side,average", [
+    (1, PositionSide.SHORT, 10), (-1, PositionSide.LONG, 10),
+    (0, PositionSide.LONG, 10), (0, PositionSide.SHORT, 10),
+    (0, PositionSide.FLAT, 10), (1, PositionSide.LONG, None),
+    (-1, PositionSide.SHORT, None), (1, PositionSide.LONG, 0),
+    (-1, PositionSide.SHORT, -1), (1, PositionSide.LONG, float("nan")),
+    (-1, PositionSide.SHORT, float("inf")),
+])
+def test_position_snapshot_rejects_every_side_and_average_mismatch(quantity, side, average):
+    with pytest.raises(DomainValidationError):
+        PositionSnapshot("s", "x", quantity, side, average, 0, NOW, "o")
+
+
+def test_portfolio_snapshot_rejects_duplicates_sorting_total_and_timestamp():
+    base = PortfolioLedger(EventBus()).apply(filled("portfolio-invalid", 100)).current_position
+    earlier = replace(base, source="a", symbol="a")
+    later = replace(base, source="b", symbol="b", updated_at=NOW + timedelta(seconds=1))
+    invalid = [
+        ((earlier, earlier), earlier.realized_pnl * 2, earlier.updated_at),
+        ((later, earlier), 0.0, later.updated_at),
+        ((earlier,), 1.0, earlier.updated_at),
+        ((earlier,), 0.0, later.updated_at),
+    ]
+    for positions, total, updated_at in invalid:
+        with pytest.raises(DomainValidationError):
+            PortfolioSnapshot(positions, total, updated_at)
+
+
+@pytest.mark.parametrize("model_name,field,value", [
+    ("position", "side", PositionSide.SHORT),
+    ("portfolio", "total_realized_pnl", 99.0),
+    ("update", "realized_pnl_delta", 99.0),
+])
+def test_all_models_validate_fail_closed_after_adversarial_tampering(model_name, field, value):
+    update = PortfolioLedger(EventBus()).apply(filled(f"tamper-model-{model_name}", 100))
+    model = {"position": update.current_position,
+             "portfolio": update.portfolio_snapshot, "update": update}[model_name]
+    object.__setattr__(model, field, value)
+    with pytest.raises(DomainValidationError):
+        model.validate()
+
+
+def test_success_preserves_exact_complete_lineage_identity():
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
+    ledger = PortfolioLedger(bus)
+    report = filled("lineage", 100)
+    update = ledger.apply(report)
+    payload = events[0].payload
+    intent_value = report.execution_intent
+    risk = intent_value.risk_assessment
+    decision = risk.decision_intent
+    alpha = decision.alpha_candidate
+    expected = {
+        "position_update": update, "execution_report": report,
+        "previous_position": update.previous_position,
+        "current_position": update.current_position,
+        "portfolio_snapshot": update.portfolio_snapshot,
+        "execution_intent": intent_value, "risk_assessment": risk,
+        "decision_intent": decision, "alpha_candidate": alpha,
+        "timing_assessment": alpha.timing_assessment,
+        "observation": alpha.observation,
+    }
+    assert set(payload) == set(expected)
+    assert all(payload[name] is value for name, value in expected.items())
+    assert ledger.history("replay", "BTCUSDT")[0] is update
+    assert ledger.processed("lineage") is update
+
+
+def test_subscriber_observes_every_committed_query_before_delivery():
+    bus, observed = EventBus(), []
+    ledger = PortfolioLedger(bus)
+    def subscriber(event):
+        update = event.payload["position_update"]
+        position = update.current_position
+        observed.append((ledger.get(position.source, position.symbol), ledger.positions(),
+                         ledger.history(position.source, position.symbol),
+                         ledger.processed(position.last_order_id), ledger.snapshot()))
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, subscriber)
+    update = ledger.apply(filled("visible", 100))
+    assert observed == [(update.current_position, (update.current_position,), (update,),
+                         update, update.portfolio_snapshot)]
+
+
+def test_concurrent_different_keys_are_serialized_without_lost_updates():
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
+    ledger = PortfolioLedger(bus)
+    barrier, release = Barrier(3), ThreadEvent()
+    reports = [filled_for("parallel-a", 100, "a", "BTC"),
+               filled_for("parallel-b", 200, "b", "ETH")]
+    outcomes = []
+    def run(report):
+        barrier.wait()
+        release.wait()
+        outcomes.append(ledger.apply(report))
+    workers = [Thread(target=run, args=(report,)) for report in reports]
+    for worker in workers: worker.start()
+    barrier.wait(); release.set()
+    for worker in workers: worker.join()
+    committed = [event.payload["position_update"] for event in events]
+    assert len(outcomes) == len(committed) == 2
+    assert {id(update) for update in outcomes} == {id(update) for update in committed}
+    assert [len(update.portfolio_snapshot.positions) for update in committed] == [1, 2]
+    assert ledger.positions() == tuple(sorted(
+        (update.current_position for update in committed),
+        key=lambda position: (position.source, position.symbol)))
+    for update in committed:
+        position = update.current_position
+        assert ledger.history(position.source, position.symbol) == (update,)
+        assert ledger.processed(position.last_order_id) is update

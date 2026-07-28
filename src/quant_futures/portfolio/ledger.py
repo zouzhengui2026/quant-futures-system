@@ -46,6 +46,14 @@ class PortfolioLedger:
         self._transition_active = False
 
     def apply(self, execution_report: PaperExecutionReport) -> PositionUpdate:
+        """Validate and atomically commit one fill.
+
+        Existing audit objects are revalidated before any new accounting state
+        is committed.  Adversarial ``object.__setattr__`` edits are therefore
+        detected fail-closed; because callers hold the exact immutable audit
+        objects, the ledger detects such pre-existing edits but does not claim
+        to restore their former values.
+        """
         with self._transition_guard():
             if not isinstance(execution_report, PaperExecutionReport):
                 raise DomainValidationError("execution_report must be a PaperExecutionReport")
