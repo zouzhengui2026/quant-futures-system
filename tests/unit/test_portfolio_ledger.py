@@ -477,3 +477,94 @@ def test_concurrent_different_keys_are_serialized_without_lost_updates():
         position = update.current_position
         assert ledger.history(position.source, position.symbol) == (update,)
         assert ledger.processed(position.last_order_id) is update
+
+
+def _two_fill_ledger():
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
+    ledger = PortfolioLedger(bus)
+    first = ledger.apply(filled("audit-one", 100, when=NOW))
+    second = ledger.apply(filled("audit-two", 110, when=NOW + timedelta(seconds=1)))
+    return ledger, events, first, second
+
+
+def _assert_audit_corruption_rejects_third(ledger, events):
+    key = ("replay", "BTCUSDT")
+    positions, history, processed = ledger._positions, ledger._history, ledger._processed
+    history_list = ledger._history[key]
+    position_count, history_count, processed_count = (
+        len(positions), len(history_list), len(processed))
+    with pytest.raises((DomainValidationError, PortfolioLedgerError)):
+        ledger.apply(filled("audit-three", 120, when=NOW + timedelta(seconds=2)))
+    assert ledger._positions is positions
+    assert ledger._history is history
+    assert ledger._processed is processed
+    assert ledger._history[key] is history_list
+    assert len(positions) == position_count
+    assert len(history_list) == history_count
+    assert len(processed) == processed_count
+    assert "audit-three" not in processed
+    assert len(events) == 2
+
+
+@pytest.mark.parametrize("field,replacement", [
+    ("realized_pnl_delta", lambda update: 999.0),
+    ("execution_report", lambda update: replace(update.execution_report)),
+    ("current_position", lambda update: replace(update.current_position)),
+    ("portfolio_snapshot", lambda update: replace(update.portfolio_snapshot)),
+])
+def test_older_update_tampering_is_detected_before_third_commit(field, replacement):
+    ledger, events, first, _ = _two_fill_ledger()
+    object.__setattr__(first, field, replacement(first))
+    _assert_audit_corruption_rejects_third(ledger, events)
+
+
+def test_replacing_history_entry_with_equal_clone_is_detected():
+    ledger, events, first, _ = _two_fill_ledger()
+    ledger._history[("replay", "BTCUSDT")][0] = replace(first)
+    _assert_audit_corruption_rejects_third(ledger, events)
+
+
+def test_broken_previous_current_identity_chain_is_detected():
+    ledger, events, first, second = _two_fill_ledger()
+    object.__setattr__(second, "previous_position", replace(first.current_position))
+    _assert_audit_corruption_rejects_third(ledger, events)
+
+
+@pytest.mark.parametrize("mutation", ["remove", "add"])
+def test_removed_or_added_history_entry_is_detected(mutation):
+    ledger, events, first, _ = _two_fill_ledger()
+    history = ledger._history[("replay", "BTCUSDT")]
+    if mutation == "remove":
+        history.pop(0)
+    else:
+        history.append(first)
+    _assert_audit_corruption_rejects_third(ledger, events)
+
+
+@pytest.mark.parametrize("mutation", ["clone", "wrong", "remove", "add"])
+def test_processed_mapping_corruption_is_detected(mutation):
+    ledger, events, first, second = _two_fill_ledger()
+    if mutation == "clone":
+        ledger._processed["audit-one"] = replace(first)
+    elif mutation == "wrong":
+        ledger._processed["audit-one"] = second
+    elif mutation == "remove":
+        del ledger._processed["audit-one"]
+    else:
+        ledger._processed["unexpected"] = first
+    _assert_audit_corruption_rejects_third(ledger, events)
+
+
+def test_position_not_identical_to_last_history_position_is_detected():
+    ledger, events, _, second = _two_fill_ledger()
+    ledger._positions[("replay", "BTCUSDT")] = replace(second.current_position)
+    _assert_audit_corruption_rejects_third(ledger, events)
+
+
+def test_valid_complete_multi_fill_audit_state_continues_to_apply():
+    ledger, events, first, second = _two_fill_ledger()
+    third = ledger.apply(filled("audit-three", 120, when=NOW + timedelta(seconds=2)))
+    assert ledger.history("replay", "BTCUSDT") == (first, second, third)
+    assert ledger.processed("audit-three") is third
+    assert len(events) == 3

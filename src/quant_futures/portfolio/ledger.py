@@ -33,6 +33,9 @@ class PortfolioLedger:
     _positions: dict[tuple[str, str], PositionSnapshot] = field(init=False, repr=False)
     _history: dict[tuple[str, str], list[PositionUpdate]] = field(init=False, repr=False)
     _processed: dict[str, PositionUpdate] = field(init=False, repr=False)
+    _committed_identity: dict[str, tuple[PositionUpdate, PaperExecutionReport,
+                                         PositionSnapshot, PortfolioSnapshot]] = field(
+                                             init=False, repr=False)
     _lock: RLock = field(init=False, repr=False)
     _transition_active: bool = field(init=False, repr=False)
 
@@ -42,6 +45,7 @@ class PortfolioLedger:
         self._positions = {}
         self._history = {}
         self._processed = {}
+        self._committed_identity = {}
         self._lock = RLock()
         self._transition_active = False
 
@@ -60,17 +64,13 @@ class PortfolioLedger:
             execution_report.validate()
             if execution_report.order.status is not OrderStatus.FILLED:
                 raise PortfolioLedgerError("only FILLED execution reports may be applied")
+            self._validate_committed_state()
             order_id = execution_report.order.order_id
             if order_id in self._processed:
                 raise PortfolioLedgerError(f"order_id already processed: {order_id}")
             intent = execution_report.execution_intent
             key = (intent.source, intent.symbol)
             previous = self._positions.get(key)
-            if previous is not None:
-                previous.validate()
-                # Revalidate the committed audit record as well as the snapshot;
-                # this detects semantically valid-looking object.__setattr__ edits.
-                self._history[key][-1].validate()
             if previous is not None and execution_report.occurred_at < previous.updated_at:
                 raise PortfolioLedgerError("fill occurred before the current position update")
             current, delta = self._account(previous, execution_report)
@@ -85,8 +85,63 @@ class PortfolioLedger:
             self._positions[key] = current
             self._history.setdefault(key, []).append(update)
             self._processed[order_id] = update
+            self._committed_identity[order_id] = (
+                update, execution_report, current, portfolio,
+            )
             self._publish(update)
             return update
+
+    def _validate_committed_state(self) -> None:
+        """Fail closed unless the complete committed audit graph is intact."""
+        try:
+            if set(self._positions) != set(self._history):
+                raise PortfolioLedgerError("position and history keys must match")
+            seen: dict[str, PositionUpdate] = {}
+            for key, history in self._history.items():
+                if not isinstance(history, list) or not history:
+                    raise PortfolioLedgerError("every history must be a non-empty list")
+                previous_update: PositionUpdate | None = None
+                for update in history:
+                    if not isinstance(update, PositionUpdate):
+                        raise PortfolioLedgerError("history must contain PositionUpdate values")
+                    update.validate()
+                    current_key = (update.current_position.source,
+                                   update.current_position.symbol)
+                    if current_key != key:
+                        raise PortfolioLedgerError("history update key does not match its key")
+                    if previous_update is None:
+                        if update.previous_position is not None:
+                            raise PortfolioLedgerError("first update must not have a previous position")
+                    else:
+                        if update.previous_position is not previous_update.current_position:
+                            raise PortfolioLedgerError("history position identity chain is broken")
+                        if update.applied_at < previous_update.applied_at:
+                            raise PortfolioLedgerError("history timestamps must be nondecreasing")
+                    order_id = update.execution_report.order.order_id
+                    if order_id in seen:
+                        raise PortfolioLedgerError("history order IDs must be globally unique")
+                    seen[order_id] = update
+                    identity = self._committed_identity.get(order_id)
+                    if identity is None or identity[0] is not update:
+                        raise PortfolioLedgerError("stored update identity was replaced")
+                    if (identity[1] is not update.execution_report
+                            or identity[2] is not update.current_position
+                            or identity[3] is not update.portfolio_snapshot):
+                        raise PortfolioLedgerError("stored audit object identity was replaced")
+                    previous_update = update
+                if self._positions[key] is not history[-1].current_position:
+                    raise PortfolioLedgerError("position must be the last history position")
+            if set(self._processed) != set(seen):
+                raise PortfolioLedgerError("processed order IDs must exactly match history")
+            if set(self._committed_identity) != set(seen):
+                raise PortfolioLedgerError("identity commitments must exactly match history")
+            if any(self._processed[order_id] is not update
+                   for order_id, update in seen.items()):
+                raise PortfolioLedgerError("processed update identity does not match history")
+        except (DomainValidationError, PortfolioLedgerError):
+            raise
+        except Exception as exc:
+            raise PortfolioLedgerError("committed portfolio state is structurally corrupt") from exc
 
     def get(self, source: str, symbol: str) -> PositionSnapshot:
         key = self._validate_key(source, symbol)
