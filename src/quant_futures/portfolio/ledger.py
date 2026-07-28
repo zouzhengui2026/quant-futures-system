@@ -127,7 +127,7 @@ class PortfolioLedger:
         objects, the ledger detects such pre-existing edits but does not claim
         to restore their former values.
         """
-        with self._transition_guard():
+        with self._transition_guard() as event_bus:
             if not isinstance(execution_report, PaperExecutionReport):
                 raise DomainValidationError("execution_report must be a PaperExecutionReport")
             execution_report.validate()
@@ -180,7 +180,7 @@ class PortfolioLedger:
             )
             self._committed_identity[order_id] = identity
             _authority_insert(self, order_id, identity)
-            self._publish(update)
+            self._publish(update, event_bus)
             return update
 
     def _validate_committed_state(self) -> None:
@@ -318,13 +318,13 @@ class PortfolioLedger:
                          default=EMPTY_PORTFOLIO_TIMESTAMP)
         return PortfolioSnapshot(ordered, total, updated_at)
 
-    def _publish(self, update: PositionUpdate) -> None:
+    def _publish(self, update: PositionUpdate, event_bus: EventBus) -> None:
         report = update.execution_report
         intent = report.execution_intent
         risk = intent.risk_assessment
         decision = risk.decision_intent
         alpha = decision.alpha_candidate
-        _event_bus_for(self).publish(Event(EventType.PORTFOLIO_UPDATED, {
+        event_bus.publish(Event(EventType.PORTFOLIO_UPDATED, {
             "position_update": update,
             "execution_report": report,
             "previous_position": update.previous_position,
@@ -339,9 +339,10 @@ class PortfolioLedger:
         }, occurred_at=update.applied_at))
 
     @contextmanager
-    def _transition_guard(self) -> Iterator[None]:
+    def _transition_guard(self) -> Iterator[EventBus]:
         ledger_id = id(self)
         anchor = _anchor_for(self)
+        event_bus = _event_bus_for(self)
         thread_active = getattr(_THREAD_ACTIVE_PORTFOLIO_LEDGERS, "active", frozenset())
         if ledger_id in thread_active:
             raise PortfolioLedgerError("portfolio transitions must not be re-entered")
@@ -356,11 +357,11 @@ class PortfolioLedger:
             _THREAD_ACTIVE_PORTFOLIO_LEDGERS.active = thread_active | {ledger_id}
             self._transition_active = True
             try:
-                yield
+                yield event_bus
             finally:
                 self._transition_active = False
                 self._lock = anchor.lock
-                self.event_bus = _event_bus_for(self)
+                self.event_bus = event_bus
                 _THREAD_ACTIVE_PORTFOLIO_LEDGERS.active = thread_active
                 _ACTIVE_PORTFOLIO_LEDGERS.reset(token)
 

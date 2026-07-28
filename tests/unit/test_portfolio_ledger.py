@@ -140,6 +140,39 @@ def test_callback_infrastructure_replacement_is_repaired_after_publication() -> 
     assert replacement_events == []
 
 
+def test_transition_retains_weakly_anchored_event_bus_through_cleanup() -> None:
+    ledger = PortfolioLedger(EventBus())
+    original = ledger.event_bus
+    replacement = EventBus()
+    original_events, replacement_events = [], []
+
+    def replace_event_bus(event) -> None:
+        original_events.append(event)
+        ledger.event_bus = replacement
+
+    original.subscribe(EventType.PORTFOLIO_UPDATED, replace_event_bus)
+    replacement.subscribe(EventType.PORTFOLIO_UPDATED, replacement_events.append)
+
+    first = ledger.apply(filled("retained-bus-first", 100.0))
+
+    assert ledger.processed("retained-bus-first") is first
+    assert ledger.history(first.current_position.source, first.current_position.symbol) == (first,)
+    assert len(original_events) == 1
+    assert original_events[0].payload["position_update"] is first
+    assert ledger.event_bus is original
+    assert replacement_events == []
+
+    second = ledger.apply(
+        filled("retained-bus-second", 101.0, when=NOW + timedelta(seconds=1)))
+
+    assert ledger.processed("retained-bus-second") is second
+    assert len(ledger.history(second.current_position.source, second.current_position.symbol)) == 2
+    assert len(original_events) == 2
+    assert original_events[1].payload["position_update"] is second
+    assert ledger.event_bus is original
+    assert replacement_events == []
+
+
 def test_instance_dictionary_rewrite_cannot_forge_audit_anchor() -> None:
     bus, events = EventBus(), []
     bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
