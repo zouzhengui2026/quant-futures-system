@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from contextlib import contextmanager
+from contextvars import ContextVar
 from collections.abc import Iterator
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,11 @@ from quant_futures.domain.order import Order, OrderStatus
 from quant_futures.execution.models import ExecutionIntent
 
 from .models import PaperExecutionReport
+
+_ACTIVE_PAPER_ENGINES: ContextVar[frozenset[int]] = ContextVar(
+    "_ACTIVE_PAPER_ENGINES",
+    default=frozenset(),
+)
 
 
 @dataclass(slots=True)
@@ -36,6 +42,9 @@ class _LedgerSnapshot:
     history_value_snapshot: dict[str, list[PaperExecutionReport]]
     object_snapshots: tuple[_ObjectSnapshot, ...]
     clock: Callable[[], datetime]
+    event_bus: EventBus
+    lock: object
+    transition_active: bool
 
 
 @dataclass(slots=True)
@@ -195,14 +204,21 @@ class PaperExecutionEngine:
     @contextmanager
     def _transition_guard(self) -> Iterator[None]:
         """Serialize transitions and reject callback-driven lifecycle re-entry."""
+        engine_key = id(self)
+        active = _ACTIVE_PAPER_ENGINES.get()
+        if engine_key in active:
+            raise OrderLifecycleError("paper lifecycle transitions must not be re-entered")
         with self._lock:
-            if self._transition_active:
+            active = _ACTIVE_PAPER_ENGINES.get()
+            if engine_key in active:
                 raise OrderLifecycleError("paper lifecycle transitions must not be re-entered")
+            token = _ACTIVE_PAPER_ENGINES.set(active | {engine_key})
             self._transition_active = True
             try:
                 yield
             finally:
                 self._transition_active = False
+                _ACTIVE_PAPER_ENGINES.reset(token)
 
     def _read_clock(self) -> datetime:
         clock_before = self.clock
@@ -256,11 +272,20 @@ class PaperExecutionEngine:
             history_value_snapshot=deepcopy(self._history),
             object_snapshots=tuple(object_snapshots.values()),
             clock=self.clock,
+            event_bus=self.event_bus,
+            lock=self._lock,
+            transition_active=self._transition_active,
         )
 
     def _validate_callback_state(self, snapshot: _LedgerSnapshot) -> None:
         if self.clock is not snapshot.clock:
             raise DomainValidationError("clock must not be replaced during a transition")
+        if self.event_bus is not snapshot.event_bus:
+            raise DomainValidationError("clock must not replace the event bus")
+        if self._lock is not snapshot.lock:
+            raise DomainValidationError("clock must not replace the lifecycle lock")
+        if self._transition_active is not True:
+            raise DomainValidationError("clock must not modify the transition guard state")
         if self._current is not snapshot.current_dict:
             raise DomainValidationError("clock must not replace the current ledger dictionary")
         if self._history is not snapshot.history_dict:
@@ -294,6 +319,9 @@ class PaperExecutionEngine:
 
     def _rollback_callback(self, snapshot: _LedgerSnapshot) -> None:
         self.clock = snapshot.clock
+        self.event_bus = snapshot.event_bus
+        self._lock = snapshot.lock
+        self._transition_active = snapshot.transition_active
         self._current = snapshot.current_dict
         snapshot.current_dict.clear()
         snapshot.current_dict.update(snapshot.current_items)

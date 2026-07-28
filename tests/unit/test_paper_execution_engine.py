@@ -1,7 +1,7 @@
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, Event as ThreadEvent, Thread
+from threading import Barrier, Event as ThreadEvent, RLock, Thread
 
 import pytest
 
@@ -530,3 +530,105 @@ def test_unrelated_ledger_tampering_is_transactionally_restored(
     assert unrelated.reason is None
     if target is not None:
         assert current_dict["target"] is target
+
+
+def test_clock_cannot_bypass_reentry_guard_by_resetting_observable_bool() -> None:
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.EXECUTION_UPDATED, events.append)
+    calls = 0
+    engine = None
+
+    def clock() -> datetime:
+        nonlocal calls
+        calls += 1
+        assert engine is not None
+        engine._transition_active = False
+        engine.submit(intent(order_id="nested"))
+        return NOW
+
+    engine = PaperExecutionEngine(bus, clock)
+    with pytest.raises(OrderLifecycleError, match="re-entered"):
+        engine.submit(intent(order_id="outer"))
+    assert calls == 1
+    assert engine._current == {}
+    assert engine._history == {}
+    assert events == []
+    assert engine._transition_active is False
+    engine.clock = lambda: NOW
+    assert engine.submit(intent(order_id="recovered")).order.status is OrderStatus.SUBMITTED
+
+
+def test_clock_event_bus_replacement_is_rolled_back_without_publication() -> None:
+    original_bus, original_events = EventBus(), []
+    replacement_bus, replacement_events = EventBus(), []
+    original_bus.subscribe(EventType.EXECUTION_UPDATED, original_events.append)
+    replacement_bus.subscribe(EventType.EXECUTION_UPDATED, replacement_events.append)
+    engine = PaperExecutionEngine(original_bus, lambda: NOW)
+
+    def clock() -> datetime:
+        engine.event_bus = replacement_bus
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises(DomainValidationError, match="event bus"):
+        engine.submit(intent())
+    assert engine.event_bus is original_bus
+    assert engine._current == {} and engine._history == {}
+    assert original_events == [] and replacement_events == []
+    assert engine._transition_active is False
+
+
+def test_clock_lock_replacement_is_rolled_back_and_engine_remains_serialized() -> None:
+    engine = PaperExecutionEngine(EventBus(), lambda: NOW)
+    original_lock = engine._lock
+
+    def clock() -> datetime:
+        engine._lock = RLock()
+        return NOW
+
+    engine.clock = clock
+    with pytest.raises(DomainValidationError, match="lifecycle lock"):
+        engine.submit(intent(order_id="failed"))
+    assert engine._lock is original_lock
+    assert engine._current == {} and engine._history == {}
+    assert engine._transition_active is False
+
+    engine.clock = lambda: NOW
+    barrier, outcomes = Barrier(3), []
+
+    def submit_concurrently(order_id: str) -> None:
+        barrier.wait()
+        outcomes.append(engine.submit(intent(order_id=order_id)).order.order_id)
+
+    workers = [
+        Thread(target=submit_concurrently, args=("one",)),
+        Thread(target=submit_concurrently, args=("two",)),
+    ]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join()
+    assert sorted(outcomes) == ["one", "two"]
+    assert set(engine._current) == {"one", "two"}
+
+
+def test_subscriber_cannot_bypass_reentry_guard_by_resetting_observable_bool() -> None:
+    bus, events = EventBus(), []
+    engine = PaperExecutionEngine(bus, lambda: NOW)
+    nested_errors = []
+
+    def subscriber(event) -> None:
+        events.append(event)
+        engine._transition_active = False
+        try:
+            engine.fill("paper-1", 1.0)
+        except OrderLifecycleError as exc:
+            nested_errors.append(exc)
+
+    bus.subscribe(EventType.EXECUTION_UPDATED, subscriber)
+    submitted = engine.submit(intent())
+    assert engine.history("paper-1") == (submitted,)
+    assert len(events) == 1 and len(nested_errors) == 1
+    assert "re-entered" in str(nested_errors[0])
+    assert engine._transition_active is False
