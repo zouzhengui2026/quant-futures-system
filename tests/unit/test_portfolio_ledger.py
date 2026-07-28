@@ -1,7 +1,8 @@
 from copy import deepcopy
+from contextvars import Context
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
-from threading import Barrier, Event as ThreadEvent, Thread
+from threading import Barrier, Event as ThreadEvent, RLock, Thread
 
 import pytest
 
@@ -53,6 +54,108 @@ def filled_for(order_id: str, price: float, source: str, symbol: str, *, when=NO
 def state(ledger):
     return (dict(ledger._positions), {key: tuple(value) for key, value in ledger._history.items()},
             dict(ledger._processed))
+
+
+def test_fresh_context_cannot_bypass_same_thread_reentry_guard() -> None:
+    bus, events = EventBus(), []
+    ledger = PortfolioLedger(bus)
+    nested = filled("fresh-context-nested", 101.0)
+
+    def subscriber(event) -> None:
+        events.append(event)
+        with pytest.raises(PortfolioLedgerError, match="re-entered"):
+            Context().run(ledger.apply, nested)
+
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, subscriber)
+    outer = ledger.apply(filled("fresh-context-outer", 100.0))
+
+    assert ledger.processed("fresh-context-outer") is outer
+    with pytest.raises(PortfolioLedgerError, match="unknown order_id"):
+        ledger.processed("fresh-context-nested")
+    assert ledger.history(outer.current_position.source, outer.current_position.symbol) == (outer,)
+    assert len(events) == 1
+
+
+def test_replacing_exposed_lock_cannot_overlap_transition_or_reorder_events() -> None:
+    bus, published = EventBus(), []
+    ledger = PortfolioLedger(bus)
+    original_lock = ledger._lock
+    publication_entered, release_publication = ThreadEvent(), ThreadEvent()
+    second_started, second_finished = ThreadEvent(), ThreadEvent()
+
+    def subscriber(event) -> None:
+        published.append(event.payload["execution_report"].order.order_id)
+        if len(published) == 1:
+            ledger._lock = RLock()
+            publication_entered.set()
+            assert release_publication.wait(2)
+
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, subscriber)
+
+    def apply_second() -> None:
+        assert publication_entered.wait(2)
+        second_started.set()
+        ledger.apply(filled_for("lock-second", 101.0, "other", "OTHER"))
+        second_finished.set()
+
+    thread = Thread(target=apply_second)
+    thread.start()
+    outer_done = ThreadEvent()
+    outer = Thread(target=lambda: (ledger.apply(filled("lock-first", 100.0)), outer_done.set()))
+    outer.start()
+    assert publication_entered.wait(2)
+    assert second_started.wait(2)
+    assert not second_finished.is_set()
+    release_publication.set()
+    outer.join(2)
+    thread.join(2)
+    assert outer_done.is_set() and second_finished.is_set()
+    assert published == ["lock-first", "lock-second"]
+    assert ledger._lock is original_lock
+
+
+def test_callback_infrastructure_replacement_is_repaired_after_publication() -> None:
+    original, replacement = EventBus(), EventBus()
+    original_events, replacement_events = [], []
+    ledger = PortfolioLedger(original)
+
+    def corrupt(event) -> None:
+        original_events.append(event)
+        ledger._lock = object()
+        ledger.event_bus = replacement
+        raise RuntimeError("subscriber failure")
+
+    unsubscribe = original.subscribe(EventType.PORTFOLIO_UPDATED, corrupt)
+    replacement.subscribe(EventType.PORTFOLIO_UPDATED, replacement_events.append)
+    with pytest.raises(RuntimeError, match="subscriber failure"):
+        ledger.apply(filled("infrastructure-first", 100.0))
+    assert ledger.event_bus is original
+    assert hasattr(ledger._lock, "acquire")
+    unsubscribe()
+    ledger.apply(filled("infrastructure-second", 101.0))
+    assert len(original_events) == 1
+    assert replacement_events == []
+
+
+def test_instance_dictionary_rewrite_cannot_forge_audit_anchor() -> None:
+    bus, events = EventBus(), []
+    bus.subscribe(EventType.PORTFOLIO_UPDATED, events.append)
+    ledger = PortfolioLedger(bus)
+    first = ledger.apply(filled("anchor-first", 100.0))
+    ledger.apply(filled("anchor-second", 101.0))
+    forged = replace(first)
+    key = (first.current_position.source, first.current_position.symbol)
+    ledger._history[key][0] = forged
+    ledger._processed["anchor-first"] = forged
+    ledger._committed_identity = dict(ledger._committed_identity)
+    ledger._committed_identity["anchor-first"] = replace(
+        ledger._committed_identity["anchor-first"], update=forged)
+
+    with pytest.raises(PortfolioLedgerError, match="anchor was replaced"):
+        ledger.apply(filled("anchor-third", 102.0))
+    assert "anchor-third" not in ledger._processed
+    assert len(ledger._history[key]) == 2
+    assert len(events) == 2
 
 
 def test_long_average_cost_reduce_close_and_flat_history() -> None:

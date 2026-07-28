@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from threading import RLock
+from threading import RLock, local
 
 from quant_futures.core.events import Event, EventBus, EventType
 from quant_futures.core.exceptions import DomainValidationError, PortfolioLedgerError
@@ -31,6 +31,7 @@ from quant_futures.timing.models import TimingAssessment
 _ACTIVE_PORTFOLIO_LEDGERS: ContextVar[frozenset[int]] = ContextVar(
     "_ACTIVE_PORTFOLIO_LEDGERS", default=frozenset()
 )
+_THREAD_ACTIVE_PORTFOLIO_LEDGERS = local()
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +54,19 @@ class _CommittedIdentity:
     portfolio_positions: tuple[PositionSnapshot, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _LedgerAnchor:
+    """Instance-external authorities that callbacks cannot replace."""
+
+    owner: PortfolioLedger
+    lock: object
+    event_bus: EventBus
+    committed_identity: dict[str, _CommittedIdentity]
+
+
+_LEDGER_ANCHORS: dict[int, _LedgerAnchor] = {}
+
+
 @dataclass(slots=True)
 class PortfolioLedger:
     event_bus: EventBus
@@ -72,6 +86,8 @@ class PortfolioLedger:
         self._committed_identity = {}
         self._lock = RLock()
         self._transition_active = False
+        _LEDGER_ANCHORS[id(self)] = _LedgerAnchor(
+            self, self._lock, self.event_bus, self._committed_identity)
 
     def apply(self, execution_report: PaperExecutionReport) -> PositionUpdate:
         """Validate and atomically commit one fill.
@@ -139,6 +155,9 @@ class PortfolioLedger:
     def _validate_committed_state(self) -> None:
         """Fail closed unless the complete committed audit graph is intact."""
         try:
+            anchor = self._anchor()
+            if self._committed_identity is not anchor.committed_identity:
+                raise PortfolioLedgerError("identity commitment anchor was replaced")
             if set(self._positions) != set(self._history):
                 raise PortfolioLedgerError("position and history keys must match")
             seen: dict[str, PositionUpdate] = {}
@@ -212,19 +231,19 @@ class PortfolioLedger:
 
     def get(self, source: str, symbol: str) -> PositionSnapshot:
         key = self._validate_key(source, symbol)
-        with self._lock:
+        with self._anchor().lock:
             try:
                 return self._positions[key]
             except KeyError as exc:
                 raise PortfolioLedgerError(f"unknown position: {source}/{symbol}") from exc
 
     def positions(self) -> tuple[PositionSnapshot, ...]:
-        with self._lock:
+        with self._anchor().lock:
             return tuple(self._positions[key] for key in sorted(self._positions))
 
     def history(self, source: str, symbol: str) -> tuple[PositionUpdate, ...]:
         key = self._validate_key(source, symbol)
-        with self._lock:
+        with self._anchor().lock:
             try:
                 return tuple(self._history[key])
             except KeyError as exc:
@@ -232,14 +251,14 @@ class PortfolioLedger:
 
     def processed(self, order_id: str) -> PositionUpdate:
         self._non_empty("order_id", order_id)
-        with self._lock:
+        with self._anchor().lock:
             try:
                 return self._processed[order_id]
             except KeyError as exc:
                 raise PortfolioLedgerError(f"unknown order_id: {order_id}") from exc
 
     def snapshot(self) -> PortfolioSnapshot:
-        with self._lock:
+        with self._anchor().lock:
             return self._make_snapshot(self._positions)
 
     @staticmethod
@@ -261,7 +280,7 @@ class PortfolioLedger:
         risk = intent.risk_assessment
         decision = risk.decision_intent
         alpha = decision.alpha_candidate
-        self.event_bus.publish(Event(EventType.PORTFOLIO_UPDATED, {
+        self._anchor().event_bus.publish(Event(EventType.PORTFOLIO_UPDATED, {
             "position_update": update,
             "execution_report": report,
             "previous_position": update.previous_position,
@@ -278,19 +297,34 @@ class PortfolioLedger:
     @contextmanager
     def _transition_guard(self) -> Iterator[None]:
         ledger_id = id(self)
+        anchor = self._anchor()
+        thread_active = getattr(_THREAD_ACTIVE_PORTFOLIO_LEDGERS, "active", frozenset())
+        if ledger_id in thread_active:
+            raise PortfolioLedgerError("portfolio transitions must not be re-entered")
         if ledger_id in _ACTIVE_PORTFOLIO_LEDGERS.get():
             raise PortfolioLedgerError("portfolio transitions must not be re-entered")
-        with self._lock:
+        with anchor.lock:
             active = _ACTIVE_PORTFOLIO_LEDGERS.get()
-            if ledger_id in active:
+            thread_active = getattr(_THREAD_ACTIVE_PORTFOLIO_LEDGERS, "active", frozenset())
+            if ledger_id in active or ledger_id in thread_active:
                 raise PortfolioLedgerError("portfolio transitions must not be re-entered")
             token = _ACTIVE_PORTFOLIO_LEDGERS.set(active | {ledger_id})
+            _THREAD_ACTIVE_PORTFOLIO_LEDGERS.active = thread_active | {ledger_id}
             self._transition_active = True
             try:
                 yield
             finally:
                 self._transition_active = False
+                self._lock = anchor.lock
+                self.event_bus = anchor.event_bus
+                _THREAD_ACTIVE_PORTFOLIO_LEDGERS.active = thread_active
                 _ACTIVE_PORTFOLIO_LEDGERS.reset(token)
+
+    def _anchor(self) -> _LedgerAnchor:
+        anchor = _LEDGER_ANCHORS.get(id(self))
+        if anchor is None or anchor.owner is not self:
+            raise PortfolioLedgerError("portfolio ledger authority is unavailable")
+        return anchor
 
     @classmethod
     def _validate_key(cls, source: object, symbol: object) -> tuple[str, str]:
