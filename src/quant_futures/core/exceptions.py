@@ -21,5 +21,9 @@ class PortfolioLedgerError(QuantFuturesError):
     """Raised when a portfolio ledger operation is invalid."""
 
 
+class AccountValuationError(QuantFuturesError):
+    """Raised when account valuation cannot be completed safely."""
+
+
 class MarketDataError(QuantFuturesError):
     """Raised when market data cannot be normalized or safely collected."""
