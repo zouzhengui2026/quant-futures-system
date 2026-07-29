@@ -1,8 +1,13 @@
 """Phase 12 account-aware portfolio risk coverage."""
 
 from contextvars import Context
+from dataclasses import replace
 from datetime import datetime, timezone
+import gc
 import math
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+import weakref
 
 import pytest
 
@@ -13,6 +18,7 @@ from quant_futures.market_data.models import MarketDataKind, MarketDataRecord
 from quant_futures.portfolio.models import PortfolioSnapshot, PositionSide, PositionSnapshot
 from quant_futures.risk import (
     PortfolioRiskEngine, PortfolioRiskLimits, PortfolioRiskOutcome, RiskLimitCode,
+    RiskLimitBreach,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -135,5 +141,147 @@ def test_coherent_tampering_and_equal_replacement_are_detected():
     result = engine.evaluate(account(("BTC", 1, 10)))
     replacement = tuple(list(result.position_exposures))
     object.__setattr__(result, "position_exposures", replacement)
+    with pytest.raises(PortfolioRiskError):
+        engine.history()
+
+
+def _breached_engine_and_result():
+    configured = limits(max_gross_notional=5, max_abs_net_notional=6,
+                        max_position_notional=7, max_concentration_ratio=.4,
+                        max_gross_exposure_multiple=.05)
+    engine = PortfolioRiskEngine(EventBus(), configured)
+    return engine, engine.evaluate(account(("BTC", 1, 10), equity=100))
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda breaches: (),
+    lambda breaches: breaches[1:],
+    lambda breaches: tuple(reversed(breaches)),
+    lambda breaches: breaches + (breaches[0],),
+    lambda breaches: (replace(breaches[0], actual=breaches[0].actual + 1),) + breaches[1:],
+    lambda breaches: (replace(breaches[0], limit=breaches[0].limit + 1),) + breaches[1:],
+    lambda breaches: breaches[:2] + (
+        replace(breaches[2], source="other", symbol="ETH"),) + breaches[3:],
+])
+def test_exact_canonical_breach_tuple_rejects_coherent_tampering(mutation):
+    engine, result = _breached_engine_and_result()
+    object.__setattr__(result, "breaches", mutation(result.breaches))
+    object.__setattr__(result, "outcome", (PortfolioRiskOutcome.BREACHED
+                                           if result.breaches else PortfolioRiskOutcome.HEALTHY))
+    with pytest.raises(DomainValidationError):
+        result.validate()
+    with pytest.raises((DomainValidationError, PortfolioRiskError)):
+        engine.history()
+
+
+@pytest.mark.parametrize("breach", [
+    (RiskLimitCode.NON_POSITIVE_EQUITY, 1, None, None, None),
+    (RiskLimitCode.NON_POSITIVE_EQUITY, 0, 1, None, None),
+    (RiskLimitCode.MAX_GROSS_NOTIONAL, 10, 10, None, None),
+    (RiskLimitCode.MAX_ABS_NET_NOTIONAL, 9, 10, None, None),
+    (RiskLimitCode.MAX_POSITION_NOTIONAL, 11, 10, None, "BTC"),
+    (RiskLimitCode.MAX_POSITION_NOTIONAL, 11, 10, "sim", None),
+    (RiskLimitCode.MAX_CONCENTRATION, 2, 1, "sim", "BTC"),
+])
+def test_breach_code_specific_semantics_are_fail_closed(breach):
+    with pytest.raises(DomainValidationError):
+        RiskLimitBreach(*breach)
+
+
+@pytest.mark.parametrize("field", [
+    "max_gross_notional", "max_abs_net_notional", "max_position_notional",
+    "max_concentration_ratio", "max_gross_exposure_multiple",
+])
+@pytest.mark.parametrize("value", [True, 0, -1, math.nan, math.inf, -math.inf])
+def test_complete_numeric_limit_validation(field, value):
+    with pytest.raises(DomainValidationError):
+        limits(**{field: value})
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "yes"])
+def test_require_positive_equity_must_be_an_actual_bool(value):
+    with pytest.raises(DomainValidationError):
+        limits(require_positive_equity=value)
+
+
+def test_threshold_equality_is_healthy_and_positive_equity_can_be_optional():
+    exact = PortfolioRiskEngine(EventBus(), limits(
+        max_gross_notional=10, max_abs_net_notional=10,
+        max_position_notional=10, max_concentration_ratio=1,
+        max_gross_exposure_multiple=1)).evaluate(account(("BTC", 1, 10), equity=10))
+    assert exact.breaches == ()
+    zero = account(equity=0)
+    position = PositionSnapshot("sim", "LOSS", 1, PositionSide.LONG, 1, -2, NOW, "loss")
+    portfolio = PortfolioSnapshot((position,), -2, NOW)
+    valuation = PositionValuation(position, MarketDataRecord(
+        MarketDataKind.MARK_PRICE, "LOSS", "sim", NOW, {"price": 1}), 1, 0, -2, NOW)
+    negative = AccountSnapshot(portfolio, (valuation,), 1, -2, 0, -2, -1, NOW)
+    for source in (zero, negative):
+        result = PortfolioRiskEngine(EventBus(), limits(
+            require_positive_equity=False)).evaluate(source)
+        assert result.breaches == ()
+        assert result.outcome is PortfolioRiskOutcome.HEALTHY
+
+
+def test_concurrent_evaluations_have_one_exact_history_and_event_order():
+    bus, events = EventBus(), []
+    engine = PortfolioRiskEngine(bus, limits())
+    bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED,
+                  lambda event: events.append(event.payload["portfolio_risk_snapshot"]))
+    inputs = [account((f"S{i}", i + 1, 1)) for i in range(8)]
+    barrier = Barrier(len(inputs))
+
+    def evaluate(source):
+        barrier.wait()
+        return engine.evaluate(source)
+
+    with ThreadPoolExecutor(max_workers=len(inputs)) as executor:
+        returned = list(executor.map(evaluate, inputs))
+    history = engine.history()
+    assert len(history) == len(inputs)
+    assert events == list(history)
+    assert {id(item) for item in returned} == {id(item) for item in history}
+    assert engine.latest() is history[-1]
+
+
+def test_subscriber_replacements_are_restored_even_after_exception():
+    original_bus, replacement_bus = EventBus(), EventBus()
+    original_limits, replacement_limits = limits(), limits(max_gross_notional=1)
+    engine = PortfolioRiskEngine(original_bus, original_limits)
+
+    def attack(_event):
+        engine.event_bus = replacement_bus
+        engine.limits = replacement_limits
+        engine._lock = object()
+        raise RuntimeError("subscriber failed")
+
+    unsubscribe = original_bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED, attack)
+    with pytest.raises(RuntimeError, match="subscriber failed"):
+        engine.evaluate(account(("BTC", 1, 10)))
+    assert engine.event_bus is original_bus
+    assert engine.limits is original_limits
+    unsubscribe()
+    assert engine.evaluate(account(("BTC", 1, 10))).outcome is PortfolioRiskOutcome.HEALTHY
+
+
+def test_engine_subscriber_cycle_is_collectable():
+    bus = EventBus()
+    engine = PortfolioRiskEngine(bus, limits())
+    bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED,
+                  lambda _event, owner=engine: owner.history())
+    engine_ref, bus_ref = weakref.ref(engine), weakref.ref(bus)
+    del engine, bus
+    gc.collect()
+    assert engine_ref() is None
+    assert bus_ref() is None
+
+
+def test_equal_limits_replacement_and_corrupt_zero_state_fail_closed():
+    engine = PortfolioRiskEngine(EventBus(), limits())
+    engine.limits = replace(engine.limits)
+    with pytest.raises(PortfolioRiskError):
+        engine.history()
+    engine = PortfolioRiskEngine(EventBus(), limits())
+    engine._latest = object()
     with pytest.raises(PortfolioRiskError):
         engine.history()

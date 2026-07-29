@@ -118,8 +118,12 @@ class RiskLimitBreach:
         if self.code is RiskLimitCode.NON_POSITIVE_EQUITY:
             if self.limit is not None:
                 raise DomainValidationError("non-positive-equity breach has no configured limit")
+            if self.actual > 0:
+                raise DomainValidationError("non-positive-equity breach requires non-positive equity")
         else:
             _positive("limit", self.limit)
+            if self.actual <= self.limit:
+                raise DomainValidationError("maximum-limit breach requires an exceedance")
         position_specific = self.code is RiskLimitCode.MAX_POSITION_NOTIONAL
         if position_specific:
             for name in ("source", "symbol"):
@@ -128,6 +132,46 @@ class RiskLimitBreach:
                     raise DomainValidationError(f"{name} is required for a position breach")
         elif self.source is not None or self.symbol is not None:
             raise DomainValidationError("portfolio breaches must not have position attribution")
+
+
+def build_portfolio_risk_breaches(
+    account_snapshot: AccountSnapshot,
+    position_exposures: tuple[PositionExposure, ...],
+    gross_notional: float,
+    net_notional: float,
+    concentration_ratio: float,
+    gross_exposure_multiple: float | None,
+    limits: PortfolioRiskLimits,
+) -> tuple[RiskLimitBreach, ...]:
+    """Build the one canonical, deterministically ordered limit decision."""
+    breaches: list[RiskLimitBreach] = []
+    if limits.require_positive_equity and account_snapshot.equity <= 0:
+        breaches.append(RiskLimitBreach(
+            RiskLimitCode.NON_POSITIVE_EQUITY, account_snapshot.equity, None))
+    if gross_notional > limits.max_gross_notional:
+        breaches.append(RiskLimitBreach(
+            RiskLimitCode.MAX_GROSS_NOTIONAL, gross_notional, limits.max_gross_notional))
+    absolute_net = abs(net_notional)
+    if absolute_net > limits.max_abs_net_notional:
+        breaches.append(RiskLimitBreach(
+            RiskLimitCode.MAX_ABS_NET_NOTIONAL, absolute_net,
+            limits.max_abs_net_notional))
+    for exposure in position_exposures:
+        if exposure.position_notional > limits.max_position_notional:
+            position = exposure.position_valuation.position
+            breaches.append(RiskLimitBreach(
+                RiskLimitCode.MAX_POSITION_NOTIONAL, exposure.position_notional,
+                limits.max_position_notional, position.source, position.symbol))
+    if concentration_ratio > limits.max_concentration_ratio:
+        breaches.append(RiskLimitBreach(
+            RiskLimitCode.MAX_CONCENTRATION, concentration_ratio,
+            limits.max_concentration_ratio))
+    if (gross_exposure_multiple is not None and
+            gross_exposure_multiple > limits.max_gross_exposure_multiple):
+        breaches.append(RiskLimitBreach(
+            RiskLimitCode.MAX_GROSS_EXPOSURE_MULTIPLE, gross_exposure_multiple,
+            limits.max_gross_exposure_multiple))
+    return tuple(breaches)
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +240,11 @@ class PortfolioRiskSnapshot:
             if not isinstance(breach, RiskLimitBreach):
                 raise DomainValidationError("breaches contains an invalid value")
             breach.validate()
+        expected_breaches = build_portfolio_risk_breaches(
+            self.account_snapshot, self.position_exposures, expected_gross, expected_net,
+            expected_concentration, expected_multiple, self.limits)
+        if self.breaches != expected_breaches:
+            raise DomainValidationError("breaches do not match the canonical limit decision")
         if not isinstance(self.outcome, PortfolioRiskOutcome):
             raise DomainValidationError("outcome must be PortfolioRiskOutcome")
         wanted_outcome = PortfolioRiskOutcome.BREACHED if self.breaches else PortfolioRiskOutcome.HEALTHY

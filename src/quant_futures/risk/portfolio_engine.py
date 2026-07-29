@@ -18,7 +18,7 @@ from quant_futures.portfolio.models import PositionSide
 
 from .portfolio_models import (
     PortfolioRiskLimits, PortfolioRiskOutcome, PortfolioRiskSnapshot,
-    PositionExposure, RiskLimitBreach, RiskLimitCode, _zero,
+    PositionExposure, build_portfolio_risk_breaches, _zero,
 )
 
 PORTFOLIO_RISK_UPDATED = EventType.PORTFOLIO_RISK_UPDATED
@@ -118,30 +118,8 @@ class PortfolioRiskEngine:
             largest = max((e.position_notional for e in exposure_tuple), default=0.0)
             concentration = 0.0 if gross == 0 else largest / gross
             multiple = None if account_snapshot.equity <= 0 else gross / account_snapshot.equity
-            breaches: list[RiskLimitBreach] = []
-            if limits.require_positive_equity and account_snapshot.equity <= 0:
-                breaches.append(RiskLimitBreach(RiskLimitCode.NON_POSITIVE_EQUITY,
-                                                account_snapshot.equity, None))
-            if gross > limits.max_gross_notional:
-                breaches.append(RiskLimitBreach(RiskLimitCode.MAX_GROSS_NOTIONAL,
-                                                gross, limits.max_gross_notional))
-            if abs(net) > limits.max_abs_net_notional:
-                breaches.append(RiskLimitBreach(RiskLimitCode.MAX_ABS_NET_NOTIONAL,
-                                                abs(net), limits.max_abs_net_notional))
-            for exposure in exposure_tuple:
-                if exposure.position_notional > limits.max_position_notional:
-                    position = exposure.position_valuation.position
-                    breaches.append(RiskLimitBreach(RiskLimitCode.MAX_POSITION_NOTIONAL,
-                                                    exposure.position_notional,
-                                                    limits.max_position_notional,
-                                                    position.source, position.symbol))
-            if concentration > limits.max_concentration_ratio:
-                breaches.append(RiskLimitBreach(RiskLimitCode.MAX_CONCENTRATION,
-                                                concentration, limits.max_concentration_ratio))
-            if multiple is not None and multiple > limits.max_gross_exposure_multiple:
-                breaches.append(RiskLimitBreach(RiskLimitCode.MAX_GROSS_EXPOSURE_MULTIPLE,
-                                                multiple, limits.max_gross_exposure_multiple))
-            breach_tuple = tuple(breaches)
+            breach_tuple = build_portfolio_risk_breaches(
+                account_snapshot, exposure_tuple, gross, net, concentration, multiple, limits)
             snapshot = PortfolioRiskSnapshot(
                 account_snapshot, exposure_tuple, long_notional, short_notional, gross, net,
                 largest, concentration, multiple, limits, breach_tuple,
