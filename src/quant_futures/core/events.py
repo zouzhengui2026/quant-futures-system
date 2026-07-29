@@ -39,6 +39,7 @@ class EventType(str, Enum):
     RISK_UPDATED = "risk.updated"
     EXECUTION_UPDATED = "execution.updated"
     PORTFOLIO_UPDATED = "portfolio.updated"
+    ACCOUNT_UPDATED = "account.updated"
 
 
 EventName: TypeAlias = str | EventType
