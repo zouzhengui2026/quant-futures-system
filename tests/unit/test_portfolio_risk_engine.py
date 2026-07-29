@@ -264,6 +264,31 @@ def test_subscriber_replacements_are_restored_even_after_exception():
     assert engine.evaluate(account(("BTC", 1, 10))).outcome is PortfolioRiskOutcome.HEALTHY
 
 
+@pytest.mark.parametrize("raises", [False, True])
+def test_subscriber_limits_field_mutation_is_restored(raises):
+    bus = EventBus()
+    configured = limits()
+    canonical_max_gross = configured.max_gross_notional
+    engine = PortfolioRiskEngine(bus, configured)
+
+    def attack(event):
+        object.__setattr__(event.payload["limits"], "max_gross_notional", 1)
+        if raises:
+            raise RuntimeError("subscriber failed")
+
+    unsubscribe = bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED, attack)
+    if raises:
+        with pytest.raises(RuntimeError, match="subscriber failed"):
+            engine.evaluate(account(("BTC", 1, 10)))
+    else:
+        engine.evaluate(account(("BTC", 1, 10)))
+
+    assert configured.max_gross_notional == canonical_max_gross
+    assert engine.history()[0].limits is configured
+    unsubscribe()
+    assert engine.evaluate(account(("BTC", 1, 10))).outcome is PortfolioRiskOutcome.HEALTHY
+
+
 def test_engine_subscriber_cycle_is_collectable():
     bus = EventBus()
     engine = PortfolioRiskEngine(bus, limits())

@@ -58,6 +58,7 @@ class _Anchor:
     lock: object
     event_bus_ref: ReferenceType[EventBus]
     limits: PortfolioRiskLimits
+    limits_values: tuple[tuple[str, object], ...]
     limits_fingerprint: object
     history: list[PortfolioRiskSnapshot]
     commitments: list[_Commitment]
@@ -92,8 +93,14 @@ class PortfolioRiskEngine:
         self._history = []
         self._lock = RLock()
         self._transition_active = False
-        _ANCHORS[self] = _Anchor(self._lock, ref(self.event_bus), self.limits,
-                                  _fingerprint(self.limits), self._history, [])
+        limits_values = tuple(
+            (item.name, getattr(self.limits, item.name))
+            for item in fields(PortfolioRiskLimits)
+        )
+        _ANCHORS[self] = _Anchor(
+            self._lock, ref(self.event_bus), self.limits, limits_values,
+            _fingerprint(self.limits), self._history, [],
+        )
 
     def evaluate(self, account_snapshot: AccountSnapshot) -> PortfolioRiskSnapshot:
         with self._guard() as (event_bus, limits):
@@ -203,6 +210,11 @@ class PortfolioRiskEngine:
             try:
                 yield event_bus, anchor.limits
             finally:
+                # Frozen dataclasses can still be attacked through object.__setattr__.
+                # Restore each field from primitive values captured at construction,
+                # rather than merely restoring the shared limits object's identity.
+                for name, value in anchor.limits_values:
+                    object.__setattr__(anchor.limits, name, value)
                 self._transition_active = False
                 self._lock = anchor.lock
                 self.event_bus = event_bus
