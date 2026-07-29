@@ -43,6 +43,12 @@ class CostConfig:
 class RiskConfig:
     max_position: float = 1.0
     max_drawdown: float = 0.5
+    require_positive_equity: bool = True
+    max_gross_notional: float = 1_000_000.0
+    max_abs_net_notional: float = 1_000_000.0
+    max_position_notional: float = 1_000_000.0
+    max_concentration_ratio: float = 1.0
+    max_gross_exposure_multiple: float = 100.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,19 +120,32 @@ def load_config(path: str | Path) -> ProductConfig:
         "starting_equity": cfg.starting_equity, "costs.commission_bps": cfg.costs.commission_bps,
         "costs.slippage_bps": cfg.costs.slippage_bps, "costs.funding_rate": cfg.costs.funding_rate,
         "risk.max_position": cfg.risk.max_position, "risk.max_drawdown": cfg.risk.max_drawdown,
+        "risk.max_gross_notional": cfg.risk.max_gross_notional,
+        "risk.max_abs_net_notional": cfg.risk.max_abs_net_notional,
+        "risk.max_position_notional": cfg.risk.max_position_notional,
+        "risk.max_concentration_ratio": cfg.risk.max_concentration_ratio,
+        "risk.max_gross_exposure_multiple": cfg.risk.max_gross_exposure_multiple,
     }
     if any(not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value)
            for value in numerics.values()):
         raise ConfigError("all numeric configuration values must be finite numbers (not bool)")
     raw_numeric = [raw.get("starting_equity", 10_000), raw.get("random_seed", 0)]
     raw_numeric += [raw.get("costs", {}).get(k, 0) for k in ("commission_bps", "slippage_bps", "funding_rate")]
-    raw_numeric += [raw.get("risk", {}).get(k, 1) for k in ("max_position", "max_drawdown")]
+    raw_numeric += [raw.get("risk", {}).get(k, 1) for k in (
+        "max_position", "max_drawdown", "max_gross_notional", "max_abs_net_notional",
+        "max_position_notional", "max_concentration_ratio", "max_gross_exposure_multiple")]
     if any(isinstance(value, bool) for value in raw_numeric):
         raise ConfigError("numeric configuration values must not be bool")
     if cfg.starting_equity <= 0 or cfg.costs.commission_bps < 0 or cfg.costs.slippage_bps < 0:
         raise ConfigError("equity must be positive and costs must be non-negative")
     if cfg.risk.max_position <= 0 or not 0 < cfg.risk.max_drawdown <= 1:
         raise ConfigError("risk limits are outside their valid range")
+    if not isinstance(cfg.risk.require_positive_equity, bool):
+        raise ConfigError("risk.require_positive_equity must be a bool")
+    if (min(cfg.risk.max_gross_notional, cfg.risk.max_abs_net_notional,
+            cfg.risk.max_position_notional, cfg.risk.max_gross_exposure_multiple) <= 0
+            or not 0 < cfg.risk.max_concentration_ratio <= 1):
+        raise ConfigError("portfolio risk limits are outside their valid range")
     _utc(cfg.data.start, "start"); _utc(cfg.data.end, "end")
     if cfg.data.start and cfg.data.end:
         start = datetime.fromisoformat(cfg.data.start.replace("Z", "+00:00"))

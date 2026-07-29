@@ -30,18 +30,25 @@ def analytics(config: ProductConfig, records: tuple[Record,...]) -> dict:
       "total_commissions":sum(r.commission for r in records),"slippage_cost":sum(r.slippage for r in records),
       "funding_cash_flow":sum(r.funding for r in records),"risk_breach_count":sum(r.risk_breach for r in records)}
 
-def write_artifacts(path: Path, config: ProductConfig, manifest: dict, records: tuple[Record,...]) -> dict:
+def write_artifacts(path: Path, config: ProductConfig, manifest: dict, records: tuple[Record,...],
+                    events: tuple[dict, ...]) -> dict:
+    # Reports are projections of the durable journal, never an independent
+    # second source of transition truth.  Amendments replace their bar record.
+    projected: dict[int, Record] = {}
+    for event in events:
+        if event["stage"] in {"bar_committed", "bar_amended"}:
+            projected[event["transition_id"]] = Record(**event["payload"]["record"])
+    records = tuple(projected[key] for key in sorted(projected))
     summary=analytics(config,records)
     atomic_write(path/"manifest.json",json.dumps(manifest,sort_keys=True,indent=2)+"\n")
     atomic_write(path/"config.resolved.yaml",json.dumps(config.normalized(),sort_keys=True,indent=2)+"\n")
     atomic_write(path/"summary.json",json.dumps(summary,sort_keys=True,indent=2,allow_nan=False)+"\n")
-    fields=list(record_dict(records[0])) if records else []
     for filename, selected in (("equity.csv",("timestamp","equity","drawdown")),("positions.csv",("timestamp","quantity","price")),
       ("trades.csv",("timestamp","fill_quantity","fill_price","commission","slippage")),("risk_breaches.csv",("timestamp","risk_breach","drawdown"))):
         rows=[r for r in records if filename not in {"trades.csv","risk_breaches.csv"} or (r.fill_quantity if filename=="trades.csv" else r.risk_breach)]
         content=",".join(selected)+"\n"+"".join(",".join(str(getattr(r,k)) for k in selected)+"\n" for r in rows)
         atomic_write(path/filename,content)
-    atomic_write(path/"events.jsonl","".join(json.dumps(record_dict(r),sort_keys=True)+"\n" for r in records))
+    atomic_write(path/"events.jsonl","".join(json.dumps(event,sort_keys=True)+"\n" for event in events))
     if records:
         low=min(r.equity for r in records); high=max(r.equity for r in records); span=max(high-low,1.0)
         points=" ".join(f"{i*800/max(1,len(records)-1):.1f},{200-(r.equity-low)/span*180:.1f}" for i,r in enumerate(records))

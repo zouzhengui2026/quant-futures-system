@@ -125,13 +125,20 @@ class PortfolioRiskEngine:
             largest = max((e.position_notional for e in exposure_tuple), default=0.0)
             concentration = 0.0 if gross == 0 else largest / gross
             multiple = None if account_snapshot.equity <= 0 else gross / account_snapshot.equity
+            initial_peak = (account_snapshot.starting_equity
+                            if limits.max_drawdown_ratio < 1 else account_snapshot.equity)
+            previous_peak = max((item.account_snapshot.equity for item in _anchor(self).history),
+                                default=initial_peak)
+            peak = max(previous_peak, account_snapshot.equity)
+            drawdown = 0.0 if peak <= 0 else (peak - account_snapshot.equity) / peak
             breach_tuple = build_portfolio_risk_breaches(
-                account_snapshot, exposure_tuple, gross, net, concentration, multiple, limits)
+                account_snapshot, exposure_tuple, gross, net, concentration, multiple, limits,
+                drawdown)
             snapshot = PortfolioRiskSnapshot(
                 account_snapshot, exposure_tuple, long_notional, short_notional, gross, net,
                 largest, concentration, multiple, limits, breach_tuple,
                 PortfolioRiskOutcome.BREACHED if breach_tuple else PortfolioRiskOutcome.HEALTHY,
-                account_snapshot.valued_at,
+                account_snapshot.valued_at, drawdown,
             )
             # Revalidate both inputs after calculation, then construct the independent
             # commitment before any externally visible state changes.

@@ -89,6 +89,7 @@ class _AccountCommitment:
     total_pnl: float
     equity: float
     valued_at: object
+    cash_flow: float
 
 
 def _commit(snapshot: AccountSnapshot) -> _AccountCommitment:
@@ -119,7 +120,7 @@ def _commit(snapshot: AccountSnapshot) -> _AccountCommitment:
         snapshot, portfolio_commitment, snapshot.valuations, tuple(valuations),
         snapshot.starting_equity, snapshot.total_realized_pnl,
         snapshot.total_unrealized_pnl, snapshot.total_pnl, snapshot.equity,
-        snapshot.valued_at,
+        snapshot.valued_at, snapshot.cash_flow,
     )
 
 
@@ -153,7 +154,7 @@ class AccountEquityEngine:
             self._lock, ref(self.event_bus), self._history, [], self.starting_equity)
 
     def value(self, portfolio_snapshot: PortfolioSnapshot,
-              mark_records: tuple[MarketDataRecord, ...]) -> AccountSnapshot:
+              mark_records: tuple[MarketDataRecord, ...], *, cash_flow: float = 0.0) -> AccountSnapshot:
         with self._guard() as event_bus:
             self._validate_committed()
             if not isinstance(portfolio_snapshot, PortfolioSnapshot):
@@ -204,13 +205,16 @@ class AccountEquityEngine:
             unrealized_total = _normalize(fsum(v.unrealized_pnl for v in valuation_tuple))
             total = _normalize(fsum((portfolio_snapshot.total_realized_pnl, unrealized_total)))
             configured_equity = _anchor(self).starting_equity
-            equity = _normalize(fsum((configured_equity, total)))
+            if (not isinstance(cash_flow, Real) or isinstance(cash_flow, bool)
+                    or not isfinite(cash_flow)):
+                raise AccountValuationError("cash_flow must be a finite real number")
+            equity = _normalize(fsum((configured_equity, total, cash_flow)))
             valued_at = max((v.valued_at for v in valuation_tuple),
                             default=portfolio_snapshot.updated_at)
             snapshot = AccountSnapshot(
                 portfolio_snapshot, valuation_tuple, configured_equity,
                 portfolio_snapshot.total_realized_pnl, unrealized_total, total,
-                equity, valued_at,
+                equity, valued_at, cash_flow,
             )
             history = _anchor(self).history
             if history and snapshot.valued_at < history[-1].valued_at:

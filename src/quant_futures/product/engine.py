@@ -7,6 +7,7 @@ portfolio-risk authorities.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from math import isfinite
 
@@ -49,6 +50,18 @@ class Record:
 _ARTIFACT_FIELDS = tuple(f.name for f in fields(Record) if f.name not in {
     "execution_report", "position_update", "account_snapshot", "portfolio_risk_snapshot"})
 
+StageSink = Callable[[dict], None]
+
+
+def _stage(sink: StageSink | None, sequence: int, transition: int,
+           stage: str, timestamp: str, **payload: object) -> int:
+    """Publish a deterministic recovery envelope before returning control."""
+    sequence += 1
+    if sink is not None:
+        sink({"sequence": sequence, "transition_id": transition, "stage": stage,
+              "timestamp": timestamp, "payload": payload})
+    return sequence
+
 
 def _candidate(config: ProductConfig, bar: Bar, direction: AlphaDirection) -> AlphaCandidate:
     observation = MarketObservation(
@@ -75,7 +88,8 @@ def _position(ledger: PortfolioLedger, source: str, symbol: str) -> float:
     return 0.0
 
 
-def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy) -> tuple[Record, ...]:
+def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy,
+             on_stage: StageSink | None = None) -> tuple[Record, ...]:
     """Run the canonical transition order.
 
     At every open the previously submitted intent is filled and committed
@@ -87,15 +101,23 @@ def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy) -
     clock = {"value": bars[0].timestamp}
     paper, ledger = PaperExecutionEngine(bus, lambda: clock["value"]), PortfolioLedger(bus)
     account = AccountEquityEngine(bus, config.starting_equity)
-    limit = max(config.starting_equity * 1000.0, config.risk.max_position * max(b.close for b in bars) * 10.0)
-    portfolio_risk = PortfolioRiskEngine(bus, PortfolioRiskLimits(True, limit, limit, limit, 1.0, 1000.0))
+    portfolio_risk = PortfolioRiskEngine(bus, PortfolioRiskLimits(
+        config.risk.require_positive_equity, config.risk.max_gross_notional,
+        config.risk.max_abs_net_notional, config.risk.max_position_notional,
+        config.risk.max_concentration_ratio, config.risk.max_gross_exposure_multiple,
+        config.risk.max_drawdown))
     closes: list[float] = []
     records: list[Record] = []
     pending = None
     peak = config.starting_equity
+    cash_flow = 0.0
+    sequence = 0
 
     for index, bar in enumerate(bars):
         clock["value"] = bar.timestamp
+        timestamp = bar.timestamp.isoformat().replace("+00:00", "Z")
+        sequence = _stage(on_stage, sequence, index + 1, "bar_started", timestamp,
+                          price=bar.close)
         report = update = None
         fill_qty = commission = slippage = 0.0
         fill_price = None
@@ -107,8 +129,14 @@ def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy) -
             fill_price = reference * (1 + (1 if fill_qty > 0 else -1) * config.costs.slippage_bps / 10000)
             slippage = abs(fill_qty) * abs(fill_price - reference)
             commission = abs(fill_qty * fill_price) * config.costs.commission_bps / 10000
+            sequence = _stage(on_stage, sequence, index + 1, "fill_prepared", timestamp,
+                              order_id=pending.order.order_id, fill_price=fill_price)
             report = paper.fill(pending.order.order_id, fill_price)
+            sequence = _stage(on_stage, sequence, index + 1, "fill_committed", timestamp,
+                              order_id=report.order.order_id, fill_price=fill_price)
             update = ledger.apply(report)
+            sequence = _stage(on_stage, sequence, index + 1, "portfolio_committed", timestamp,
+                              order_id=report.order.order_id)
             pending = None
 
         current = _position(ledger, config.data.source, config.data.symbol)
@@ -130,6 +158,8 @@ def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy) -
             ))
             intent = execution.create_intent(assessment)
             paper.submit(intent)
+            sequence = _stage(on_stage, sequence, index + 1, "order_submitted", timestamp,
+                              order_id=intent.order.order_id, quantity=requested)
             if config.fill_timing == "next_open":
                 pending = intent
             else:
@@ -138,29 +168,47 @@ def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy) -
                 fill_price = reference * (1 + (1 if fill_qty > 0 else -1) * config.costs.slippage_bps / 10000)
                 slippage = abs(fill_qty) * abs(fill_price - reference)
                 commission = abs(fill_qty * fill_price) * config.costs.commission_bps / 10000
+                sequence = _stage(on_stage, sequence, index + 1, "fill_prepared", timestamp,
+                                  order_id=intent.order.order_id, fill_price=fill_price)
                 report = paper.fill(intent.order.order_id, fill_price)
+                sequence = _stage(on_stage, sequence, index + 1, "fill_committed", timestamp,
+                                  order_id=report.order.order_id, fill_price=fill_price)
                 update = ledger.apply(report)
+                sequence = _stage(on_stage, sequence, index + 1, "portfolio_committed", timestamp,
+                                  order_id=report.order.order_id)
 
         snapshot = ledger.snapshot()
         marks = tuple(MarketDataRecord(MarketDataKind.MARK_PRICE, p.symbol, p.source, bar.timestamp,
                                        {"price": bar.close}) for p in snapshot.positions if p.side is not PositionSide.FLAT)
-        account_snapshot = account.value(snapshot, marks)
+        funding = -quantity * bar.close * config.costs.funding_rate if (quantity := _position(
+            ledger, config.data.source, config.data.symbol)) else 0.0
+        cash_flow += funding - commission
+        account_snapshot = account.value(snapshot, marks, cash_flow=cash_flow)
+        sequence = _stage(on_stage, sequence, index + 1, "account_committed", timestamp,
+                          equity=account_snapshot.equity, cash_flow=cash_flow,
+                          commission=commission, funding=funding)
         risk_snapshot = portfolio_risk.evaluate(account_snapshot)
+        sequence = _stage(on_stage, sequence, index + 1, "risk_committed", timestamp,
+                          breaches=[breach.code.value for breach in risk_snapshot.breaches])
         equity = account_snapshot.equity
         peak = max(peak, equity)
         drawdown = 0.0 if peak <= 0 else (peak - equity) / peak
-        quantity = _position(ledger, config.data.source, config.data.symbol)
         records.append(Record(
             index + 1, bar.timestamp.isoformat().replace("+00:00", "Z"), bar.close,
-            target, quantity, fill_qty, fill_price, commission, slippage, 0.0,
+            target, quantity, fill_qty, fill_price, commission, slippage, funding,
             equity - quantity * bar.close, equity, drawdown,
-            bool(risk_snapshot.breaches) or drawdown > config.risk.max_drawdown,
+            bool(risk_snapshot.breaches),
             report.order.order_id if report else None, False, report, update,
             account_snapshot, risk_snapshot,
         ))
+        sequence = _stage(on_stage, sequence, index + 1, "bar_committed", timestamp,
+                          record=record_dict(records[-1]))
 
     if pending is not None:
         paper.cancel(pending.order.order_id, "end of replay: no following open")
+        sequence = _stage(on_stage, sequence, len(bars), "order_cancelled",
+                          bars[-1].timestamp.isoformat().replace("+00:00", "Z"),
+                          order_id=pending.order.order_id, reason="no following open")
         if records:
             last = records[-1]
             records[-1] = Record(**{
@@ -171,6 +219,9 @@ def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy) -
                 "account_snapshot": last.account_snapshot,
                 "portfolio_risk_snapshot": last.portfolio_risk_snapshot,
             })
+            sequence = _stage(on_stage, sequence, len(bars), "bar_amended",
+                              bars[-1].timestamp.isoformat().replace("+00:00", "Z"),
+                              record=record_dict(records[-1]))
     return tuple(records)
 
 
