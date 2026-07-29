@@ -26,11 +26,101 @@ class _Anchor:
     lock: object
     event_bus_ref: ReferenceType[EventBus]
     history: list[AccountSnapshot]
-    committed_history: list[AccountSnapshot]
+    commitments: list[_AccountCommitment]
     starting_equity: float
 
 
 _ANCHORS: WeakKeyDictionary[AccountEquityEngine, _Anchor] = WeakKeyDictionary()
+
+
+@dataclass(frozen=True, slots=True)
+class _PositionCommitment:
+    identity: int
+    source: str
+    symbol: str
+    signed_quantity: float
+    side: PositionSide
+    average_entry_price: float | None
+    realized_pnl: float
+    updated_at: object
+    last_order_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MarkCommitment:
+    identity: int
+    kind: MarketDataKind
+    source: str
+    symbol: str
+    timestamp: object
+    value_keys: frozenset[object]
+    price: object
+
+
+@dataclass(frozen=True, slots=True)
+class _ValuationCommitment:
+    identity: int
+    position_identity: int
+    mark: _MarkCommitment | None
+    mark_price: float | None
+    unrealized_pnl: float
+    total_pnl: float
+    valued_at: object
+
+
+@dataclass(frozen=True, slots=True)
+class _PortfolioCommitment:
+    identity: int
+    positions_tuple_identity: int
+    positions: tuple[_PositionCommitment, ...]
+    total_realized_pnl: float
+    updated_at: object
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountCommitment:
+    identity: int
+    portfolio: _PortfolioCommitment
+    valuations_tuple_identity: int
+    valuations: tuple[_ValuationCommitment, ...]
+    starting_equity: float
+    total_realized_pnl: float
+    total_unrealized_pnl: float
+    total_pnl: float
+    equity: float
+    valued_at: object
+
+
+def _commit(snapshot: AccountSnapshot) -> _AccountCommitment:
+    """Copy a public snapshot graph into an independent immutable authority."""
+    portfolio = snapshot.portfolio_snapshot
+    positions = tuple(_PositionCommitment(
+        id(position), position.source, position.symbol, position.signed_quantity,
+        position.side, position.average_entry_price, position.realized_pnl,
+        position.updated_at, position.last_order_id,
+    ) for position in portfolio.positions)
+    portfolio_commitment = _PortfolioCommitment(
+        id(portfolio), id(portfolio.positions), positions,
+        portfolio.total_realized_pnl, portfolio.updated_at,
+    )
+    valuations = []
+    for valuation in snapshot.valuations:
+        record = valuation.mark_record
+        mark_commitment = None if record is None else _MarkCommitment(
+            id(record), record.kind, record.source, record.symbol, record.timestamp,
+            frozenset(record.values), record.values.get("price"),
+        )
+        valuations.append(_ValuationCommitment(
+            id(valuation), id(valuation.position), mark_commitment,
+            valuation.mark_price, valuation.unrealized_pnl, valuation.total_pnl,
+            valuation.valued_at,
+        ))
+    return _AccountCommitment(
+        id(snapshot), portfolio_commitment, id(snapshot.valuations), tuple(valuations),
+        snapshot.starting_equity, snapshot.total_realized_pnl,
+        snapshot.total_unrealized_pnl, snapshot.total_pnl, snapshot.equity,
+        snapshot.valued_at,
+    )
 
 
 def _anchor(engine: AccountEquityEngine) -> _Anchor:
@@ -126,7 +216,7 @@ class AccountEquityEngine:
             if history and snapshot.valued_at < history[-1].valued_at:
                 raise AccountValuationError("valuation precedes the latest committed snapshot")
             history.append(snapshot)
-            _anchor(self).committed_history.append(snapshot)
+            _anchor(self).commitments.append(_commit(snapshot))
             self._latest = snapshot
             event_bus.publish(Event(EventType.ACCOUNT_UPDATED, {
                 "account_snapshot": snapshot,
@@ -153,17 +243,19 @@ class AccountEquityEngine:
             anchor = _anchor(self)
             if self._history is not anchor.history:
                 raise AccountValuationError("account history authority was replaced")
-            if (len(anchor.history) != len(anchor.committed_history)
-                    or any(working is not committed for working, committed in zip(
-                        anchor.history, anchor.committed_history))):
+            if (len(anchor.history) != len(anchor.commitments)
+                    or any(id(working) != committed.identity for working, committed in zip(
+                        anchor.history, anchor.commitments))):
                 raise AccountValuationError("account history differs from authority")
-            expected_latest = anchor.committed_history[-1] if anchor.committed_history else None
+            expected_latest = anchor.history[-1] if anchor.history else None
             if self._latest is not expected_latest:
                 raise AccountValuationError("latest account snapshot identity was replaced")
-            for snapshot in anchor.committed_history:
+            for snapshot, commitment in zip(anchor.history, anchor.commitments):
                 if not isinstance(snapshot, AccountSnapshot):
                     raise AccountValuationError("account history is structurally corrupt")
                 snapshot.validate()
+                if _commit(snapshot) != commitment:
+                    raise AccountValuationError("committed account snapshot was mutated")
         except (AccountValuationError, DomainValidationError):
             raise
         except Exception as exc:

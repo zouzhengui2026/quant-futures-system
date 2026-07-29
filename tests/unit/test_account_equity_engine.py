@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 import gc
 import math
+from types import MappingProxyType
 import weakref
 
 import pytest
@@ -192,3 +193,83 @@ def test_engine_can_be_collected_when_subscriber_closure_captures_it():
     bus._subscribers.clear()
     gc.collect()
     assert reference() is None
+
+
+@pytest.mark.parametrize("read", ["latest", "history", "value"])
+def test_coherent_committed_graph_forgery_is_rejected(read):
+    bus, p, events = EventBus(), position(), []
+    engine = AccountEquityEngine(bus, 100)
+    bus.subscribe(EventType.ACCOUNT_UPDATED, events.append)
+    record = mark(p, 101)
+    snapshot = engine.value(portfolio(p), (record,))
+    valuation = snapshot.valuations[0]
+    object.__setattr__(record, "values", MappingProxyType({"price": 150.0}))
+    object.__setattr__(valuation, "mark_price", 150.0)
+    object.__setattr__(valuation, "unrealized_pnl", 100.0)
+    object.__setattr__(valuation, "total_pnl", 103.0)
+    object.__setattr__(snapshot, "total_unrealized_pnl", 100.0)
+    object.__setattr__(snapshot, "total_pnl", 103.0)
+    object.__setattr__(snapshot, "equity", 203.0)
+
+    with pytest.raises(AccountValuationError, match="mutated"):
+        if read == "value":
+            engine.value(portfolio(p), (mark(p, 150),))
+        else:
+            getattr(engine, read)()
+    assert len(events) == 1
+
+
+def test_engine_and_bus_subscriber_cycle_is_collectible():
+    def make_cycle():
+        bus = EventBus()
+        engine = AccountEquityEngine(bus, 100)
+        bus.subscribe(EventType.ACCOUNT_UPDATED, lambda event: engine.history())
+        return weakref.ref(engine), weakref.ref(bus)
+
+    engine_ref, bus_ref = make_cycle()
+    gc.collect()
+    assert engine_ref() is None
+    assert bus_ref() is None
+
+
+def test_latest_before_first_valuation_fails_closed():
+    with pytest.raises(AccountValuationError, match="empty"):
+        AccountEquityEngine(EventBus(), 100).latest()
+
+
+def test_starting_equity_callback_mutation_is_repaired():
+    bus, p = EventBus(), position()
+    engine = AccountEquityEngine(bus, 100)
+    bus.subscribe(EventType.ACCOUNT_UPDATED,
+                  lambda event: setattr(engine, "starting_equity", 9_999))
+    first = engine.value(portfolio(p), (mark(p, 100),))
+    second = engine.value(portfolio(p), (mark(p, 101),))
+    assert engine.starting_equity == 100
+    assert first.starting_equity == second.starting_equity == 100
+    assert second.equity == 105
+
+
+def test_reentry_guard_is_cleaned_after_subscriber_exception():
+    bus, p = EventBus(), position()
+    engine = AccountEquityEngine(bus, 100)
+    def fail_once(event):
+        bus.unsubscribe(EventType.ACCOUNT_UPDATED, fail_once)
+        raise RuntimeError("subscriber failed")
+    bus.subscribe(EventType.ACCOUNT_UPDATED, fail_once)
+    with pytest.raises(RuntimeError, match="subscriber failed"):
+        engine.value(portfolio(p), (mark(p, 100),))
+    assert engine.value(portfolio(p), (mark(p, 101),)).equity == 105
+
+
+def test_mixed_positions_are_sorted_and_stably_aggregated_to_negative_equity():
+    flat = position("MID", 0, None, -5)
+    long = position("AAA", 1e16, 100, 7)
+    short = position("ZZZ", -1e16, 100, -3)
+    snapshot = AccountEquityEngine(EventBus(), 1).value(
+        portfolio(short, flat, long), (mark(short, 101), mark(long, 99)))
+    assert tuple(v.position for v in snapshot.valuations) == (long, flat, short)
+    assert snapshot.valuations[0].mark_record.symbol == "AAA"
+    assert snapshot.valuations[1].mark_record is None
+    assert snapshot.valuations[2].mark_record.symbol == "ZZZ"
+    assert snapshot.total_unrealized_pnl == -2e16
+    assert snapshot.equity == -2e16
