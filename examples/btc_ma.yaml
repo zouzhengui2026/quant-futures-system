@@ -1,0 +1,23 @@
+# Synthetic BTC-USDT perpetual demonstration.
+mode: backtest
+data:
+  path: data/btc_usdt_1h.csv
+  source: synthetic
+  symbol: BTC-USDT-PERP
+  timeframe: 1h
+strategy:
+  name: moving_average_crossover
+  parameters:
+    fast: 2
+    slow: 4
+starting_equity: 10000
+fill_timing: next_open
+costs:
+  commission_bps: 2
+  slippage_bps: 1
+  funding_rate: 0
+risk:
+  max_position: 1
+  max_drawdown: 0.25
+output_directory: ../runs/backtest
+random_seed: 0
