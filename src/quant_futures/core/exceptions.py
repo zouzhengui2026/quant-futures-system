@@ -25,5 +25,9 @@ class AccountValuationError(QuantFuturesError):
     """Raised when account valuation cannot be completed safely."""
 
 
+class PortfolioRiskError(QuantFuturesError):
+    """Raised when portfolio risk cannot be evaluated safely."""
+
+
 class MarketDataError(QuantFuturesError):
     """Raised when market data cannot be normalized or safely collected."""
