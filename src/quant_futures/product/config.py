@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from math import isfinite
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +86,11 @@ def load_config(path: str | Path) -> ProductConfig:
     if unknown:
         raise ConfigError(f"unknown configuration keys: {', '.join(sorted(unknown))}")
     try:
+        if not isinstance(raw.get("data"), dict):
+            raise ConfigError("data must be a mapping")
+        for section in ("strategy", "costs", "risk"):
+            if section in raw and not isinstance(raw[section], dict):
+                raise ConfigError(f"{section} must be a mapping")
         data_raw = dict(raw["data"])
         candidate = Path(data_raw["path"]).expanduser()
         data_raw["path"] = str(candidate.resolve() if candidate.is_absolute()
@@ -103,11 +110,28 @@ def load_config(path: str | Path) -> ProductConfig:
         raise ConfigError("mode must be 'backtest' or 'paper'")
     if cfg.fill_timing not in {"next_open", "current_close"}:
         raise ConfigError("fill_timing must be next_open or current_close")
+    numerics = {
+        "starting_equity": cfg.starting_equity, "costs.commission_bps": cfg.costs.commission_bps,
+        "costs.slippage_bps": cfg.costs.slippage_bps, "costs.funding_rate": cfg.costs.funding_rate,
+        "risk.max_position": cfg.risk.max_position, "risk.max_drawdown": cfg.risk.max_drawdown,
+    }
+    if any(not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value)
+           for value in numerics.values()):
+        raise ConfigError("all numeric configuration values must be finite numbers (not bool)")
+    raw_numeric = [raw.get("starting_equity", 10_000), raw.get("random_seed", 0)]
+    raw_numeric += [raw.get("costs", {}).get(k, 0) for k in ("commission_bps", "slippage_bps", "funding_rate")]
+    raw_numeric += [raw.get("risk", {}).get(k, 1) for k in ("max_position", "max_drawdown")]
+    if any(isinstance(value, bool) for value in raw_numeric):
+        raise ConfigError("numeric configuration values must not be bool")
     if cfg.starting_equity <= 0 or cfg.costs.commission_bps < 0 or cfg.costs.slippage_bps < 0:
         raise ConfigError("equity must be positive and costs must be non-negative")
     if cfg.risk.max_position <= 0 or not 0 < cfg.risk.max_drawdown <= 1:
         raise ConfigError("risk limits are outside their valid range")
     _utc(cfg.data.start, "start"); _utc(cfg.data.end, "end")
+    if cfg.data.start and cfg.data.end:
+        start = datetime.fromisoformat(cfg.data.start.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(cfg.data.end.replace("Z", "+00:00"))
+        if start > end: raise ConfigError("data.start must not be after data.end")
     return cfg
 
 

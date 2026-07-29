@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib, json
 from pathlib import Path
-from .config import ProductConfig
+from .config import CostConfig, DataConfig, ProductConfig, RiskConfig, StrategyConfig
 from .data import load_bars
 from .engine import simulate, record_dict
 from .reporting import write_artifacts
@@ -11,7 +11,8 @@ from .strategy import build_strategy
 
 def run(config: ProductConfig, replay_path: str|None=None) -> tuple[str,Path,dict]:
     path=replay_path or config.data.path
-    bars,fingerprint=load_bars(path,config.data.schema)
+    bars,fingerprint=load_bars(path,config.data.schema, start=config.data.start,
+                               end=config.data.end, timeframe=config.data.timeframe)
     strategy=build_strategy(config.strategy.name,config.strategy.parameters)
     identifier=run_id(config.normalized(),fingerprint,strategy.version)
     directory=create_run_directory(config.output_directory,identifier)
@@ -21,8 +22,10 @@ def run(config: ProductConfig, replay_path: str|None=None) -> tuple[str,Path,dic
           "strategy":{"name":strategy.name,"version":strategy.version},"record_count":len(records),
           "real_money_trading":False}
         summary=write_artifacts(directory,config,manifest,records)
+        artifact_names=("events.jsonl","summary.json","equity.csv","positions.csv","trades.csv","risk_breaches.csv","report.html")
         state={"lifecycle":"stopped","last_transition":len(records),"final_record":record_dict(records[-1]) if records else None,
-               "event_digest":hashlib.sha256((directory/"events.jsonl").read_bytes()).hexdigest()}
+               "event_digest":hashlib.sha256((directory/"events.jsonl").read_bytes()).hexdigest(),
+               "artifact_digests":{name:hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in artifact_names}}
         atomic_write(directory/"checkpoint.json",json.dumps(state,sort_keys=True,indent=2)+"\n")
         atomic_write(directory/"status.json",json.dumps({"lifecycle":"completed","counters":{"bars":len(records),"decisions":len(records),"fills":summary["trade_count"],"risk_breaches":summary["risk_breach_count"],"recovery_attempts":0}},sort_keys=True,indent=2)+"\n")
         (directory/".lock").unlink()
@@ -32,11 +35,26 @@ def run(config: ProductConfig, replay_path: str|None=None) -> tuple[str,Path,dic
         raise
 
 def audit(directory: str|Path) -> bool:
+    """Authoritatively reconstruct the run and require an exact state match."""
     directory=Path(directory); state=json.loads((directory/"checkpoint.json").read_text())
+    raw=json.loads((directory/"config.resolved.yaml").read_text())
+    config=ProductConfig(raw["mode"],DataConfig(**raw["data"]),StrategyConfig(**raw["strategy"]),
+                         CostConfig(**raw["costs"]),RiskConfig(**raw["risk"]),raw["starting_equity"],
+                         raw["fill_timing"],raw["output_directory"],raw["random_seed"])
+    bars,fingerprint=load_bars(config.data.path,config.data.schema,start=config.data.start,
+                               end=config.data.end,timeframe=config.data.timeframe)
+    manifest=json.loads((directory/"manifest.json").read_text())
+    if fingerprint != manifest["data_fingerprint"]: return False
+    reconstructed=simulate(config,bars,build_strategy(config.strategy.name,config.strategy.parameters))
+    expected=[record_dict(record) for record in reconstructed]
     payload=(directory/"events.jsonl").read_bytes()
-    events=[json.loads(line) for line in payload.splitlines()]
-    return (hashlib.sha256(payload).hexdigest()==state["event_digest"] and
-            state["last_transition"]==len(events) and (not events or events[-1]==state["final_record"]))
+    try: events=[json.loads(line) for line in payload.splitlines()]
+    except json.JSONDecodeError: return False
+    digests=state.get("artifact_digests",{})
+    return (events==expected and hashlib.sha256(payload).hexdigest()==state["event_digest"] and
+            state["last_transition"]==len(expected) and (not expected or expected[-1]==state["final_record"]) and
+            all((directory/name).is_file() and hashlib.sha256((directory/name).read_bytes()).hexdigest()==digest
+                for name,digest in digests.items()))
 
 def recover(directory: str|Path) -> dict:
     """Fail closed and return the latest valid, non-duplicated paper state."""

@@ -1,6 +1,7 @@
 """Stable future-blind strategy API and built-in deterministic strategies."""
 from __future__ import annotations
 from dataclasses import dataclass
+from math import isfinite
 from typing import Protocol
 from .data import Bar
 
@@ -46,11 +47,19 @@ class FixedStrategy:
     name: str = "fixed"
     version: str = "1"
     def __post_init__(self):
-        if self.value not in {-1.0, 0.0, 1.0}: raise ValueError("fixed value must be -1, 0, or 1")
+        if isinstance(self.value, bool) or not isinstance(self.value, (int, float)) or not isfinite(self.value) or self.value not in {-1.0, 0.0, 1.0}: raise ValueError("fixed value must be -1, 0, or 1")
     def target(self, context: StrategyContext) -> float: return self.value
+
+@dataclass(slots=True)
+class HoldStrategy:
+    """Retain current normalized exposure; never initiate a position."""
+    name: str = "hold"
+    version: str = "1"
+    def target(self, context: StrategyContext) -> float: return context.current_position
 
 def build_strategy(name: str, parameters: dict) -> Strategy:
     if name == "moving_average_crossover": return MovingAverageCrossover(**parameters)
     if name == "channel_breakout": return ChannelBreakout(**parameters)
-    if name in {"hold", "flat"}: return FixedStrategy(1.0 if name=="hold" else 0.0, name=name)
+    if name == "hold": return HoldStrategy()
+    if name == "flat": return FixedStrategy(0.0, name=name)
     raise ValueError(f"unknown strategy: {name}")

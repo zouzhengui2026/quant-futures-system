@@ -1,7 +1,7 @@
 """Strict, future-blind OHLCV catalog."""
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import csv, hashlib, math
 from pathlib import Path
 
@@ -15,7 +15,8 @@ class Bar:
     volume: float
     funding_rate: float = 0.0
 
-def load_bars(path: str | Path, schema: dict[str, str]) -> tuple[tuple[Bar, ...], str]:
+def load_bars(path: str | Path, schema: dict[str, str], *, start: str | None = None,
+              end: str | None = None, timeframe: str | None = None) -> tuple[tuple[Bar, ...], str]:
     source = Path(path)
     if source.suffix.lower() != ".csv":
         raise ValueError("only CSV is available in the dependency-free installation")
@@ -43,6 +44,21 @@ def load_bars(path: str | Path, schema: dict[str, str]) -> tuple[tuple[Bar, ...]
             rows.append(Bar(timestamp, o, h, l, c, v, funding))
     if not rows or any(a.timestamp >= b.timestamp for a, b in zip(rows, rows[1:])):
         raise ValueError("bars must be non-empty, unique, and strictly ordered")
+    lower = datetime.fromisoformat(start.replace("Z", "+00:00")) if start else None
+    upper = datetime.fromisoformat(end.replace("Z", "+00:00")) if end else None
+    rows = [bar for bar in rows if (lower is None or bar.timestamp >= lower) and
+            (upper is None or bar.timestamp <= upper)]
+    if not rows:
+        raise ValueError("configured date range contains no bars")
+    if timeframe:
+        units = {"m": "minutes", "h": "hours", "d": "days"}
+        try:
+            amount, unit = int(timeframe[:-1]), timeframe[-1]
+            expected = timedelta(**{units[unit]: amount})
+        except (ValueError, KeyError):
+            raise ValueError("timeframe must use a positive integer followed by m, h, or d") from None
+        if amount <= 0 or any(b.timestamp - a.timestamp != expected for a, b in zip(rows, rows[1:])):
+            raise ValueError("bars violate the configured strict timeframe/gap policy")
     return tuple(rows), hashlib.sha256(payload).hexdigest()
 
 def replay(bars: tuple[Bar, ...]):
