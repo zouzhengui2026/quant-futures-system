@@ -6,12 +6,14 @@ from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 import gc
 import math
+import threading
 from types import MappingProxyType
 import weakref
 
 import pytest
 
 from quant_futures.account import AccountEquityEngine, AccountSnapshot, PositionValuation
+from quant_futures.account import engine as account_engine_module
 from quant_futures.core.events import EventBus, EventType
 from quant_futures.core.exceptions import AccountValuationError, DomainValidationError
 from quant_futures.market_data.models import MarketDataKind, MarketDataRecord
@@ -273,3 +275,158 @@ def test_mixed_positions_are_sorted_and_stably_aggregated_to_negative_equity():
     assert snapshot.valuations[2].mark_record.symbol == "ZZZ"
     assert snapshot.total_unrealized_pnl == -2e16
     assert snapshot.equity == -2e16
+
+
+def test_commitment_strongly_anchors_exact_graph_and_rejects_equal_replacement():
+    p = position()
+    portfolio_snapshot = portfolio(p)
+    record = mark(p, 101)
+    engine = AccountEquityEngine(EventBus(), 100)
+    snapshot = engine.value(portfolio_snapshot, (record,))
+    valuation = snapshot.valuations[0]
+    commitment = account_engine_module._ANCHORS[engine].commitments[0]
+
+    replacement_position = position()
+    replacement_portfolio = portfolio(replacement_position)
+    replacement_record = mark(replacement_position, 101)
+    replacement_valuation = PositionValuation(
+        replacement_position, replacement_record, 101, 2, 5, NOW)
+    replacement_snapshot = AccountSnapshot(
+        replacement_portfolio, (replacement_valuation,), 100, 3, 2, 5, 105, NOW)
+    account_engine_module._ANCHORS[engine].history[0] = replacement_snapshot
+    del record, valuation, portfolio_snapshot, p
+    gc.collect()
+
+    assert commitment.snapshot is snapshot and commitment.snapshot is not replacement_snapshot
+    assert commitment.portfolio.portfolio is snapshot.portfolio_snapshot
+    assert commitment.portfolio.portfolio is not replacement_portfolio
+    assert commitment.portfolio.positions_tuple is snapshot.portfolio_snapshot.positions
+    assert commitment.portfolio.positions[0].position is not replacement_position
+    assert commitment.valuations[0].valuation is not replacement_valuation
+    assert commitment.valuations[0].mark.record is not replacement_record
+    with pytest.raises(AccountValuationError, match="differs"):
+        engine.latest()
+
+
+def test_split_lock_transitions_never_overlap_and_preserve_order():
+    bus, p = EventBus(), position()
+    engine = AccountEquityEngine(bus, 100)
+    first_publishing = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    maximum = 0
+    events = []
+
+    def subscriber(event):
+        nonlocal active, maximum
+        with state_lock:
+            active += 1
+            maximum = max(maximum, active)
+        events.append(event.payload["account_snapshot"])
+        if len(events) == 1:
+            engine._lock = threading.RLock()
+            first_publishing.set()
+            assert release_first.wait(2)
+        with state_lock:
+            active -= 1
+
+    bus.subscribe(EventType.ACCOUNT_UPDATED, subscriber)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(engine.value, portfolio(p), (mark(p, 101),))
+        assert first_publishing.wait(2)
+        second = pool.submit(lambda: (second_started.set(), engine.value(
+            portfolio(p), (mark(p, 102, NOW + timedelta(seconds=1)),)))[1])
+        assert second_started.wait(2)
+        assert len(events) == 1
+        release_first.set()
+        results = (first.result(), second.result())
+    assert maximum == 1
+    assert tuple(events) == engine.history() == results
+
+
+def test_transition_strongly_retains_and_restores_original_event_bus():
+    def build():
+        original = EventBus()
+        replacement = EventBus()
+        engine = AccountEquityEngine(original, 100)
+        original_ref = weakref.ref(original)
+        original.subscribe(EventType.ACCOUNT_UPDATED,
+                           lambda event: setattr(engine, "event_bus", replacement))
+        return engine, original_ref
+
+    engine, original_ref = build()
+    gc.collect()
+    assert original_ref() is not None
+    p = position()
+    assert engine.value(portfolio(p), (mark(p, 101),)).equity == 105
+    assert engine.event_bus is original_ref()
+    seen = []
+    original_ref().subscribe(EventType.ACCOUNT_UPDATED, seen.append)
+    engine.value(portfolio(p), (mark(p, 102, NOW + timedelta(seconds=1)),))
+    assert len(seen) == 1
+
+
+def test_different_concurrent_inputs_have_exact_event_history_order():
+    bus, p, events = EventBus(), position(), []
+    engine = AccountEquityEngine(bus, 100)
+    bus.subscribe(EventType.ACCOUNT_UPDATED,
+                  lambda event: events.append(event.payload["account_snapshot"]))
+    barrier = threading.Barrier(3)
+    def run(price):
+        barrier.wait()
+        return engine.value(portfolio(p), (mark(p, price),))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run, 101), pool.submit(run, 102)]
+        barrier.wait()
+        results = tuple(f.result() for f in futures)
+    assert set(map(id, results)) == set(map(id, events))
+    assert tuple(events) == engine.history()
+
+
+def test_fsum_preserves_genuine_stable_cancellation():
+    positive = position("AAA", 1, 1, 0)
+    unit = position("BBB", 1, 1, 0)
+    negative = position("CCC", -1, 1, 0)
+    snapshot = AccountEquityEngine(EventBus(), 10).value(
+        portfolio(positive, unit, negative),
+        (mark(positive, 1e16), mark(unit, 2), mark(negative, 1e16)),
+    )
+    assert [v.unrealized_pnl for v in snapshot.valuations] == [1e16, 1.0, -1e16]
+    assert snapshot.total_unrealized_pnl == math.fsum((1e16, 1.0, -1e16)) == 1.0
+    assert snapshot.equity == 11.0
+
+
+def test_account_model_rejects_missing_extra_duplicate_and_bad_aggregates():
+    p = position()
+    record = mark(p, 101)
+    valuation = PositionValuation(p, record, 101, 2, 5, NOW)
+    port = portfolio(p)
+    valid = (port, (valuation,), 100, 3, 2, 5, 105, NOW)
+    invalid = [
+        (port, (), 100, 3, 0, 3, 103, NOW),
+        (port, (valuation, valuation), 100, 3, 4, 7, 107, NOW),
+        (port, (valuation,), 100, 3, 2, 6, 106, NOW),
+        (port, (valuation,), 100, 3, 2, 5, 106, NOW),
+    ]
+    assert AccountSnapshot(*valid).equity == 105
+    for args in invalid:
+        with pytest.raises(DomainValidationError):
+            AccountSnapshot(*args)
+
+
+@pytest.mark.parametrize("change", [
+    {"source": "other"}, {"symbol": "ETH"},
+    {"kind": MarketDataKind.INDEX_PRICE}, {"values": {"price": 101, "extra": 1}},
+    {"values": {"other": 101}},
+    {"timestamp": datetime(2026, 1, 1)},
+])
+def test_valuation_model_rejects_wrong_mark_lineage(change):
+    p = position()
+    values = dict(kind=MarketDataKind.MARK_PRICE, symbol=p.symbol, source=p.source,
+                  timestamp=NOW, values={"price": 101})
+    values.update(change)
+    with pytest.raises((DomainValidationError, Exception)):
+        record = MarketDataRecord(**values)
+        PositionValuation(p, record, record.values.get("price"), 2, 5, NOW)
