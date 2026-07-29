@@ -5,6 +5,7 @@ from quant_futures.core.exceptions import (
     DomainValidationError,
     EventBusError,
     MarketDataError,
+    PortfolioLedgerError,
     QuantFuturesError,
 )
 from quant_futures.core.logger import get_logger
@@ -18,6 +19,7 @@ __all__ = [
     "EventName",
     "EventType",
     "MarketDataError",
+    "PortfolioLedgerError",
     "QuantFuturesError",
     "get_logger",
 ]

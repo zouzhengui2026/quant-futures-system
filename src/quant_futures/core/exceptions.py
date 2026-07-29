@@ -17,5 +17,9 @@ class OrderLifecycleError(QuantFuturesError):
     """Raised when a paper order lifecycle operation is invalid."""
 
 
+class PortfolioLedgerError(QuantFuturesError):
+    """Raised when a portfolio ledger operation is invalid."""
+
+
 class MarketDataError(QuantFuturesError):
     """Raised when market data cannot be normalized or safely collected."""
