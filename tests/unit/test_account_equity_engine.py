@@ -1,5 +1,6 @@
 """Phase 11 deterministic account-equity coverage."""
 
+from collections import UserDict
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import Context
 from dataclasses import FrozenInstanceError
@@ -15,7 +16,11 @@ import pytest
 from quant_futures.account import AccountEquityEngine, AccountSnapshot, PositionValuation
 from quant_futures.account import engine as account_engine_module
 from quant_futures.core.events import EventBus, EventType
-from quant_futures.core.exceptions import AccountValuationError, DomainValidationError
+from quant_futures.core.exceptions import (
+    AccountValuationError,
+    DomainValidationError,
+    MarketDataError,
+)
 from quant_futures.market_data.models import MarketDataKind, MarketDataRecord
 from quant_futures.portfolio.models import PortfolioSnapshot, PositionSide, PositionSnapshot
 
@@ -416,17 +421,67 @@ def test_account_model_rejects_missing_extra_duplicate_and_bad_aggregates():
             AccountSnapshot(*args)
 
 
-@pytest.mark.parametrize("change", [
-    {"source": "other"}, {"symbol": "ETH"},
-    {"kind": MarketDataKind.INDEX_PRICE}, {"values": {"price": 101, "extra": 1}},
-    {"values": {"other": 101}},
-    {"timestamp": datetime(2026, 1, 1)},
+@pytest.mark.parametrize(("change", "expected_error"), [
+    ({"source": "other"}, DomainValidationError),
+    ({"symbol": "ETH"}, DomainValidationError),
+    ({"kind": MarketDataKind.INDEX_PRICE}, DomainValidationError),
+    ({"values": {"price": 101, "extra": 1}}, DomainValidationError),
+    ({"values": {"other": 101}}, DomainValidationError),
+    ({"timestamp": datetime(2026, 1, 1)}, MarketDataError),
 ])
-def test_valuation_model_rejects_wrong_mark_lineage(change):
+def test_valuation_model_rejects_wrong_mark_lineage(change, expected_error):
     p = position()
     values = dict(kind=MarketDataKind.MARK_PRICE, symbol=p.symbol, source=p.source,
                   timestamp=NOW, values={"price": 101})
     values.update(change)
-    with pytest.raises((DomainValidationError, Exception)):
+    with pytest.raises(expected_error):
         record = MarketDataRecord(**values)
         PositionValuation(p, record, record.values.get("price"), 2, 5, NOW)
+
+
+@pytest.mark.parametrize("replacement", [
+    {"price": 101},
+    UserDict({"price": 101}),
+])
+def test_market_record_repeatable_validation_rejects_mutable_values(replacement):
+    record = mark(position(), 101)
+    object.__setattr__(record, "values", replacement)
+
+    with pytest.raises(MarketDataError, match="canonical read-only mapping"):
+        record.validate()
+
+
+def test_tampered_mutable_mark_fails_without_state_or_event():
+    bus, p, events = EventBus(), position(), []
+    bus.subscribe(EventType.ACCOUNT_UPDATED, events.append)
+    engine = AccountEquityEngine(bus, 100)
+    record = mark(p, 101)
+    object.__setattr__(record, "values", {"price": 101})
+
+    with pytest.raises(AccountValuationError, match="invalid mark record"):
+        engine.value(portfolio(p), (record,))
+
+    anchor = account_engine_module._ANCHORS[engine]
+    assert engine.history() == ()
+    assert anchor.commitments == []
+    assert engine._latest is None
+    assert events == []
+
+
+def test_commitment_construction_failure_is_atomic(monkeypatch):
+    bus, p, events = EventBus(), position(), []
+    bus.subscribe(EventType.ACCOUNT_UPDATED, events.append)
+    engine = AccountEquityEngine(bus, 100)
+
+    def fail_commitment(snapshot):
+        raise RuntimeError("commitment failed")
+
+    monkeypatch.setattr(account_engine_module, "_commit", fail_commitment)
+    with pytest.raises(RuntimeError, match="commitment failed"):
+        engine.value(portfolio(p), (mark(p, 101),))
+
+    anchor = account_engine_module._ANCHORS[engine]
+    assert engine.history() == ()
+    assert anchor.commitments == []
+    assert engine._latest is None
+    assert events == []

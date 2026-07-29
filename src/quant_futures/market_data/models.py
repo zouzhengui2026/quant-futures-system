@@ -60,7 +60,9 @@ class MarketDataRecord:
             raise MarketDataError("timestamp must be timezone-aware") from exc
         if self.timestamp.tzinfo is None or offset is None:
             raise MarketDataError("timestamp must be timezone-aware")
-        if not isinstance(self.values, Mapping) or not self.values:
+        if not isinstance(self.values, MappingProxyType):
+            raise MarketDataError("values must use the canonical read-only mapping")
+        if not self.values:
             raise MarketDataError("values must not be empty")
         for name, value in self.values.items():
             if not isinstance(name, str) or not name.strip():

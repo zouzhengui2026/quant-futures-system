@@ -215,8 +215,9 @@ class AccountEquityEngine:
             history = _anchor(self).history
             if history and snapshot.valued_at < history[-1].valued_at:
                 raise AccountValuationError("valuation precedes the latest committed snapshot")
+            commitment = _commit(snapshot)
             history.append(snapshot)
-            _anchor(self).commitments.append(_commit(snapshot))
+            _anchor(self).commitments.append(commitment)
             self._latest = snapshot
             event_bus.publish(Event(EventType.ACCOUNT_UPDATED, {
                 "account_snapshot": snapshot,
