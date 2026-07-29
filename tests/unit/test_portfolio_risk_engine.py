@@ -1,12 +1,12 @@
 """Phase 12 account-aware portfolio risk coverage."""
 
 from contextvars import Context
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 import gc
 import math
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event as ThreadEvent, Lock
 import weakref
 
 import pytest
@@ -17,9 +17,10 @@ from quant_futures.core.exceptions import DomainValidationError, PortfolioRiskEr
 from quant_futures.market_data.models import MarketDataKind, MarketDataRecord
 from quant_futures.portfolio.models import PortfolioSnapshot, PositionSide, PositionSnapshot
 from quant_futures.risk import (
-    PortfolioRiskEngine, PortfolioRiskLimits, PortfolioRiskOutcome, RiskLimitCode,
-    RiskLimitBreach,
+    PortfolioRiskEngine, PortfolioRiskLimits, PortfolioRiskOutcome, PortfolioRiskSnapshot,
+    PositionExposure, RiskLimitCode, RiskLimitBreach,
 )
+import quant_futures.risk.portfolio_engine as portfolio_engine_module
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -310,3 +311,214 @@ def test_equal_limits_replacement_and_corrupt_zero_state_fail_closed():
     engine._latest = object()
     with pytest.raises(PortfolioRiskError):
         engine.history()
+
+
+def test_split_lock_replacement_cannot_split_the_authoritative_transition():
+    original_bus = EventBus()
+    engine = PortfolioRiskEngine(original_bus, limits())
+    first_source = account(("FIRST", 1, 1))
+    second_source = account(("SECOND", 2, 1))
+    callback_entered = ThreadEvent()
+    release_callback = ThreadEvent()
+    second_started = ThreadEvent()
+    second_finished = ThreadEvent()
+    events = []
+
+    def attack(event):
+        snapshot = event.payload["portfolio_risk_snapshot"]
+        events.append(snapshot)
+        if snapshot.account_snapshot is first_source:
+            engine._lock = Lock()
+            callback_entered.set()
+            assert release_callback.wait(5)
+
+    original_bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED, attack)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(engine.evaluate, first_source)
+        assert callback_entered.wait(5)
+
+        def second_evaluation():
+            second_started.set()
+            result = engine.evaluate(second_source)
+            second_finished.set()
+            return result
+
+        second_future = executor.submit(second_evaluation)
+        assert second_started.wait(5)
+        assert not second_finished.wait(.1)
+        assert len(engine._history) == 1
+        release_callback.set()
+        first, second = first_future.result(5), second_future.result(5)
+
+    history = engine.history()
+    assert history == (first, second)
+    assert events == [first, second]
+    assert history[0] is first and history[1] is second
+    assert engine.latest() is second
+
+
+def test_original_event_bus_is_retained_locally_during_replacement_without_owner():
+    replacement = EventBus()
+    replacement_events = []
+    replacement.subscribe(EventType.PORTFOLIO_RISK_UPDATED,
+                          lambda event: replacement_events.append(event))
+    engine = PortfolioRiskEngine(EventBus(), limits())
+    original_ref = weakref.ref(engine.event_bus)
+    original_events = []
+
+    def attack(event):
+        original_events.append(event.payload["portfolio_risk_snapshot"])
+        engine.event_bus = replacement
+        gc.collect()
+        assert original_ref() is not None
+
+    engine.event_bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED, attack)
+    first = engine.evaluate(account(("FIRST", 1, 1)))
+    assert engine.event_bus is original_ref()
+    second = engine.evaluate(account(("SECOND", 1, 1)))
+    assert original_events == [first, second]
+    assert replacement_events == []
+
+
+def test_commitment_construction_failure_has_zero_state_and_later_recovers(monkeypatch):
+    bus, events = EventBus(), []
+    engine = PortfolioRiskEngine(bus, limits())
+    bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED, events.append)
+    real_fingerprint = portfolio_engine_module._fingerprint
+
+    def fail_snapshot_fingerprint(value):
+        if isinstance(value, PortfolioRiskSnapshot):
+            raise RuntimeError("fingerprint failed")
+        return real_fingerprint(value)
+
+    monkeypatch.setattr(portfolio_engine_module, "_fingerprint", fail_snapshot_fingerprint)
+    with pytest.raises(RuntimeError, match="fingerprint failed"):
+        engine.evaluate(account(("BTC", 1, 10)))
+    assert engine.history() == ()
+    with pytest.raises(PortfolioRiskError, match="history is empty"):
+        engine.latest()
+    assert events == []
+
+    monkeypatch.setattr(portfolio_engine_module, "_fingerprint", real_fingerprint)
+    result = engine.evaluate(account(("BTC", 1, 10)))
+    assert engine.history() == (result,)
+    assert events[0].payload["portfolio_risk_snapshot"] is result
+
+
+def test_same_input_concurrency_preserves_exact_commit_and_event_identities():
+    bus, events = EventBus(), []
+    engine = PortfolioRiskEngine(bus, limits())
+    source = account(("BTC", 1, 10))
+    bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED,
+                  lambda event: events.append(event.payload["portfolio_risk_snapshot"]))
+    workers = 8
+    barrier = Barrier(workers)
+
+    def evaluate():
+        barrier.wait()
+        return engine.evaluate(source)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        returned = [future.result() for future in
+                    [executor.submit(evaluate) for _ in range(workers)]]
+    history = engine.history()
+    assert len({id(snapshot) for snapshot in returned}) == workers
+    assert {id(snapshot) for snapshot in returned} == {id(snapshot) for snapshot in history}
+    assert len(events) == workers
+    assert all(event_snapshot is history[index]
+               for index, event_snapshot in enumerate(events))
+    assert all(snapshot.account_snapshot is source for snapshot in history)
+    assert engine.latest() is history[-1]
+
+
+def test_fresh_context_and_thread_reentry_state_are_cleaned_after_exception():
+    bus = EventBus()
+    engine = PortfolioRiskEngine(bus, limits())
+    source = account(("BTC", 1, 10))
+    errors = []
+
+    def callback(_event):
+        for invoke in (lambda: engine.evaluate(source),
+                       lambda: Context().run(engine.evaluate, source)):
+            with pytest.raises(PortfolioRiskError) as raised:
+                invoke()
+            errors.append(raised.value)
+        raise RuntimeError("stop publication")
+
+    unsubscribe = bus.subscribe(EventType.PORTFOLIO_RISK_UPDATED, callback)
+    with pytest.raises(RuntimeError, match="stop publication"):
+        engine.evaluate(source)
+    unsubscribe()
+    later = engine.evaluate(source)
+    assert len(errors) == 2
+    assert engine.history() == (engine.history()[0], later)
+    assert engine.latest() is later
+
+
+def test_history_is_an_immutable_tuple_detached_from_internal_storage():
+    engine = PortfolioRiskEngine(EventBus(), limits())
+    first = engine.evaluate(account(("BTC", 1, 10)))
+    history = engine.history()
+    assert isinstance(history, tuple) and history == (first,)
+    with pytest.raises(TypeError):
+        history[0] = first
+    engine.evaluate(account(("ETH", 1, 10)))
+    assert history == (first,)
+
+
+@pytest.mark.parametrize("target", [
+    "account", "valuation", "exposure", "limits", "breach", "history", "latest",
+])
+def test_exact_or_equal_public_graph_replacements_fail_closed(target):
+    engine, snapshot = _breached_engine_and_result()
+    if target == "account":
+        object.__setattr__(snapshot, "account_snapshot", replace(snapshot.account_snapshot))
+    elif target == "valuation":
+        replacement_account = replace(
+            snapshot.account_snapshot,
+            valuations=(replace(snapshot.account_snapshot.valuations[0]),),
+        )
+        object.__setattr__(snapshot, "account_snapshot", replacement_account)
+    elif target == "exposure":
+        object.__setattr__(snapshot, "position_exposures", tuple(
+            replace(exposure) for exposure in snapshot.position_exposures))
+    elif target == "limits":
+        object.__setattr__(snapshot, "limits", replace(snapshot.limits))
+    elif target == "breach":
+        object.__setattr__(snapshot, "breaches", tuple(
+            replace(breach) for breach in snapshot.breaches))
+    elif target == "history":
+        engine._history = list(engine._history)
+    else:
+        engine._latest = replace(snapshot)
+    with pytest.raises((DomainValidationError, PortfolioRiskError)):
+        engine.history()
+
+
+@pytest.mark.parametrize("factory", [
+    lambda: PositionExposure(
+        account(("BTC", 1, 10)).valuations[0], 10, 10),
+    lambda: limits(),
+    lambda: RiskLimitBreach(RiskLimitCode.MAX_GROSS_NOTIONAL, 11, 10),
+    lambda: PortfolioRiskEngine(EventBus(), limits()).evaluate(account(("BTC", 1, 10))),
+])
+def test_every_public_record_is_frozen_slotted_and_repeatably_validated(factory):
+    model = factory()
+    assert not hasattr(model, "__dict__")
+    model.validate()
+    model.validate()
+    first_field = next(iter(model.__dataclass_fields__))
+    with pytest.raises((FrozenInstanceError, AttributeError, TypeError)):
+        setattr(model, first_field, getattr(model, first_field))
+
+
+def test_multi_position_breaches_follow_deterministic_exposure_order():
+    result = PortfolioRiskEngine(EventBus(), limits(
+        max_position_notional=5)).evaluate(account(
+            ("ZETA", 2, 10), ("ALPHA", -3, 10), ("MU", 4, 10)))
+    position_breaches = tuple(
+        breach for breach in result.breaches
+        if breach.code is RiskLimitCode.MAX_POSITION_NOTIONAL)
+    assert [(breach.source, breach.symbol, breach.actual) for breach in position_breaches] == [
+        ("sim", "ALPHA", 30), ("sim", "MU", 40), ("sim", "ZETA", 20),
+    ]
