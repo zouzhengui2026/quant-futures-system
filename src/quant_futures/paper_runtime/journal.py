@@ -49,12 +49,20 @@ class TransitionRecord:
 
 
 @dataclass(frozen=True)
+class JournalSnapshot:
+    """Constant-sized result of validating a journal through its durable tail."""
+
+    tail: TransitionRecord | None
+
+
+@dataclass(frozen=True)
 class _Tail:
     run_id: str | None
     sequence: int
     digest: str | None
     boundary: int
     signature: tuple[int, int] | None
+    record: TransitionRecord | None = None
 
 
 class TransitionJournal:
@@ -77,14 +85,25 @@ class TransitionJournal:
 
     def tail(self) -> TransitionRecord | None:
         """Return the validated final record using constant memory."""
-        record, _ = self._scan(repair_tail=False)
-        return record
+        return self.snapshot().tail
 
-    def _repair_tail_held(self) -> TransitionRecord | None:
+    def snapshot(self) -> JournalSnapshot:
+        """Return a lock-consistent, constant-sized validated journal snapshot."""
+        with RunDirectoryLock(self.run_directory):
+            return self._snapshot_held()
+
+    def _snapshot_held(self) -> JournalSnapshot:
+        """Reuse this instance's tail only while the caller holds the run lock."""
+        tail = self._validated_tail_held(repair_tail=False)
+        return JournalSnapshot(tail.record)
+
+    def _repair_tail_held(self) -> JournalSnapshot:
         """Validate committed frames and repair only a provably incomplete append."""
         record, tail = self._scan(repair_tail=True)
+        tail = _Tail(tail.run_id, tail.sequence, tail.digest, tail.boundary,
+                     tail.signature, record)
         self._tail = tail
-        return record
+        return JournalSnapshot(record)
 
     def append(
         self, run_id: str, product_transition_id: str, stage: str, event_type: str,
@@ -107,7 +126,7 @@ class TransitionJournal:
         if not isinstance(normalized, dict):
             raise JournalError("transition payload must be an object")
 
-        tail = self._validated_tail_held()
+        tail = self._validated_tail_held(repair_tail=True)
         if tail.run_id is not None and tail.run_id != run_id:
             raise JournalError("run ID does not match journal lineage")
         unsigned: dict[str, object] = {
@@ -135,14 +154,16 @@ class TransitionJournal:
         )
         stat = self.path.stat()
         self._tail = _Tail(run_id, record.sequence, digest, stat.st_size,
-                           (stat.st_size, stat.st_mtime_ns))
+                           (stat.st_size, stat.st_mtime_ns), record)
         return record
 
-    def _validated_tail_held(self) -> _Tail:
+    def _validated_tail_held(self, *, repair_tail: bool) -> _Tail:
         signature = _signature(self.path)
         if self._tail is not None and self._tail.signature == signature:
             return self._tail
-        _, tail = self._scan(repair_tail=True)
+        record, tail = self._scan(repair_tail=repair_tail)
+        tail = _Tail(tail.run_id, tail.sequence, tail.digest, tail.boundary,
+                     tail.signature, record)
         self._tail = tail
         return tail
 

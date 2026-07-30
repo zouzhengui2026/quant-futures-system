@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from .lifecycle import Lifecycle, LifecycleError, LifecycleRecord, LifecycleState
-from .journal import JournalError, TransitionJournal
+from .journal import JournalError, JournalSnapshot, TransitionJournal
 from .lock import RunDirectoryLock
 
 
@@ -37,9 +37,13 @@ def project_status(run_directory: str | Path) -> dict[str, object]:
         return _project_status_held(Lifecycle(directory))
 
 
-def _project_status_held(lifecycle: Lifecycle) -> dict[str, object]:
+def _project_status_held(
+    lifecycle: Lifecycle, journal_snapshot: JournalSnapshot | None = None,
+) -> dict[str, object]:
     record = lifecycle.current()
-    journal_tail = TransitionJournal(lifecycle.run_directory).tail()
+    if journal_snapshot is None:
+        journal_snapshot = TransitionJournal(lifecycle.run_directory)._snapshot_held()
+    journal_tail = journal_snapshot.tail
     if journal_tail is not None and journal_tail.run_id != record.run_id:
         raise JournalError("journal run ID does not match lifecycle authority")
     return _status_for_record(record, journal_tail)
@@ -50,8 +54,10 @@ def write_status(run_directory: str | Path) -> dict[str, object]:
         return _write_status_held(Lifecycle(run_directory))
 
 
-def _write_status_held(lifecycle: Lifecycle) -> dict[str, object]:
-    status = _project_status_held(lifecycle)
+def _write_status_held(
+    lifecycle: Lifecycle, journal_snapshot: JournalSnapshot | None = None,
+) -> dict[str, object]:
+    status = _project_status_held(lifecycle, journal_snapshot)
     _atomic_projection(lifecycle.run_directory / "status.json", status)
     return status
 
@@ -106,13 +112,14 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
     lifecycle = Lifecycle(run_directory)
     with RunDirectoryLock(run_directory):
         journal = TransitionJournal(run_directory)
-        journal_tail = journal._repair_tail_held()
+        journal_snapshot = journal._repair_tail_held()
+        journal_tail = journal_snapshot.tail
         current = lifecycle.current()
         if journal_tail is not None and journal_tail.run_id != current.run_id:
             raise JournalError("journal run ID does not match lifecycle authority")
         lifecycle._transition_held(LifecycleState.RECOVERING, "recovery requested")
         record = lifecycle._transition_held(LifecycleState.RUNNING, "lifecycle authority validated")
-        _write_status_held(lifecycle)
+        _write_status_held(lifecycle, journal_snapshot)
         return record
 
 

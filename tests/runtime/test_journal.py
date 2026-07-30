@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 
 from quant_futures.paper_runtime import journal as journal_module
+from quant_futures.paper_runtime.control import _write_status_held, start
 from quant_futures.paper_runtime.journal import JournalError, TransitionJournal
+from quant_futures.paper_runtime.lifecycle import Lifecycle
+from quant_futures.paper_runtime.lock import RunDirectoryLock
 
 
 def append(journal: TransitionJournal, event: str = "INPUT_ACCEPTED", cursor: int = 0,
@@ -107,6 +110,42 @@ def test_steady_state_append_scans_existing_history_only_once(tmp_path: Path,
     restarted = TransitionJournal(tmp_path)
     append(restarted, cursor=500)
     assert decoded == 500  # One linear restart validation, not one scan per append.
+
+
+def test_append_and_status_projection_reuse_one_validated_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = start(tmp_path)
+    writer = TransitionJournal(run_directory)
+    for index in range(40):
+        writer.append(run_directory.name, f"transition-{index}", "INPUT", "INPUT_ACCEPTED",
+                      "2026-01-01T00:00:00Z", index, {})
+
+    decoded = 0
+    original = journal_module._decode
+
+    def instrumented(encoded: bytes, frame: int):
+        nonlocal decoded
+        decoded += 1
+        return original(encoded, frame)
+
+    monkeypatch.setattr(journal_module, "_decode", instrumented)
+    journal = TransitionJournal(run_directory)
+    lifecycle = Lifecycle(run_directory)
+    with RunDirectoryLock(run_directory):
+        snapshot = journal._snapshot_held()
+        assert decoded == 40
+        for index in range(40, 140):
+            record = journal._append_held(
+                run_directory.name, f"transition-{index}", "INPUT", "INPUT_ACCEPTED",
+                "2026-01-01T00:00:00Z", index, {},
+            )
+            snapshot = journal._snapshot_held()
+            assert snapshot.tail == record
+            _write_status_held(lifecycle, snapshot)
+
+    assert decoded == 40
+    assert json.loads((run_directory / "status.json").read_text())["journal_sequence"] == 140
 
 
 def test_first_create_fsyncs_file_then_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
