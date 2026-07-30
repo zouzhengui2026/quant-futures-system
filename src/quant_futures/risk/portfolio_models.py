@@ -35,6 +35,7 @@ class RiskLimitCode(str, Enum):
     MAX_POSITION_NOTIONAL = "max_position_notional"
     MAX_CONCENTRATION = "max_concentration"
     MAX_GROSS_EXPOSURE_MULTIPLE = "max_gross_exposure_multiple"
+    MAX_DRAWDOWN = "max_drawdown"
 
 
 class PortfolioRiskOutcome(str, Enum):
@@ -83,6 +84,7 @@ class PortfolioRiskLimits:
     max_position_notional: float
     max_concentration_ratio: float
     max_gross_exposure_multiple: float
+    max_drawdown_ratio: float = 1.0
 
     def __post_init__(self) -> None:
         self.validate()
@@ -98,6 +100,9 @@ class PortfolioRiskLimits:
         _positive("max_concentration_ratio", self.max_concentration_ratio)
         if self.max_concentration_ratio > 1:
             raise DomainValidationError("max_concentration_ratio must be at most one")
+        _positive("max_drawdown_ratio", self.max_drawdown_ratio)
+        if self.max_drawdown_ratio > 1:
+            raise DomainValidationError("max_drawdown_ratio must be at most one")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +147,7 @@ def build_portfolio_risk_breaches(
     concentration_ratio: float,
     gross_exposure_multiple: float | None,
     limits: PortfolioRiskLimits,
+    drawdown_ratio: float = 0.0,
 ) -> tuple[RiskLimitBreach, ...]:
     """Build the one canonical, deterministically ordered limit decision."""
     breaches: list[RiskLimitBreach] = []
@@ -171,6 +177,9 @@ def build_portfolio_risk_breaches(
         breaches.append(RiskLimitBreach(
             RiskLimitCode.MAX_GROSS_EXPOSURE_MULTIPLE, gross_exposure_multiple,
             limits.max_gross_exposure_multiple))
+    if drawdown_ratio > limits.max_drawdown_ratio:
+        breaches.append(RiskLimitBreach(
+            RiskLimitCode.MAX_DRAWDOWN, drawdown_ratio, limits.max_drawdown_ratio))
     return tuple(breaches)
 
 
@@ -189,6 +198,7 @@ class PortfolioRiskSnapshot:
     breaches: tuple[RiskLimitBreach, ...]
     outcome: PortfolioRiskOutcome
     evaluated_at: datetime
+    drawdown_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         self.validate()
@@ -216,6 +226,9 @@ class PortfolioRiskSnapshot:
         expected_concentration = 0.0 if expected_gross == 0 else expected_largest / expected_gross
         equity = self.account_snapshot.equity
         expected_multiple = None if equity <= 0 else expected_gross / equity
+        _finite("drawdown_ratio", self.drawdown_ratio)
+        if self.drawdown_ratio < 0:
+            raise DomainValidationError("drawdown_ratio must be non-negative")
         expected = (expected_long, expected_short, expected_gross, expected_net,
                     expected_largest, expected_concentration)
         names = ("long_notional", "short_notional", "gross_notional", "net_notional",
@@ -242,7 +255,7 @@ class PortfolioRiskSnapshot:
             breach.validate()
         expected_breaches = build_portfolio_risk_breaches(
             self.account_snapshot, self.position_exposures, expected_gross, expected_net,
-            expected_concentration, expected_multiple, self.limits)
+            expected_concentration, expected_multiple, self.limits, self.drawdown_ratio)
         if self.breaches != expected_breaches:
             raise DomainValidationError("breaches do not match the canonical limit decision")
         if not isinstance(self.outcome, PortfolioRiskOutcome):

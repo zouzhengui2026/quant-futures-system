@@ -3,6 +3,8 @@ name = "quant-futures-system"
 version = "0.1.0"
 description = "Crypto perpetual futures quantitative trading system"
 requires-python = ">=3.11"
+[project.scripts]
+quant-futures = "quant_futures.product.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

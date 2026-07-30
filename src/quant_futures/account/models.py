@@ -101,6 +101,9 @@ class AccountSnapshot:
     total_pnl: float
     equity: float
     valued_at: datetime
+    # Product-level fees, funding, deposits, and withdrawals committed by the
+    # account authority.  Kept last for backwards-compatible construction.
+    cash_flow: float = 0.0
 
     def __post_init__(self) -> None:
         self.validate()
@@ -127,13 +130,13 @@ class AccountSnapshot:
         _finite("starting_equity", self.starting_equity)
         if self.starting_equity < 0:
             raise DomainValidationError("starting_equity must be non-negative")
-        for name in ("total_realized_pnl", "total_unrealized_pnl", "total_pnl", "equity"):
+        for name in ("total_realized_pnl", "total_unrealized_pnl", "total_pnl", "equity", "cash_flow"):
             _finite(name, getattr(self, name))
         if not _equal(self.total_realized_pnl, self.portfolio_snapshot.total_realized_pnl):
             raise DomainValidationError("total_realized_pnl must equal the portfolio total")
         unrealized = _normalize(fsum(v.unrealized_pnl for v in self.valuations))
         total = _normalize(fsum((self.total_realized_pnl, unrealized)))
-        equity = _normalize(fsum((self.starting_equity, total)))
+        equity = _normalize(fsum((self.starting_equity, total, self.cash_flow)))
         if not _equal(self.total_unrealized_pnl, unrealized):
             raise DomainValidationError("total_unrealized_pnl does not equal valuation total")
         if not _equal(self.total_pnl, total):

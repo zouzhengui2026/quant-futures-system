@@ -1,51 +1,76 @@
-# Quant Futures System
+# Quant Futures System — Product v0.1 release candidate
 
-Institutional-grade cryptocurrency perpetual futures quantitative trading system.
+A deterministic, dependency-free local research product for replaying perpetual-futures
+bars through a reusable strategy, simulated market fills, account bookkeeping, risk
+checks, and self-contained reports. **Real-money execution is unavailable.** The product
+contains no credentials, private exchange access, deposits, withdrawals, or order routing.
 
-## Philosophy
-
-This project is designed around systematic market observation, opportunity detection, alpha extraction, disciplined execution and continuous improvement.
-
-Core principles:
-
-- Observe before acting.
-- Identify structural opportunities, not random signals.
-- Understand the source of profit before trading.
-- Respect leverage, liquidity and risk boundaries.
-- Execute through strict rules.
-
-## Architecture Philosophy
+## Architecture
 
 ```text
-Observation
-    ↓
-Market Regime
-    ↓
-Flow Analysis
-    ↓
-Alpha Sources
-    ↓
-Opportunity Evaluation
-    ↓
-Portfolio & Risk
-    ↓
-Execution
-    ↓
-Attribution & Improvement
+strict UTC CSV -> future-blind strategy -> simulated fill -> portfolio/account
+                                                        -> risk -> journal/report
 ```
 
-## Development Status
+## Install and five-minute quick start
 
-Phase 2: A read-only market-data collection boundary is available. It accepts
-validated, exchange-neutral OHLCV, funding, open-interest, mark/index-price,
-liquidation, and instrument-metadata observations, stores their latest values,
-and emits runtime events. Exchange adapters remain read-only; no order or
-trading capability exists.
+Python 3.11 or newer is required.
 
-No live trading capability exists at this stage.
+```bash
+python -m pip install -e .
+quant-futures validate-config examples/btc_ma.yaml
+quant-futures backtest --config examples/btc_ma.yaml
+quant-futures paper --config examples/btc_ma_paper.yaml --replay examples/data/btc_usdt_1h.csv
+```
 
-## Runtime Communication
+`paper --replay` is a **finite historical replay preview**, not paced or
+restartable paper trading. Interrupted-run continuation is not supported.
 
-`EventBus` is an internal, in-process runtime communication mechanism for
-decoupling system layers. It transports events between components but does not
-connect to exchanges, submit orders, or perform trading execution.
+Each command prints its deterministic run ID, directory, return, drawdown, trade count,
+and final equity. Remove or select a different `output_directory` before repeating an
+identical run: collision refusal protects existing evidence.
+
+## Configuration reference
+
+`mode` is `backtest` or `paper`; `data` selects the path, source, symbol, timeframe and
+explicit column schema. `starting_equity`, `fill_timing` (`next_open` or
+`current_close`), `costs` (commission/slippage bps), `risk`, output directory,
+and random seed have explicit defaults. Relative paths resolve against the YAML file.
+
+## Strategies
+
+Both modes use the same `Strategy` protocol and current-only `StrategyContext`. Included
+strategies are `moving_average_crossover`, `channel_breakout`, `hold`, and `flat`.
+Implement `target(context)` and publish a stable name/version to add a strategy; strategies
+return desired position and never mutate accounting state.
+
+## Artifacts and audit
+
+Every run includes `manifest.json`, `config.resolved.yaml`, `summary.json`, `equity.csv`,
+`positions.csv`, `trades.csv`, `risk_breaches.csv`, `events.jsonl`, `report.html`, an atomic
+`checkpoint.json`, and `status.json`. Run `quant-futures audit RUN_DIRECTORY` to compare the
+journal, exact schemas/digests, and reconstructed final state. Audit accepts only completed
+runs; it is not an interrupted-run recovery API.
+
+The included data is **synthetic sample data**, created solely for deterministic software
+demonstration; it is not exchange history or investment advice.
+
+## Assumptions and limitations
+
+Market orders fill at current close or next bar open with fixed costs. The runtime is a
+single-account, single-process simulator. It does not model order books, leverage, margin,
+liquidation, exchange latency, or live feeds. CSV is supported by the dependency-free RC;
+Parquet requires a future optional adapter. Funding applies only on rows with an explicit,
+non-blank funding value and charges the position carried into that timestamp; absent or
+blank values mean no funding event. The legacy configured funding rate is not a schedule.
+
+## Troubleshooting
+
+Configuration and CSV errors identify the invalid field or row and exit with code 2.
+All timestamps must explicitly be UTC and OHLCV values must be finite and valid. An existing
+run directory is never overwritten. Audit mismatch or checkpoint corruption fails closed.
+
+## Deferred beyond Product v0.1
+
+Restartable/paced paper trading, Parquet adapters, multi-symbol orchestration, and production
+event sourcing are explicitly out of scope. Live or real-money execution is unavailable.
