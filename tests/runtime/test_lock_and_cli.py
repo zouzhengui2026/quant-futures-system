@@ -12,6 +12,7 @@ from quant_futures.paper_runtime.control import start
 from quant_futures.paper_runtime import control as paper_control
 from quant_futures.paper_runtime.lifecycle import Lifecycle, LifecycleState
 from quant_futures.paper_runtime.lock import RunDirectoryLock, RunLockError
+from quant_futures.paper_runtime.journal import TransitionJournal
 from quant_futures.product.cli import main
 
 
@@ -171,5 +172,40 @@ def test_paper_audit_corrupt_authority_returns_mismatch(
     if authority is not None:
         (directory / "lifecycle.jsonl").write_bytes(authority)
     (directory / "status.json").write_text("{}\n", encoding="utf-8")
+    assert main(["paper", "audit", str(directory)]) == 3
+    assert "paper runtime audit: mismatch" in capsys.readouterr().out
+
+
+def test_paper_audit_accepts_missing_or_empty_checkpoint_two_journal(tmp_path: Path) -> None:
+    directory = start(tmp_path)
+    assert paper_control.audit(directory)
+    (directory / TransitionJournal.filename).touch()
+    assert paper_control.audit(directory)
+
+
+@pytest.mark.parametrize("corruption", ["tamper", "truncate", "duplicate", "reorder"])
+def test_paper_audit_journal_corruption_returns_exit_three(
+    tmp_path: Path, corruption: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory = start(tmp_path)
+    journal = TransitionJournal(directory)
+    args = ("run-1", "product-1", "INPUT", "INPUT_ACCEPTED",
+            "2026-01-01T00:00:00Z", 0, {"accepted": True})
+    # Use the lifecycle run ID required by the journal authority.
+    args = (Lifecycle(directory).current().run_id, *args[1:])
+    journal.append(*args)
+    journal.append(args[0], "product-2", "INPUT", "INPUT_ACCEPTED",
+                   "2026-01-01T00:00:01Z", 1, {})
+    paper_control.write_status(directory)
+    assert paper_control.audit(directory)
+    data = journal.path.read_bytes()
+    first_length = int.from_bytes(data[4:8], "big") + 8
+    if corruption == "tamper":
+        damaged = bytearray(data); damaged[damaged.index(b"true")] = ord("f")
+        data = bytes(damaged)
+    elif corruption == "truncate": data = data[:-1]
+    elif corruption == "duplicate": data += data[:first_length]
+    else: data = data[first_length:] + data[:first_length]
+    journal.path.write_bytes(data)
     assert main(["paper", "audit", str(directory)]) == 3
     assert "paper runtime audit: mismatch" in capsys.readouterr().out

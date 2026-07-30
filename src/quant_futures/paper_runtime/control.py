@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from .lifecycle import Lifecycle, LifecycleError, LifecycleRecord, LifecycleState
+from .journal import JournalError, TransitionJournal
 from .lock import RunDirectoryLock
 
 
@@ -31,7 +32,8 @@ def _atomic_projection(path: Path, value: dict[str, object]) -> None:
 
 def project_status(run_directory: str | Path) -> dict[str, object]:
     """Rebuild status exclusively from authoritative persisted lifecycle state."""
-    return _status_for_record(Lifecycle(run_directory).current())
+    directory = Path(run_directory)
+    return _status_for_record(Lifecycle(directory).current(), TransitionJournal(directory).records())
 
 
 def write_status(run_directory: str | Path) -> dict[str, object]:
@@ -40,16 +42,22 @@ def write_status(run_directory: str | Path) -> dict[str, object]:
 
 
 def _write_status_held(lifecycle: Lifecycle) -> dict[str, object]:
-    status = _status_for_record(lifecycle.current())
+    status = _status_for_record(
+        lifecycle.current(), TransitionJournal(lifecycle.run_directory).records()
+    )
     _atomic_projection(lifecycle.run_directory / "status.json", status)
     return status
 
 
-def _status_for_record(record: LifecycleRecord) -> dict[str, object]:
+def _status_for_record(record: LifecycleRecord, journal_records: tuple[object, ...] = ()) -> dict[str, object]:
+    journal_tail = journal_records[-1] if journal_records else None
     return {"schema_version": 1, "authoritative": False, "authority": Lifecycle.filename,
             "run_id": record.run_id, "lifecycle": record.state.value,
             "lifecycle_sequence": record.sequence, "last_reason": record.reason,
-            "input_cursor": 0, "journal_sequence": 0, "pending_order": None,
+            "input_cursor": getattr(journal_tail, "input_cursor", 0),
+            "journal_sequence": getattr(journal_tail, "sequence", 0),
+            "journal_tail_digest": getattr(journal_tail, "digest", None),
+            "pending_order": None,
             "positions": [], "equity": None, "risk_outcome": None,
             "counters": {"inputs": 0, "orders": 0, "fills": 0}}
 
@@ -103,6 +111,6 @@ def audit(run_directory: str | Path) -> bool:
         with RunDirectoryLock(run_directory):
             expected = project_status(run_directory)
             actual = json.loads((Path(run_directory) / "status.json").read_text(encoding="utf-8"))
-    except (LifecycleError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (LifecycleError, JournalError, OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
     return actual == expected

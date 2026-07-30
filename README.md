@@ -40,10 +40,16 @@ quant-futures paper recover RUN_DIRECTORY
 quant-futures paper audit RUN_DIRECTORY
 ```
 
-The runtime now also provides a durable `transitions.journal` foundation: length-prefixed,
-canonical-JSON frames form a SHA-256 lineage and every append is flushed under the run's
-single-writer lock. Truncated, reordered, modified, or oversized frames fail closed. Market-event
-consumption, checkpoints, and restart recovery remain subsequent checkpoints. In particular,
+The runtime now also provides a durable `transitions.journal` foundation. Its versioned,
+length-prefixed canonical-JSON envelope records deterministic journal and product transition
+identities, stage, event type, effective market time, input cursor, payload, and SHA-256 lineage.
+Startup validates the committed prefix in one streaming pass without retaining its history;
+steady-state appends use constant-sized tail metadata. Under the run lock, only an incomplete
+final header or payload is truncated and fsynced. Completed-frame corruption, invalid schema,
+reordering, duplication, modification, and oversized frames fail closed. `paper audit` validates
+this authority (a missing or empty journal is valid during Checkpoint 2) and projects its sequence
+and tail digest. Market-event consumption, checkpoints, and state restoration remain subsequent
+checkpoints. In particular,
 `recover` is legal only for a persisted `FAILED_RECOVERABLE`
 lifecycle and currently validates lifecycle authority—it does not yet restore trading state.
 Invalid or repeated transitions fail closed with exit code 2, while an audit mismatch exits 3.
