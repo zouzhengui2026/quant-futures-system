@@ -82,13 +82,17 @@ class Lifecycle:
 
     def initialize(self, run_id: str) -> LifecycleRecord:
         with RunDirectoryLock(self.run_directory):
-            if not run_id or not self.run_directory.is_dir():
-                raise LifecycleError("a non-empty run ID and existing run directory are required")
-            if self.path.exists():
-                raise LifecycleError("lifecycle authority already exists")
-            record = LifecycleRecord(1, run_id, 1, None, LifecycleState.CREATED, "run created")
-            self._append(record, exclusive=True)
-            return record
+            return self._initialize_held(run_id)
+
+    def _initialize_held(self, run_id: str) -> LifecycleRecord:
+        """Initialize authority while the caller holds the run-directory lock."""
+        if not run_id or not self.run_directory.is_dir():
+            raise LifecycleError("a non-empty run ID and existing run directory are required")
+        if self.path.exists():
+            raise LifecycleError("lifecycle authority already exists")
+        record = LifecycleRecord(1, run_id, 1, None, LifecycleState.CREATED, "run created")
+        self._append(record, exclusive=True)
+        return record
 
     def records(self) -> tuple[LifecycleRecord, ...]:
         return tuple(self._read_records())
@@ -101,15 +105,19 @@ class Lifecycle:
 
     def transition(self, target: LifecycleState, reason: str) -> LifecycleRecord:
         with RunDirectoryLock(self.run_directory):
-            current = self.current()
-            if (current.state, target) not in LEGAL_TRANSITIONS:
-                raise LifecycleError(f"illegal lifecycle transition: {current.state.value} -> {target.value}")
-            if not reason.strip():
-                raise LifecycleError("transition reason must not be empty")
-            record = LifecycleRecord(1, current.run_id, current.sequence + 1,
-                                     current.state, target, reason.strip())
-            self._append(record)
-            return record
+            return self._transition_held(target, reason)
+
+    def _transition_held(self, target: LifecycleState, reason: str) -> LifecycleRecord:
+        """Append a transition while the caller holds the run-directory lock."""
+        current = self.current()
+        if (current.state, target) not in LEGAL_TRANSITIONS:
+            raise LifecycleError(f"illegal lifecycle transition: {current.state.value} -> {target.value}")
+        if not reason.strip():
+            raise LifecycleError("transition reason must not be empty")
+        record = LifecycleRecord(1, current.run_id, current.sequence + 1,
+                                 current.state, target, reason.strip())
+        self._append(record)
+        return record
 
     def _read_records(self) -> Iterator[LifecycleRecord]:
         try:
