@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from math import isfinite
 from typing import Callable
 
@@ -30,7 +31,7 @@ from quant_futures.risk.portfolio_engine import PortfolioRiskEngine
 from quant_futures.risk.portfolio_models import PortfolioRiskLimits
 
 from .journal import JournalSnapshot, TransitionJournal
-from .lifecycle import Lifecycle, LifecycleState
+from .lifecycle import Lifecycle, LifecycleError, LifecycleState
 from .lock import RunDirectoryLock
 
 VALID_STAGES = frozenset({
@@ -99,6 +100,7 @@ class PaperTransitionState:
     risk_snapshot: object
     counters: TransitionCounters
     journal_snapshot: JournalSnapshot
+    last_committed_ordering_key: str | None
 
 
 def deterministic_id(run_id: str, input_identity: str, kind: str, domain: object) -> str:
@@ -135,7 +137,7 @@ class PaperTransitionCoordinator:
         self._cursor = 0
         self._orders = self._fills = self._events = 0
         self._poisoned = False
-        self._last_input_identity: str | None = None
+        self._last_committed_timestamp: datetime | None = None
         snapshot = journal.snapshot()
         if snapshot.tail is not None and snapshot.tail.run_id != run_id:
             raise TransitionError("journal/lifecycle run ID mismatch")
@@ -155,6 +157,8 @@ class PaperTransitionCoordinator:
             self._account_snapshot, self._risk_snapshot,
             TransitionCounters(self._cursor, self._orders, self._fills, self._events),
             self._journal_snapshot,
+            (self._last_committed_timestamp.isoformat().replace("+00:00", "Z")
+             if self._last_committed_timestamp is not None else None),
         )
 
     def status_projection(self) -> dict[str, object]:
@@ -164,6 +168,7 @@ class PaperTransitionCoordinator:
             "authoritative": False,
             "run_id": self.run_id,
             "input_cursor": state.input_cursor,
+            "last_committed_ordering_key": state.last_committed_ordering_key,
             "pending_order": (
                 state.pending_order.order.order_id if state.pending_order is not None else None
             ),
@@ -200,11 +205,17 @@ class PaperTransitionCoordinator:
         persisted = self.journal._snapshot_held()
         if persisted != self._journal_snapshot:
             raise TransitionError("journal advanced outside this coordinator")
-        lifecycle_path = self.journal.run_directory / Lifecycle.filename
-        if lifecycle_path.exists():
+        try:
             lifecycle = Lifecycle(self.journal.run_directory).current()
-            if lifecycle.run_id != self.run_id or lifecycle.state is not LifecycleState.RUNNING:
-                raise TransitionError("lifecycle is not eligible for a market transition")
+        except LifecycleError as exc:
+            raise TransitionError("valid lifecycle authority is required for a market transition") from exc
+        if lifecycle.run_id != self.run_id or lifecycle.state is not LifecycleState.RUNNING:
+            raise TransitionError("lifecycle is not eligible for a market transition")
+        if bar.timestamp.tzinfo is None or bar.timestamp.utcoffset() is None:
+            raise TransitionError("market timestamp must be timezone-aware")
+        if (self._last_committed_timestamp is not None
+                and bar.timestamp <= self._last_committed_timestamp):
+            raise TransitionError("market timestamps must be strictly increasing")
         cursor = self._cursor + 1
         timestamp = bar.timestamp.isoformat().replace("+00:00", "Z")
         input_domain = {"cursor": cursor, "timestamp": timestamp, "open": bar.open,
@@ -215,8 +226,6 @@ class PaperTransitionCoordinator:
             {key: value for key, value in input_domain.items() if key != "cursor"},
         )
         transition_id = deterministic_id(self.run_id, input_id, "transition", cursor)
-        if input_id == self._last_input_identity:
-            raise TransitionError("duplicate deterministic identity in uninterrupted run")
         protocol = StageProtocol()
 
         def emit(stage: str, payload: dict[str, object]) -> None:
@@ -322,7 +331,7 @@ class PaperTransitionCoordinator:
         emit("transition_committed", {"orders": self._orders, "fills": self._fills})
         protocol.complete()
         self._cursor = cursor
-        self._last_input_identity = input_id
+        self._last_committed_timestamp = bar.timestamp
         self._journal_snapshot = self.journal._snapshot_held()
         return self.state
 

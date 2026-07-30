@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
-from threading import Event, Thread
+from multiprocessing import Event, Process, Queue
+from threading import Event as ThreadEvent, Thread
 import time
 
 import pytest
@@ -53,10 +54,54 @@ def bar(n, *, close=100.0, open_=100.0, funding=None):
 def stages(journal):
     return [record.stage for record in journal.iter_records()]
 
+def running_lifecycle(path, run_id):
+    lifecycle = Lifecycle(path)
+    lifecycle.initialize(run_id)
+    lifecycle.transition(LifecycleState.STARTING, "start")
+    lifecycle.transition(LifecycleState.RUNNING, "run")
+    return lifecycle
+
+
+def authorized_coordinator(run_id, cfg, strategy, journal, failure_injector=None):
+    """Focused-test harness that explicitly materializes production lifecycle authority."""
+    lifecycle_path = journal.run_directory / Lifecycle.filename
+    if not lifecycle_path.exists():
+        running_lifecycle(journal.run_directory, run_id)
+    return PaperTransitionCoordinator(run_id, cfg, strategy, journal, failure_injector)
+
+
+def _run_slow_transition(path, entered, release, outcomes):
+    try:
+        coordinator = PaperTransitionCoordinator(
+            "process-run", config(), SlowStrategy(entered, release), TransitionJournal(path))
+        coordinator.transition(bar(0))
+        outcomes.put(("transition", "committed"))
+    except BaseException as exc:
+        outcomes.put(("transition", type(exc).__name__))
+
+
+def _attempt_transition(path, outcomes):
+    try:
+        coordinator = PaperTransitionCoordinator(
+            "process-run", config(), HoldStrategy(), TransitionJournal(path))
+        coordinator.transition(bar(1))
+        outcomes.put(("second", "committed"))
+    except BaseException as exc:
+        outcomes.put(("second", type(exc).__name__))
+
+
+def _attempt_control(path, target, outcomes):
+    try:
+        Lifecycle(path).transition(target, target.value.lower())
+        outcomes.put((target.value, "committed"))
+    except BaseException as exc:
+        outcomes.put((target.value, type(exc).__name__))
+
+
 
 def test_no_order_transition_and_status_use_canonical_state(tmp_path):
     journal = TransitionJournal(tmp_path)
-    coordinator = PaperTransitionCoordinator("run-a", config(), HoldStrategy(), journal)
+    coordinator = authorized_coordinator("run-a", config(), HoldStrategy(), journal)
     state = coordinator.transition(bar(0))
     assert stages(journal) == [
         "transition_started", "input_committed", "strategy_committed",
@@ -66,10 +111,59 @@ def test_no_order_transition_and_status_use_canonical_state(tmp_path):
     assert state.input_cursor == 1
     assert coordinator.status_projection()["equity"] == state.account_snapshot.equity
     assert coordinator.status_projection()["positions"] == []
+    assert state.last_committed_ordering_key == "2025-01-01T00:00:00Z"
+
+
+@pytest.mark.parametrize("authority", ["missing", "corrupt", "paused", "wrong-run"])
+def test_transition_requires_running_matching_lifecycle_authority(tmp_path, authority):
+    if authority == "corrupt":
+        (tmp_path / Lifecycle.filename).write_text("not-json\n", encoding="utf-8")
+    elif authority == "paused":
+        lifecycle = running_lifecycle(tmp_path, "authority-run")
+        lifecycle.transition(LifecycleState.PAUSED, "pause")
+    elif authority == "wrong-run":
+        running_lifecycle(tmp_path, "different-run")
+    coordinator = PaperTransitionCoordinator(
+        "authority-run", config(), HoldStrategy(), TransitionJournal(tmp_path))
+    before = (tmp_path / "transitions.journal").read_bytes() if (
+        tmp_path / "transitions.journal").exists() else b""
+    with pytest.raises(TransitionError, match="lifecycle"):
+        coordinator.transition(bar(0))
+    after = (tmp_path / "transitions.journal").read_bytes() if (
+        tmp_path / "transitions.journal").exists() else b""
+    assert after == before == b""
+
+
+@pytest.mark.parametrize("candidate", [
+    bar(0, close=101.0),
+    bar(-1),
+])
+def test_committed_market_timestamp_is_a_strict_bounded_ordering_key(tmp_path, candidate):
+    journal = TransitionJournal(tmp_path)
+    coordinator = authorized_coordinator(
+        "ordered-run", config(), HoldStrategy(), journal)
+    first = coordinator.transition(bar(0))
+    before = (tmp_path / "transitions.journal").read_bytes()
+    with pytest.raises(TransitionError, match="strictly increasing"):
+        coordinator.transition(candidate)
+    assert (tmp_path / "transitions.journal").read_bytes() == before
+    assert first.last_committed_ordering_key == "2025-01-01T00:00:00Z"
+
+
+def test_rejects_nonadjacent_replay_before_journal_append(tmp_path):
+    journal = TransitionJournal(tmp_path)
+    coordinator = authorized_coordinator(
+        "ordered-replay", config(), HoldStrategy(), journal)
+    coordinator.transition(bar(0))
+    coordinator.transition(bar(1))
+    before = (tmp_path / "transitions.journal").read_bytes()
+    with pytest.raises(TransitionError, match="strictly increasing"):
+        coordinator.transition(bar(0))
+    assert (tmp_path / "transitions.journal").read_bytes() == before
 
 
 def test_current_close_costs_funding_and_canonical_outputs(tmp_path):
-    coordinator = PaperTransitionCoordinator(
+    coordinator = authorized_coordinator(
         "run-b", config(commission=10.0, slippage=10.0), FixedStrategy(1.0),
         TransitionJournal(tmp_path))
     first = coordinator.transition(bar(0))
@@ -87,7 +181,7 @@ def test_matches_product_v01_account_portfolio_and_risk_path(tmp_path):
     cfg = config(commission=2.0, slippage=1.0)
     bars = (bar(0), bar(1, close=110.0, funding=0.001))
     expected = simulate(cfg, bars, FixedStrategy(1.0))
-    coordinator = PaperTransitionCoordinator(
+    coordinator = authorized_coordinator(
         "canonical-comparison", cfg, FixedStrategy(1.0), TransitionJournal(tmp_path))
     states = tuple(coordinator.transition(item) for item in bars)
     for state, record in zip(states, expected):
@@ -98,7 +192,7 @@ def test_matches_product_v01_account_portfolio_and_risk_path(tmp_path):
 
 def test_next_open_creates_then_fills_pending_order(tmp_path):
     journal = TransitionJournal(tmp_path)
-    coordinator = PaperTransitionCoordinator(
+    coordinator = authorized_coordinator(
         "run-c", config(timing="next_open"), FixedStrategy(1.0), journal)
     first = coordinator.transition(bar(0))
     assert first.pending_order is not None and first.counters.fills == 0
@@ -109,7 +203,7 @@ def test_next_open_creates_then_fills_pending_order(tmp_path):
 
 def test_next_open_target_change_records_real_causal_order_and_payloads(tmp_path):
     journal = TransitionJournal(tmp_path)
-    coordinator = PaperTransitionCoordinator(
+    coordinator = authorized_coordinator(
         "changing", config(timing="next_open", commission=10.0, slippage=10.0),
         SequenceStrategy((1.0, -1.0)), journal)
     first = coordinator.transition(bar(0))
@@ -151,7 +245,7 @@ def test_deterministic_byte_stable_journal(tmp_path):
     payloads = []
     for path in paths:
         path.mkdir()
-        coordinator = PaperTransitionCoordinator(
+        coordinator = authorized_coordinator(
             "same-run", config(), FixedStrategy(1.0), TransitionJournal(path))
         coordinator.transition(bar(0))
         payloads.append((path / "transitions.journal").read_bytes())
@@ -167,7 +261,7 @@ def test_any_journal_boundary_failure_poisons_coordinator(
     tmp_path, monkeypatch, failed_stage,
 ):
     journal = TransitionJournal(tmp_path)
-    coordinator = PaperTransitionCoordinator("run-d", config(), FixedStrategy(1.0), journal)
+    coordinator = authorized_coordinator("run-d", config(), FixedStrategy(1.0), journal)
     original = journal._append_held
 
     def fail_commit(*args, **kwargs):
@@ -185,19 +279,19 @@ def test_any_journal_boundary_failure_poisons_coordinator(
 
 def test_reopening_completed_or_partial_journal_fails_closed(tmp_path, monkeypatch):
     journal = TransitionJournal(tmp_path)
-    coordinator = PaperTransitionCoordinator("run-e", config(), HoldStrategy(), journal)
+    coordinator = authorized_coordinator("run-e", config(), HoldStrategy(), journal)
     coordinator.transition(bar(0))
-    with pytest.raises(TransitionError, match="duplicate"):
+    with pytest.raises(TransitionError, match="strictly increasing"):
         coordinator.transition(bar(0))
     with pytest.raises(TransitionError, match="unusable"):
         coordinator.transition(bar(1))
     with pytest.raises(TransitionError, match="Checkpoint 4"):
-        PaperTransitionCoordinator("run-e", config(), HoldStrategy(), TransitionJournal(tmp_path))
+        authorized_coordinator("run-e", config(), HoldStrategy(), TransitionJournal(tmp_path))
 
     partial = tmp_path / "partial"
     partial.mkdir()
     journal = TransitionJournal(partial)
-    coordinator = PaperTransitionCoordinator("run-f", config(), HoldStrategy(), journal)
+    coordinator = authorized_coordinator("run-f", config(), HoldStrategy(), journal)
     original = journal._append_held
     monkeypatch.setattr(journal, "_append_held", lambda *a, **k: (
         (_ for _ in ()).throw(OSError("cut")) if a[2] == "strategy_committed" else original(*a, **k)
@@ -205,7 +299,7 @@ def test_reopening_completed_or_partial_journal_fails_closed(tmp_path, monkeypat
     with pytest.raises(OSError):
         coordinator.transition(bar(0))
     with pytest.raises(TransitionError, match="Checkpoint 4"):
-        PaperTransitionCoordinator("run-f", config(), HoldStrategy(), TransitionJournal(partial))
+        authorized_coordinator("run-f", config(), HoldStrategy(), TransitionJournal(partial))
 
 
 @pytest.mark.parametrize("boundary", [
@@ -216,7 +310,7 @@ def test_canonical_authority_failure_poisons_coordinator(tmp_path, boundary):
         if candidate == boundary:
             raise RuntimeError(f"injected {boundary}")
 
-    coordinator = PaperTransitionCoordinator(
+    coordinator = authorized_coordinator(
         "authority-cut", config(), FixedStrategy(1.0), TransitionJournal(tmp_path), inject)
     with pytest.raises(RuntimeError, match=boundary):
         coordinator.transition(bar(0))
@@ -229,10 +323,10 @@ def test_whole_transition_excludes_second_coordinator_and_control(tmp_path):
     lifecycle.initialize("locked-run")
     lifecycle.transition(LifecycleState.STARTING, "start")
     lifecycle.transition(LifecycleState.RUNNING, "run")
-    entered, release = Event(), Event()
-    first = PaperTransitionCoordinator(
+    entered, release = ThreadEvent(), ThreadEvent()
+    first = authorized_coordinator(
         "locked-run", config(), SlowStrategy(entered, release), TransitionJournal(tmp_path))
-    second = PaperTransitionCoordinator(
+    second = authorized_coordinator(
         "locked-run", config(), HoldStrategy(), TransitionJournal(tmp_path))
     outcomes = []
 
@@ -270,3 +364,44 @@ def test_whole_transition_excludes_second_coordinator_and_control(tmp_path):
     assert [name for name, _ in outcomes].count("pause") == 1
     assert [name for name, _ in outcomes].count("second") == 1
     lifecycle.transition(LifecycleState.PAUSED, "pause after product commit")
+
+
+def test_multiprocess_transition_excludes_product_and_controls(tmp_path):
+    lifecycle = running_lifecycle(tmp_path, "process-run")
+    lifecycle_before = (tmp_path / Lifecycle.filename).read_bytes()
+    entered, release, outcomes = Event(), Event(), Queue()
+    first = Process(target=_run_slow_transition,
+                    args=(tmp_path, entered, release, outcomes))
+    first.start()
+    assert entered.wait(5)
+
+    contenders = [
+        Process(target=_attempt_transition, args=(tmp_path, outcomes)),
+        Process(target=_attempt_control,
+                args=(tmp_path, LifecycleState.PAUSED, outcomes)),
+        Process(target=_attempt_control,
+                args=(tmp_path, LifecycleState.STOPPING, outcomes)),
+    ]
+    for process in contenders:
+        process.start()
+    for process in contenders:
+        process.join(5)
+        assert process.exitcode == 0
+
+    blocked = dict(outcomes.get(timeout=2) for _ in contenders)
+    assert blocked == {
+        "second": "RunLockError",
+        "PAUSED": "RunLockError",
+        "STOPPING": "RunLockError",
+    }
+    assert (tmp_path / Lifecycle.filename).read_bytes() == lifecycle_before
+
+    release.set()
+    first.join(5)
+    assert first.exitcode == 0
+    assert outcomes.get(timeout=2) == ("transition", "committed")
+    records = tuple(TransitionJournal(tmp_path).iter_records())
+    assert records
+    assert len({record.product_transition_id for record in records}) == 1
+    assert [record.sequence for record in records] == list(range(1, len(records) + 1))
+    assert lifecycle.current().state is LifecycleState.RUNNING
