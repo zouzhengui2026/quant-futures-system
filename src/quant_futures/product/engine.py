@@ -118,6 +118,15 @@ def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy,
         timestamp = bar.timestamp.isoformat().replace("+00:00", "Z")
         sequence = _stage(on_stage, sequence, index + 1, "bar_started", timestamp,
                           price=bar.close)
+        # Funding is a timestamped event charged to the position carried into
+        # the timestamp.  Fills at this timestamp (next-open or current-close)
+        # are therefore never charged retrospectively.  A missing/blank
+        # funding cell means no event.  ``costs.funding_rate`` is retained for
+        # configuration compatibility but is not a schedule and is never
+        # applied to an ordinary row.
+        pre_event_quantity = _position(ledger, config.data.source, config.data.symbol)
+        funding = (-pre_event_quantity * bar.close * bar.funding_rate
+                   if bar.funding_rate is not None else 0.0)
         report = update = None
         fill_qty = commission = slippage = 0.0
         fill_price = None
@@ -180,8 +189,7 @@ def simulate(config: ProductConfig, bars: tuple[Bar, ...], strategy: Strategy,
         snapshot = ledger.snapshot()
         marks = tuple(MarketDataRecord(MarketDataKind.MARK_PRICE, p.symbol, p.source, bar.timestamp,
                                        {"price": bar.close}) for p in snapshot.positions if p.side is not PositionSide.FLAT)
-        funding = -quantity * bar.close * config.costs.funding_rate if (quantity := _position(
-            ledger, config.data.source, config.data.symbol)) else 0.0
+        quantity = _position(ledger, config.data.source, config.data.symbol)
         cash_flow += funding - commission
         account_snapshot = account.value(snapshot, marks, cash_flow=cash_flow)
         sequence = _stage(on_stage, sequence, index + 1, "account_committed", timestamp,

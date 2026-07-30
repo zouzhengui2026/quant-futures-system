@@ -13,7 +13,9 @@ class Bar:
     low: float
     close: float
     volume: float
-    funding_rate: float = 0.0
+    # ``None`` means this row is not a funding event.  A numeric value,
+    # including zero, means that the dataset explicitly supplied an event.
+    funding_rate: float | None = None
 
 def load_bars(path: str | Path, schema: dict[str, str], *, start: str | None = None,
               end: str | None = None, timeframe: str | None = None) -> tuple[tuple[Bar, ...], str]:
@@ -31,13 +33,16 @@ def load_bars(path: str | Path, schema: dict[str, str], *, start: str | None = N
             try:
                 timestamp = datetime.fromisoformat(raw[schema["timestamp"]].replace("Z", "+00:00"))
                 values = [float(raw[schema[k]]) for k in ("open", "high", "low", "close", "volume")]
-                funding = float(raw.get(schema.get("funding_rate", "funding_rate"), 0) or 0)
+                funding_name = schema.get("funding_rate", "funding_rate")
+                funding_raw = raw.get(funding_name)
+                funding = None if funding_raw is None or not funding_raw.strip() else float(funding_raw)
             except (ValueError, TypeError, KeyError) as exc:
                 raise ValueError(f"malformed CSV row {number}") from exc
             o, h, l, c, v = values
             if timestamp.tzinfo is None or timestamp.utcoffset() != timezone.utc.utcoffset(timestamp):
                 raise ValueError(f"row {number} timestamp is not UTC-aware")
-            if not all(math.isfinite(x) for x in (*values, funding)) or v < 0:
+            if not all(math.isfinite(x) for x in values) or (funding is not None and
+                    not math.isfinite(funding)) or v < 0:
                 raise ValueError(f"row {number} contains non-finite values or negative volume")
             if min(o, c) < l or max(o, c) > h or l > h or l <= 0:
                 raise ValueError(f"row {number} has invalid OHLC values")

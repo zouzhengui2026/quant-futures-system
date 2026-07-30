@@ -1,4 +1,4 @@
-# Quant Futures System — v1.0 release candidate
+# Quant Futures System — Product v0.1 release candidate
 
 A deterministic, dependency-free local research product for replaying perpetual-futures
 bars through a reusable strategy, simulated market fills, account bookkeeping, risk
@@ -23,6 +23,9 @@ quant-futures backtest --config examples/btc_ma.yaml
 quant-futures paper --config examples/btc_ma_paper.yaml --replay examples/data/btc_usdt_1h.csv
 ```
 
+`paper --replay` is a **finite historical replay preview**, not paced or
+restartable paper trading. Interrupted-run continuation is not supported.
+
 Each command prints its deterministic run ID, directory, return, drawdown, trade count,
 and final equity. Remove or select a different `output_directory` before repeating an
 identical run: collision refusal protects existing evidence.
@@ -31,7 +34,7 @@ identical run: collision refusal protects existing evidence.
 
 `mode` is `backtest` or `paper`; `data` selects the path, source, symbol, timeframe and
 explicit column schema. `starting_equity`, `fill_timing` (`next_open` or
-`current_close`), `costs` (commission/slippage bps and funding), `risk`, output directory,
+`current_close`), `costs` (commission/slippage bps), `risk`, output directory,
 and random seed have explicit defaults. Relative paths resolve against the YAML file.
 
 ## Strategies
@@ -46,7 +49,8 @@ return desired position and never mutate accounting state.
 Every run includes `manifest.json`, `config.resolved.yaml`, `summary.json`, `equity.csv`,
 `positions.csv`, `trades.csv`, `risk_breaches.csv`, `events.jsonl`, `report.html`, an atomic
 `checkpoint.json`, and `status.json`. Run `quant-futures audit RUN_DIRECTORY` to compare the
-journal digest and reconstruct the exact last state.
+journal, exact schemas/digests, and reconstructed final state. Audit accepts only completed
+runs; it is not an interrupted-run recovery API.
 
 The included data is **synthetic sample data**, created solely for deterministic software
 demonstration; it is not exchange history or investment advice.
@@ -56,7 +60,9 @@ demonstration; it is not exchange history or investment advice.
 Market orders fill at current close or next bar open with fixed costs. The runtime is a
 single-account, single-process simulator. It does not model order books, leverage, margin,
 liquidation, exchange latency, or live feeds. CSV is supported by the dependency-free RC;
-Parquet requires a future optional adapter.
+Parquet requires a future optional adapter. Funding applies only on rows with an explicit,
+non-blank funding value and charges the position carried into that timestamp; absent or
+blank values mean no funding event. The legacy configured funding rate is not a schedule.
 
 ## Troubleshooting
 
@@ -64,8 +70,7 @@ Configuration and CSV errors identify the invalid field or row and exit with cod
 All timestamps must explicitly be UTC and OHLCV values must be finite and valid. An existing
 run directory is never overwritten. Audit mismatch or checkpoint corruption fails closed.
 
-## Roadmap after v1.0 RC
+## Deferred beyond Product v0.1
 
-Optional Parquet adapters, multi-symbol portfolio orchestration, richer trade attribution,
-paced external normalized feeds, and stronger crash/concurrency testing are planned. Live
-or real-money execution is deliberately not on the RC roadmap.
+Restartable/paced paper trading, Parquet adapters, multi-symbol orchestration, and production
+event sourcing are explicitly out of scope. Live or real-money execution is unavailable.

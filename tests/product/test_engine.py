@@ -20,13 +20,14 @@ def test_next_open_reversal_is_exact_and_final_intent_is_cancelled():
 
 def test_account_and_risk_snapshots_include_commission_and_funding():
     t=datetime(2024,1,1,tzinfo=timezone.utc)
-    bars=tuple(Bar(t+timedelta(hours=i),100,100,100,100,1) for i in range(3))
-    config=ProductConfig("backtest",DataConfig("x"),costs=CostConfig(100,0,.01))
+    bars=tuple(Bar(t+timedelta(hours=i),100,100,100,100,1, .01 if i == 2 else None) for i in range(3))
+    config=ProductConfig("backtest",DataConfig("x"),costs=CostConfig(100,0,.99))
     records=simulate(config,bars,FixedStrategy(1))
     assert records[1].commission == 1
-    assert records[1].funding == -1
-    assert records[1].account_snapshot.cash_flow == -2
-    assert records[1].equity == 9998
+    assert records[1].funding == 0
+    assert records[2].funding == -1
+    assert records[2].account_snapshot.cash_flow == -2
+    assert records[2].equity == 9998
     assert records[1].portfolio_risk_snapshot.account_snapshot is records[1].account_snapshot
 
 def test_resolved_portfolio_limits_and_stage_journal_are_authoritative():
@@ -40,3 +41,25 @@ def test_resolved_portfolio_limits_and_stage_journal_are_authoritative():
     assert records[0].risk_breach
     assert [event["sequence"] for event in events] == list(range(1,len(events)+1))
     assert {"fill_prepared","fill_committed","portfolio_committed","account_committed","risk_committed"} <= {event["stage"] for event in events}
+
+def test_funding_is_explicit_and_charges_pre_event_position_for_both_fill_conventions():
+    t=datetime(2024,1,1,tzinfo=timezone.utc)
+    base=(Bar(t,100,100,100,100,1,.25), Bar(t+timedelta(hours=1),100,100,100,100,1,None),
+          Bar(t+timedelta(hours=2),100,100,100,100,1,.01))
+    current=simulate(ProductConfig("backtest",DataConfig("x"),costs=CostConfig(0,0,.5),
+                                   fill_timing="current_close"),base,FixedStrategy(1))
+    next_open=simulate(ProductConfig("backtest",DataConfig("x"),costs=CostConfig(0,0,.5),
+                                     fill_timing="next_open"),base,FixedStrategy(1))
+    # Timestamp-zero entries are not charged; missing row values do not invoke
+    # the configured legacy rate; the carried long pays at timestamp two.
+    assert [r.funding for r in current] == [0, 0, -1]
+    assert [r.funding for r in next_open] == [0, 0, -1]
+
+
+def test_explicit_zero_funding_and_short_sign():
+    t=datetime(2024,1,1,tzinfo=timezone.utc)
+    bars=(Bar(t,100,100,100,100,1,None), Bar(t+timedelta(hours=1),100,100,100,100,1,0.0),
+          Bar(t+timedelta(hours=2),100,100,100,100,1,.01))
+    records=simulate(ProductConfig("backtest",DataConfig("x"),fill_timing="current_close"),
+                     bars,FixedStrategy(-1))
+    assert [r.funding for r in records] == [0, 0, 1]

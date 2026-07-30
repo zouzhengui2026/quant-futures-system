@@ -1,4 +1,4 @@
-"""Installable local backtest and paper-trading product."""
+"""Installable local backtest and finite historical replay-preview product."""
 
 from .config import ProductConfig, load_config
 

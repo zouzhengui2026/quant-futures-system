@@ -16,7 +16,7 @@ def parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("--config", required=True)
         if name == "paper":
-            command.add_argument("--replay")
+            command.add_argument("--replay", help="finite historical replay preview (not restartable)")
     audit_command = commands.add_parser("audit")
     audit_command.add_argument("run_directory")
     return result
