@@ -26,6 +26,32 @@ quant-futures paper --config examples/btc_ma_paper.yaml --replay examples/data/b
 `paper --replay` is a **finite historical replay preview**, not paced or
 restartable paper trading. Interrupted-run continuation is not supported.
 
+### Paper Runtime control plane (Phase 14, checkpoint 1)
+
+Checkpoint 1 also installs the scriptable lifecycle control surface:
+
+```bash
+quant-futures paper start --config examples/btc_ma_paper.yaml --replay examples/data/btc_usdt_1h.csv --pace 1s
+quant-futures paper status RUN_DIRECTORY
+quant-futures paper pause RUN_DIRECTORY
+quant-futures paper resume RUN_DIRECTORY
+quant-futures paper stop RUN_DIRECTORY
+quant-futures paper recover RUN_DIRECTORY
+quant-futures paper audit RUN_DIRECTORY
+```
+
+At this checkpoint the commands validate and durably control the lifecycle only; market-event
+consumption, transition journaling, checkpoints, and restart recovery remain subsequent
+checkpoints. In particular, `recover` is legal only for a persisted `FAILED_RECOVERABLE`
+lifecycle and currently validates lifecycle authority—it does not yet restore trading state.
+Invalid or repeated transitions fail closed with exit code 2, while an audit mismatch exits 3.
+
+`lifecycle.jsonl` is the checkpoint-one lifecycle authority. `status.json` is explicitly a
+disposable, non-authoritative projection rebuilt from that log. Mutating commands acquire an
+OS-backed, non-blocking `.paper-runtime.lock`; a concurrent writer is rejected rather than
+waiting or racing. This control plane does not introduce accounting or risk state and does not
+claim exactly-once processing, append-only transition durability, or restart safety.
+
 Each command prints its deterministic run ID, directory, return, drawdown, trade count,
 and final equity. Remove or select a different `output_directory` before repeating an
 identical run: collision refusal protects existing evidence.
