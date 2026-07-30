@@ -40,9 +40,11 @@ quant-futures paper recover RUN_DIRECTORY
 quant-futures paper audit RUN_DIRECTORY
 ```
 
-At this checkpoint the commands validate and durably control the lifecycle only; market-event
-consumption, transition journaling, checkpoints, and restart recovery remain subsequent
-checkpoints. In particular, `recover` is legal only for a persisted `FAILED_RECOVERABLE`
+The runtime now also provides a durable `transitions.journal` foundation: length-prefixed,
+canonical-JSON frames form a SHA-256 lineage and every append is flushed under the run's
+single-writer lock. Truncated, reordered, modified, or oversized frames fail closed. Market-event
+consumption, checkpoints, and restart recovery remain subsequent checkpoints. In particular,
+`recover` is legal only for a persisted `FAILED_RECOVERABLE`
 lifecycle and currently validates lifecycle authority—it does not yet restore trading state.
 Invalid or repeated transitions fail closed with exit code 2, while an audit mismatch exits 3.
 
@@ -50,7 +52,7 @@ Invalid or repeated transitions fail closed with exit code 2, while an audit mis
 disposable, non-authoritative projection rebuilt from that log. Mutating commands acquire an
 OS-backed, non-blocking `.paper-runtime.lock`; a concurrent writer is rejected rather than
 waiting or racing. This control plane does not introduce accounting or risk state and does not
-claim exactly-once processing, append-only transition durability, or restart safety.
+claim exactly-once processing or restart safety.
 
 Each command prints its deterministic run ID, directory, return, drawdown, trade count,
 and final equity. Remove or select a different `output_directory` before repeating an
