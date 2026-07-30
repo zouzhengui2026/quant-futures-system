@@ -3,7 +3,6 @@ import os
 import subprocess
 import sys
 import venv
-import zipfile
 from pathlib import Path
 
 from quant_futures.product.config import DataConfig, ProductConfig, StrategyConfig
@@ -48,22 +47,26 @@ def test_btc_golden_e2e_and_byte_stable_core_artifacts(tmp_path: Path):
 
 
 def test_installed_console_entry_point_offline_in_isolated_environment(tmp_path: Path):
-    # Build a standards-compliant local wheel directly so the acceptance check
-    # never asks pip to download the build-system dependency.
-    wheel=tmp_path/"quant_futures_system-0.1.0-py3-none-any.whl"
-    dist="quant_futures_system-0.1.0.dist-info"
-    with zipfile.ZipFile(wheel,"w") as archive:
-        for source in (ROOT/"src/quant_futures").rglob("*.py"):
-            archive.write(source,source.relative_to(ROOT/"src"))
-        archive.writestr(f"{dist}/METADATA","Metadata-Version: 2.1\nName: quant-futures-system\nVersion: 0.1.0\n")
-        archive.writestr(f"{dist}/WHEEL","Wheel-Version: 1.0\nGenerator: product-acceptance\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
-        archive.writestr(f"{dist}/entry_points.txt","[console_scripts]\nquant-futures = quant_futures.product.cli:main\n")
-        archive.writestr(f"{dist}/RECORD","")
     environment=tmp_path/"venv"
     venv.EnvBuilder(with_pip=True,system_site_packages=True).create(environment)
     executable=environment/("Scripts" if os.name=="nt" else "bin")/"python"
-    subprocess.run([str(executable),"-m","pip","install",str(wheel),"--no-deps","--no-index"],
+    # Seed the declared build backend from the interpreter/OS offline wheel
+    # cache when the host environment does not already provide setuptools.
+    candidates = (list((Path(sys.base_prefix)/"lib"/f"python{sys.version_info.major}.{sys.version_info.minor}"/
+                        "test"/"wheeldata").glob("setuptools-*.whl"))
+                  + list(Path("/usr/share/python-wheels").glob("setuptools-*.whl")))
+    if candidates:
+        subprocess.run([str(executable),"-m","pip","install","--no-index",str(candidates[0])],
+                       check=True,capture_output=True,text=True)
+    subprocess.run([str(executable),"-m","pip","install","--no-build-isolation","--no-deps",str(ROOT)],
                    check=True,capture_output=True,text=True)
     console=environment/("Scripts" if os.name=="nt" else "bin")/"quant-futures"
-    result=subprocess.run([str(console),"paper","--help"],check=True,capture_output=True,text=True)
-    assert "finite historical replay preview" in result.stdout
+    installed_config=tmp_path/"installed.yaml"
+    installed_config.write_text((ROOT/"examples/btc_ma.yaml").read_text()
+        .replace("path: data/btc_usdt_1h.csv",f"path: {ROOT/'examples/data/btc_usdt_1h.csv'}")
+        .replace("output_directory: ../runs/backtest",f"output_directory: {tmp_path/'runs'}"))
+    subprocess.run([str(console),"validate-config","--config",str(installed_config)],
+                   check=True,capture_output=True,text=True)
+    result=subprocess.run([str(console),"backtest","--config",str(installed_config)],
+                          check=True,capture_output=True,text=True,cwd=tmp_path)
+    assert "final_equity:" in result.stdout

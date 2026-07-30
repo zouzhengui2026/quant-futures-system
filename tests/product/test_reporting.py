@@ -16,7 +16,25 @@ def test_actual_elapsed_annualization_and_longest_continuous_drawdown():
     result=analytics(ProductConfig('backtest',DataConfig('x',timeframe='1d')),records)
     assert result['elapsed_seconds'] == 4*86400
     assert result['maximum_drawdown_duration_bars'] == 2
-    assert result['maximum_drawdown_duration_seconds'] == 86400
+    assert result['maximum_drawdown_duration_seconds'] == 2*86400
+
+
+def test_short_interval_positive_returns_never_overflow():
+    t=datetime(2024,1,1,tzinfo=timezone.utc)
+    cfg=ProductConfig('backtest',DataConfig('x'))
+    for interval in (timedelta(seconds=1),timedelta(minutes=1)):
+        result=analytics(cfg,(record(1,t,10000),record(2,t+interval,10100)))
+        assert result['annualized_return'] is None
+
+
+def test_drawdown_duration_runs_from_peak_through_recovery_or_final_observation():
+    t=datetime(2024,1,1,tzinfo=timezone.utc); cfg=ProductConfig('backtest',DataConfig('x'))
+    recovered=tuple(record(i+1,t+timedelta(minutes=i),e) for i,e in enumerate((10000,9000,10000)))
+    underwater=recovered[:2]
+    assert analytics(cfg,recovered)['maximum_drawdown_duration_bars']==2
+    assert analytics(cfg,recovered)['maximum_drawdown_duration_seconds']==120
+    assert analytics(cfg,underwater)['maximum_drawdown_duration_bars']==1
+    assert analytics(cfg,underwater)['maximum_drawdown_duration_seconds']==60
 
 
 def test_completed_trade_net_pnl_allocates_commission_funding_and_excludes_open_lot():

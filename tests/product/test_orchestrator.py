@@ -67,3 +67,18 @@ def test_replay_override_is_persisted_and_auditable(tmp_path: Path):
     _,directory,_=run(cfg,str(override))
     assert json.loads((directory/"config.resolved.yaml").read_text())["data"]["path"] == str(override.resolve())
     assert completed_run_audit(directory)
+
+
+@pytest.mark.parametrize("target,replacement", [
+    ("checkpoint.json", {"artifact_digests": list(("manifest.json", "config.resolved.yaml", "events.jsonl",
+        "summary.json", "equity.csv", "positions.csv", "trades.csv", "risk_breaches.csv", "report.html"))}),
+    ("checkpoint.json", {"artifact_digests": None}),
+    ("manifest.json", {"strategy": "flat"}),
+    ("status.json", {"counters": []}),
+    ("status.json", {"schema_version": 2}),
+])
+def test_audit_is_total_for_malformed_nested_json(tmp_path: Path, target, replacement):
+    _,directory,_=run(config(tmp_path))
+    path=directory/target; value=json.loads(path.read_text()); value.update(replacement)
+    path.write_text(json.dumps(value,sort_keys=True,indent=2)+"\n")
+    assert completed_run_audit(directory) is False

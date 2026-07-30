@@ -89,6 +89,22 @@ def _ratio(numerator: float, denominator: float) -> float | None:
     return value if value is None or math.isfinite(value) else None
 
 
+def _annualized_return(start: float, final: float, elapsed_years: float) -> float | None:
+    """Return finite compound annual growth, or ``None`` when it is undefined.
+
+    Computing in log space avoids overflowing during the power operation for
+    second- and minute-long observations.  A result beyond the finite float
+    range has no faithful JSON number representation and is therefore ``None``.
+    """
+    if start <= 0 or final <= 0 or elapsed_years <= 0:
+        return None
+    exponent = math.log(final / start) / elapsed_years
+    if exponent > math.log(float.fromhex("0x1.fffffffffffffp+1023")):
+        return None
+    value = math.expm1(exponent)
+    return value if math.isfinite(value) else None
+
+
 def analytics(config: ProductConfig, records: tuple[Record, ...]) -> dict:
     start = config.starting_equity
     final = records[-1].equity if records else start
@@ -102,21 +118,27 @@ def analytics(config: ProductConfig, records: tuple[Record, ...]) -> dict:
     deviation = pstdev(returns) if len(returns) > 1 else 0.0
     mean = sum(returns) / len(returns) if returns else 0.0
     downside_period = math.sqrt(sum(min(value, 0.0) ** 2 for value in returns) / len(returns)) if returns else 0.0
-    annualized = ((final / start) ** (1 / elapsed_years) - 1
-                  if elapsed_years > 0 and final > 0 and start > 0 else 0.0)
+    annualized = _annualized_return(start, final, elapsed_years)
     scale = math.sqrt(periods_per_year) if periods_per_year > 0 else 0.0
 
-    longest_bars = current_bars = 0
-    longest_seconds = current_start = 0.0
+    longest_bars = 0
+    longest_seconds = 0.0
+    peak_index = 0
     for index, record in enumerate(records):
         if record.drawdown > 0:
-            current_bars += 1
-            if current_bars == 1:
-                current_start = timestamps[index].timestamp()
-            longest_bars = max(longest_bars, current_bars)
-            longest_seconds = max(longest_seconds, timestamps[index].timestamp() - current_start)
+            # Duration begins at the preceding peak, not at the first
+            # underwater observation.  If the run ends underwater, the final
+            # observation is the episode endpoint.
+            longest_bars = max(longest_bars, index - peak_index)
+            longest_seconds = max(longest_seconds,
+                                  (timestamps[index] - timestamps[peak_index]).total_seconds())
         else:
-            current_bars = 0
+            if index > peak_index:
+                # A recovered observation closes the episode at recovery.
+                longest_bars = max(longest_bars, index - peak_index)
+                longest_seconds = max(longest_seconds,
+                                      (timestamps[index] - timestamps[peak_index]).total_seconds())
+            peak_index = index
 
     trades = completed_trades(records)
     wins = [trade["net_pnl"] for trade in trades if trade["net_pnl"] > 0]

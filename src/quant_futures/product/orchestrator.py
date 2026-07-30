@@ -93,7 +93,7 @@ def _load_exact_json(path: Path, keys: set[str]) -> dict | None:
     return value if isinstance(value, dict) and set(value) == keys else None
 
 
-def completed_run_audit(directory: str | Path) -> bool:
+def _completed_run_audit(directory: str | Path) -> bool:
     """Fail-closed validation and canonical reconstruction of a completed run."""
     directory = Path(directory)
     state = _load_exact_json(directory / "checkpoint.json", _CHECKPOINT_KEYS)
@@ -103,13 +103,20 @@ def completed_run_audit(directory: str | Path) -> bool:
         raw = json.loads((directory / "config.resolved.yaml").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
-    if not state or not manifest or not status or state["schema_version"] != 1 or manifest["schema_version"] != 1:
+    if (not state or not manifest or not status or state["schema_version"] != 1
+            or manifest["schema_version"] != 1 or status["schema_version"] != 1):
         return False
     if state["lifecycle"] != "completed" or status["lifecycle"] != "completed":
         return False
-    if set(state["artifact_digests"]) != set(_ARTIFACT_NAMES):
+    if not isinstance(state["artifact_digests"], dict) or set(state["artifact_digests"]) != set(_ARTIFACT_NAMES):
         return False
     if any(not isinstance(value, str) or len(value) != 64 for value in state["artifact_digests"].values()):
+        return False
+    if (not isinstance(manifest["strategy"], dict)
+            or set(manifest["strategy"]) != {"name", "version", "parameters"}
+            or not isinstance(manifest["strategy"]["parameters"], dict)
+            or not isinstance(status["counters"], dict)
+            or set(status["counters"]) != {"bars", "events", "fills", "completed_trades", "risk_breaches"}):
         return False
     try:
         if set(raw) != {"mode", "data", "strategy", "costs", "risk", "starting_equity",
@@ -180,6 +187,16 @@ def completed_run_audit(directory: str | Path) -> bool:
         and all((directory / name).is_file() and _digest(directory / name) == digest
                 for name, digest in state["artifact_digests"].items())
     )
+
+
+def completed_run_audit(directory: str | Path) -> bool:
+    """Audit a completed run, returning ``False`` for every malformed input."""
+    try:
+        return _completed_run_audit(directory)
+    except Exception:
+        # This API consumes untrusted artifact trees.  Any parsing,
+        # reconstruction, numeric, or filesystem failure is an audit mismatch.
+        return False
 
 
 # Stable CLI-facing name.  Its contract is explicitly completed-run audit only.
