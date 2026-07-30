@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from quant_futures.paper_runtime.lifecycle import (
     Lifecycle,
     LifecycleError,
     LifecycleState,
+    _fsync_directory,
 )
 
 
@@ -74,3 +76,36 @@ def test_corrupt_authority_fails_closed_and_status_is_only_a_projection(tmp_path
         stream.write("not-json\n")
     with pytest.raises(LifecycleError, match="invalid lifecycle record"):
         lifecycle.current()
+
+
+def test_initial_authority_fsyncs_file_before_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    real_fsync = os.fsync
+
+    def record_file_fsync(descriptor: int) -> None:
+        calls.append("file")
+        real_fsync(descriptor)
+
+    def record_directory_fsync(directory: Path) -> bool:
+        assert directory == tmp_path
+        calls.append("directory")
+        return True
+
+    monkeypatch.setattr(os, "fsync", record_file_fsync)
+    monkeypatch.setattr("quant_futures.paper_runtime.lifecycle._fsync_directory",
+                        record_directory_fsync)
+    Lifecycle(tmp_path).initialize("run-1")
+    assert calls == ["file", "directory"]
+
+
+def test_directory_fsync_helper_opens_fsyncs_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(os, "open", lambda path, flags: calls.append(("open", path)) or 42)
+    monkeypatch.setattr(os, "fsync", lambda descriptor: calls.append(("fsync", descriptor)))
+    monkeypatch.setattr(os, "close", lambda descriptor: calls.append(("close", descriptor)))
+    assert _fsync_directory(tmp_path)
+    assert calls == [("open", tmp_path), ("fsync", 42), ("close", 42)]

@@ -8,12 +8,15 @@ framed transition journal.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Iterator
+
+from .lock import RunDirectoryLock
 
 
 class LifecycleState(StrEnum):
@@ -78,13 +81,14 @@ class Lifecycle:
         self.path = self.run_directory / self.filename
 
     def initialize(self, run_id: str) -> LifecycleRecord:
-        if not run_id or not self.run_directory.is_dir():
-            raise LifecycleError("a non-empty run ID and existing run directory are required")
-        if self.path.exists():
-            raise LifecycleError("lifecycle authority already exists")
-        record = LifecycleRecord(1, run_id, 1, None, LifecycleState.CREATED, "run created")
-        self._append(record, exclusive=True)
-        return record
+        with RunDirectoryLock(self.run_directory):
+            if not run_id or not self.run_directory.is_dir():
+                raise LifecycleError("a non-empty run ID and existing run directory are required")
+            if self.path.exists():
+                raise LifecycleError("lifecycle authority already exists")
+            record = LifecycleRecord(1, run_id, 1, None, LifecycleState.CREATED, "run created")
+            self._append(record, exclusive=True)
+            return record
 
     def records(self) -> tuple[LifecycleRecord, ...]:
         return tuple(self._read_records())
@@ -96,15 +100,16 @@ class Lifecycle:
         return records[-1]
 
     def transition(self, target: LifecycleState, reason: str) -> LifecycleRecord:
-        current = self.current()
-        if (current.state, target) not in LEGAL_TRANSITIONS:
-            raise LifecycleError(f"illegal lifecycle transition: {current.state.value} -> {target.value}")
-        if not reason.strip():
-            raise LifecycleError("transition reason must not be empty")
-        record = LifecycleRecord(1, current.run_id, current.sequence + 1,
-                                 current.state, target, reason.strip())
-        self._append(record)
-        return record
+        with RunDirectoryLock(self.run_directory):
+            current = self.current()
+            if (current.state, target) not in LEGAL_TRANSITIONS:
+                raise LifecycleError(f"illegal lifecycle transition: {current.state.value} -> {target.value}")
+            if not reason.strip():
+                raise LifecycleError("transition reason must not be empty")
+            record = LifecycleRecord(1, current.run_id, current.sequence + 1,
+                                     current.state, target, reason.strip())
+            self._append(record)
+            return record
 
     def _read_records(self) -> Iterator[LifecycleRecord]:
         try:
@@ -145,5 +150,30 @@ class Lifecycle:
                 stream.write(json.dumps(record.as_dict(), sort_keys=True, separators=(",", ":")) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
+            if exclusive:
+                _fsync_directory(self.run_directory)
         except OSError as exc:
             raise LifecycleError(f"cannot persist lifecycle transition: {exc}") from exc
+
+
+def _fsync_directory(directory: Path) -> bool:
+    """Make a newly created directory entry durable when the platform permits.
+
+    Some platforms cannot open or fsync directory descriptors.  Those explicit
+    unsupported-operation cases safely fall back to the already-fsynced file;
+    other I/O failures remain fatal rather than claiming durability.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(directory, flags)
+        os.fsync(descriptor)
+    except OSError as exc:
+        unsupported = {errno.EACCES, errno.EINVAL, errno.ENOTSUP}
+        if exc.errno not in unsupported:
+            raise
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return True

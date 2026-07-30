@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 from pathlib import Path
 from typing import IO
@@ -23,6 +22,15 @@ class RunDirectoryLock:
         if self._stream is not None:
             raise RunLockError("run-directory lock is already held by this object")
         try:
+            # Import the Unix backend only when Paper control is actually used.
+            # This keeps the existing product CLI importable on platforms where
+            # fcntl is unavailable and gives Paper control a deterministic error.
+            try:
+                import fcntl
+            except ImportError as exc:
+                raise RunLockError(
+                    "Paper runtime locking is unsupported on this platform (fcntl unavailable)"
+                ) from exc
             stream = self.path.open("a+", encoding="ascii")
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             stream.seek(0)
@@ -38,6 +46,8 @@ class RunDirectoryLock:
 
     def release(self) -> None:
         if self._stream is not None:
+            import fcntl
+
             fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
             self._stream.close()
             self._stream = None
