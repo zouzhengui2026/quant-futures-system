@@ -124,6 +124,7 @@ def analytics(config: ProductConfig, records: tuple[Record, ...]) -> dict:
     longest_bars = 0
     longest_seconds = 0.0
     peak_index = 0
+    underwater = False
     for index, record in enumerate(records):
         if record.drawdown > 0:
             # Duration begins at the preceding peak, not at the first
@@ -132,13 +133,15 @@ def analytics(config: ProductConfig, records: tuple[Record, ...]) -> dict:
             longest_bars = max(longest_bars, index - peak_index)
             longest_seconds = max(longest_seconds,
                                   (timestamps[index] - timestamps[peak_index]).total_seconds())
+            underwater = True
         else:
-            if index > peak_index:
+            if underwater:
                 # A recovered observation closes the episode at recovery.
                 longest_bars = max(longest_bars, index - peak_index)
                 longest_seconds = max(longest_seconds,
                                       (timestamps[index] - timestamps[peak_index]).total_seconds())
             peak_index = index
+            underwater = False
 
     trades = completed_trades(records)
     wins = [trade["net_pnl"] for trade in trades if trade["net_pnl"] > 0]

@@ -42,6 +42,15 @@ def test_resolved_portfolio_limits_and_stage_journal_are_authoritative():
     assert [event["sequence"] for event in events] == list(range(1,len(events)+1))
     assert {"fill_prepared","fill_committed","portfolio_committed","account_committed","risk_committed"} <= {event["stage"] for event in events}
 
+
+def test_first_valuation_cost_drawdown_matches_authoritative_risk_at_full_limit():
+    t=datetime(2024,1,1,tzinfo=timezone.utc)
+    config=ProductConfig("backtest",DataConfig("x"),costs=CostConfig(100,0,0),
+                         risk=RiskConfig(max_drawdown=1),fill_timing="current_close")
+    first=simulate(config,(Bar(t,100,100,100,100,1),),FixedStrategy(1))[0]
+    assert first.equity == 9999
+    assert first.drawdown == first.portfolio_risk_snapshot.drawdown_ratio == .0001
+
 def test_funding_is_explicit_and_charges_pre_event_position_for_both_fill_conventions():
     t=datetime(2024,1,1,tzinfo=timezone.utc)
     base=(Bar(t,100,100,100,100,1,.25), Bar(t+timedelta(hours=1),100,100,100,100,1,None),

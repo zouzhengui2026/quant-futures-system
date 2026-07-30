@@ -217,11 +217,27 @@ def test_threshold_equality_is_healthy_and_positive_equity_can_be_optional():
     valuation = PositionValuation(position, MarketDataRecord(
         MarketDataKind.MARK_PRICE, "LOSS", "sim", NOW, {"price": 1}), 1, 0, -2, NOW)
     negative = AccountSnapshot(portfolio, (valuation,), 1, -2, 0, -2, -1, NOW)
-    for source in (zero, negative):
-        result = PortfolioRiskEngine(EventBus(), limits(
-            require_positive_equity=False)).evaluate(source)
-        assert result.breaches == ()
-        assert result.outcome is PortfolioRiskOutcome.HEALTHY
+    zero_result = PortfolioRiskEngine(EventBus(), limits(
+        require_positive_equity=False)).evaluate(zero)
+    assert zero_result.breaches == ()
+    assert zero_result.outcome is PortfolioRiskOutcome.HEALTHY
+    negative_result = PortfolioRiskEngine(EventBus(), limits(
+        require_positive_equity=False)).evaluate(negative)
+    assert [breach.code for breach in negative_result.breaches] == [
+        RiskLimitCode.MAX_DRAWDOWN]
+    assert negative_result.drawdown_ratio == 2
+
+
+@pytest.mark.parametrize("equity,cash_flow,expected", [(990, -10, .01), (0, -1000, 1)])
+def test_first_drawdown_always_anchors_to_starting_equity_at_full_threshold(
+        equity, cash_flow, expected):
+    portfolio = PortfolioSnapshot((), 0, datetime(1970, 1, 1, tzinfo=timezone.utc))
+    snapshot = AccountSnapshot(portfolio, (), 1000, 0, 0, 0, equity,
+                               portfolio.updated_at, cash_flow)
+    result = PortfolioRiskEngine(EventBus(), limits(
+        require_positive_equity=False, max_drawdown_ratio=1)).evaluate(snapshot)
+    assert result.drawdown_ratio == expected
+    assert result.breaches == ()
 
 
 def test_concurrent_evaluations_have_one_exact_history_and_event_order():

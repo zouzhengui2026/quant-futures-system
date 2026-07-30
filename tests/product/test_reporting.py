@@ -37,6 +37,15 @@ def test_drawdown_duration_runs_from_peak_through_recovery_or_final_observation(
     assert analytics(cfg,underwater)['maximum_drawdown_duration_seconds']==60
 
 
+def test_drawdown_duration_stays_zero_without_an_underwater_episode():
+    t=datetime(2024,1,1,tzinfo=timezone.utc); cfg=ProductConfig('backtest',DataConfig('x'))
+    for equities in ((10000, 10100, 10200), (10000, 10000, 10000)):
+        records=tuple(record(i+1,t+timedelta(minutes=i),e) for i,e in enumerate(equities))
+        result=analytics(cfg,records)
+        assert result['maximum_drawdown_duration_bars']==0
+        assert result['maximum_drawdown_duration_seconds']==0
+
+
 def test_completed_trade_net_pnl_allocates_commission_funding_and_excludes_open_lot():
     t=datetime(2024,1,1,tzinfo=timezone.utc)
     records=(record(1,t,9999,1,1,100,1,2),record(2,t+timedelta(hours=1),10008,0,-1,110,1,2,-1),
