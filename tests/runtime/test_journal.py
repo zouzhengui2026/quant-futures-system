@@ -74,11 +74,19 @@ def test_corrupt_completed_frames_are_rejected(tmp_path: Path, mode: str) -> Non
     journal = TransitionJournal(tmp_path); append(journal); append(journal, cursor=1)
     data = journal.path.read_bytes()
     length = struct.unpack(">4sI", data[:8])[1]
-    boundary = 8 + length
+    payload_start = journal_module._HEADER.size
+    boundary = payload_start + length + journal_module._FOOTER.size
     if mode == "tamper":
-        raw = json.loads(data[8:boundary]); raw["payload"] = {"valid": "json"}
+        raw = json.loads(data[payload_start:payload_start + length]); raw["payload"] = {"valid": "json"}
         encoded = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
-        data = struct.pack(">4sI", b"QFTJ", len(encoded)) + encoded + data[boundary:]
+        header = journal_module._HEADER.pack(
+            b"QFTJ", len(encoded),
+            journal_module.hashlib.sha256(b"QFTJ" + struct.pack(">I", len(encoded))).digest(),
+        )
+        footer = journal_module._FOOTER.pack(
+            b"QFTC", len(encoded), journal_module.hashlib.sha256(encoded).digest()
+        )
+        data = header + encoded + footer + data[boundary:]
     elif mode == "duplicate": data += data[:boundary]
     elif mode == "reorder": data = data[boundary:] + data[:boundary]
     else: data = struct.pack(">4sI", b"QFTJ", journal_module._MAX_PAYLOAD_BYTES + 1)
@@ -107,3 +115,25 @@ def test_first_create_fsyncs_file_then_directory(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(journal_module, "_fsync_directory", lambda path: calls.append("directory"))
     append(TransitionJournal(tmp_path))
     assert calls == ["file", "directory"]
+
+
+def test_complete_final_frame_length_tamper_fails_closed_without_repair(tmp_path: Path) -> None:
+    journal = TransitionJournal(tmp_path)
+    append(journal)
+    damaged = bytearray(journal.path.read_bytes())
+    original_length = struct.unpack(">I", damaged[4:8])[0]
+    damaged[4:8] = struct.pack(">I", original_length + 1)
+    journal.path.write_bytes(damaged)
+    before = journal.path.read_bytes()
+    with pytest.raises(JournalError, match="header"):
+        append(TransitionJournal(tmp_path), cursor=1)
+    assert journal.path.read_bytes() == before
+
+
+def test_streaming_iterator_and_tail_validate_with_constant_memory(tmp_path: Path) -> None:
+    journal = TransitionJournal(tmp_path)
+    expected = [append(journal, cursor=index) for index in range(20)]
+    iterator = journal.iter_records()
+    assert iter(iterator) is iterator
+    assert list(iterator) == expected
+    assert journal.tail() == expected[-1]

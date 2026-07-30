@@ -14,7 +14,9 @@ from .lifecycle import _fsync_directory
 from .lock import RunDirectoryLock
 
 _MAGIC = b"QFTJ"
-_HEADER = struct.Struct(">4sI")
+_HEADER = struct.Struct(">4sI32s")
+_COMMIT_MAGIC = b"QFTC"
+_FOOTER = struct.Struct(">4sI32s")
 _MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 _FIELDS = frozenset({
     "schema_version", "run_id", "sequence", "journal_event_id",
@@ -66,7 +68,23 @@ class TransitionJournal:
         self._tail: _Tail | None = None
 
     def records(self) -> tuple[TransitionRecord, ...]:
-        return tuple(self._scan(repair_tail=False, collect=True)[0])
+        """Materialize all records for diagnostics; prefer ``iter_records`` or ``tail``."""
+        return tuple(self.iter_records())
+
+    def iter_records(self) -> Iterator[TransitionRecord]:
+        """Stream validated records without retaining the journal history in memory."""
+        yield from self._iter_validated_records()
+
+    def tail(self) -> TransitionRecord | None:
+        """Return the validated final record using constant memory."""
+        record, _ = self._scan(repair_tail=False)
+        return record
+
+    def _repair_tail_held(self) -> TransitionRecord | None:
+        """Validate committed frames and repair only a provably incomplete append."""
+        record, tail = self._scan(repair_tail=True)
+        self._tail = tail
+        return record
 
     def append(
         self, run_id: str, product_transition_id: str, stage: str, event_type: str,
@@ -106,7 +124,15 @@ class TransitionJournal:
         encoded = _canonical(record.as_dict())
         if len(encoded) > _MAX_PAYLOAD_BYTES:
             raise JournalError("transition record exceeds maximum frame size")
-        self._persist(_HEADER.pack(_MAGIC, len(encoded)) + encoded)
+        length = len(encoded)
+        length_bytes = struct.pack(">I", length)
+        header_digest = hashlib.sha256(_MAGIC + length_bytes).digest()
+        footer_digest = hashlib.sha256(encoded).digest()
+        self._persist(
+            _HEADER.pack(_MAGIC, length, header_digest)
+            + encoded
+            + _FOOTER.pack(_COMMIT_MAGIC, length, footer_digest)
+        )
         stat = self.path.stat()
         self._tail = _Tail(run_id, record.sequence, digest, stat.st_size,
                            (stat.st_size, stat.st_mtime_ns))
@@ -116,7 +142,7 @@ class TransitionJournal:
         signature = _signature(self.path)
         if self._tail is not None and self._tail.signature == signature:
             return self._tail
-        _, tail = self._scan(repair_tail=True, collect=False)
+        _, tail = self._scan(repair_tail=True)
         self._tail = tail
         return tail
 
@@ -139,10 +165,25 @@ class TransitionJournal:
         except OSError as exc:
             raise JournalError(f"cannot persist transition journal: {exc}") from exc
 
-    def _scan(self, repair_tail: bool, collect: bool) -> tuple[Iterator[TransitionRecord], _Tail]:
-        records: list[TransitionRecord] = []
+    def _iter_validated_records(self) -> Iterator[TransitionRecord]:
         if not self.path.exists():
-            return iter(records), _Tail(None, 0, None, 0, None)
+            return
+        try:
+            with self.path.open("rb") as stream:
+                previous: TransitionRecord | None = None
+                frame_number = 0
+                while stream.peek(1):
+                    frame_number += 1
+                    record = _read_complete_frame(stream, frame_number)
+                    _validate_lineage(record, previous, frame_number)
+                    previous = record
+                    yield record
+        except OSError as exc:
+            raise JournalError(f"cannot read transition journal: {exc}") from exc
+
+    def _scan(self, repair_tail: bool) -> tuple[TransitionRecord | None, _Tail]:
+        if not self.path.exists():
+            return None, _Tail(None, 0, None, 0, None)
         try:
             stream = self.path.open("r+b" if repair_tail else "rb")
             with stream:
@@ -155,12 +196,16 @@ class TransitionJournal:
                         break
                     frame_number += 1
                     if len(header) != _HEADER.size:
-                        if repair_tail:
+                        if repair_tail and _is_incomplete_header(header):
                             _truncate_tail(stream, boundary)
                             break
                         raise JournalError(f"truncated journal header at frame {frame_number}")
-                    magic, length = _HEADER.unpack(header)
-                    if magic != _MAGIC or length > _MAX_PAYLOAD_BYTES:
+                    magic, length, header_digest = _HEADER.unpack(header)
+                    expected_header_digest = hashlib.sha256(
+                        magic + struct.pack(">I", length)
+                    ).digest()
+                    if (magic != _MAGIC or length > _MAX_PAYLOAD_BYTES
+                            or header_digest != expected_header_digest):
                         raise JournalError(f"invalid journal header at frame {frame_number}")
                     encoded = stream.read(length)
                     if len(encoded) != length:
@@ -168,15 +213,19 @@ class TransitionJournal:
                             _truncate_tail(stream, boundary)
                             break
                         raise JournalError(f"truncated journal payload at frame {frame_number}")
+                    footer = stream.read(_FOOTER.size)
+                    if len(footer) != _FOOTER.size:
+                        if repair_tail:
+                            _truncate_tail(stream, boundary)
+                            break
+                        raise JournalError(f"truncated journal footer at frame {frame_number}")
+                    commit_magic, committed_length, payload_digest = _FOOTER.unpack(footer)
+                    if (commit_magic != _COMMIT_MAGIC or committed_length != length
+                            or payload_digest != hashlib.sha256(encoded).digest()):
+                        raise JournalError(f"invalid journal footer at frame {frame_number}")
                     record = _decode(encoded, frame_number)
-                    if not ((previous is None and record.sequence == 1 and record.previous_digest is None)
-                            or (previous is not None and record.run_id == previous.run_id
-                                and record.sequence == previous.sequence + 1
-                                and record.previous_digest == previous.digest)):
-                        raise JournalError(f"invalid journal lineage at frame {frame_number}")
+                    _validate_lineage(record, previous, frame_number)
                     previous = record
-                    if collect:
-                        records.append(record)
                     boundary = stream.tell()
             stat = self.path.stat()
         except OSError as exc:
@@ -184,7 +233,54 @@ class TransitionJournal:
         tail = _Tail(previous.run_id if previous else None, previous.sequence if previous else 0,
                      previous.digest if previous else None, boundary,
                      (stat.st_size, stat.st_mtime_ns))
-        return iter(records), tail
+        return previous, tail
+
+
+def _read_complete_frame(stream: object, frame_number: int) -> TransitionRecord:
+    header = stream.read(_HEADER.size)  # type: ignore[attr-defined]
+    if len(header) != _HEADER.size:
+        raise JournalError(f"truncated journal header at frame {frame_number}")
+    magic, length, header_digest = _HEADER.unpack(header)
+    if (magic != _MAGIC or length > _MAX_PAYLOAD_BYTES
+            or header_digest != hashlib.sha256(magic + struct.pack(">I", length)).digest()):
+        raise JournalError(f"invalid journal header at frame {frame_number}")
+    encoded = stream.read(length)  # type: ignore[attr-defined]
+    if len(encoded) != length:
+        raise JournalError(f"truncated journal payload at frame {frame_number}")
+    footer = stream.read(_FOOTER.size)  # type: ignore[attr-defined]
+    if len(footer) != _FOOTER.size:
+        raise JournalError(f"truncated journal footer at frame {frame_number}")
+    commit_magic, committed_length, payload_digest = _FOOTER.unpack(footer)
+    if (commit_magic != _COMMIT_MAGIC or committed_length != length
+            or payload_digest != hashlib.sha256(encoded).digest()):
+        raise JournalError(f"invalid journal footer at frame {frame_number}")
+    return _decode(encoded, frame_number)
+
+
+def _validate_lineage(record: TransitionRecord, previous: TransitionRecord | None,
+                      frame_number: int) -> None:
+    if not ((previous is None and record.sequence == 1 and record.previous_digest is None)
+            or (previous is not None and record.run_id == previous.run_id
+                and record.sequence == previous.sequence + 1
+                and record.previous_digest == previous.digest)):
+        raise JournalError(f"invalid journal lineage at frame {frame_number}")
+
+
+def _is_incomplete_header(header: bytes) -> bool:
+    """Recognize a byte prefix of a valid header, not arbitrary committed corruption."""
+    if len(header) <= len(_MAGIC):
+        return _MAGIC.startswith(header)
+    if header[:4] != _MAGIC:
+        return False
+    if len(header) < 8:
+        return True
+    length = struct.unpack(">I", header[4:8])[0]
+    if length > _MAX_PAYLOAD_BYTES:
+        return False
+    expected = _HEADER.pack(
+        _MAGIC, length, hashlib.sha256(_MAGIC + struct.pack(">I", length)).digest()
+    )
+    return expected.startswith(header)
 
 
 def _truncate_tail(stream: object, boundary: int) -> None:

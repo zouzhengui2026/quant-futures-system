@@ -31,9 +31,18 @@ def _atomic_projection(path: Path, value: dict[str, object]) -> None:
 
 
 def project_status(run_directory: str | Path) -> dict[str, object]:
-    """Rebuild status exclusively from authoritative persisted lifecycle state."""
+    """Rebuild a lock-consistent snapshot from both persisted authorities."""
     directory = Path(run_directory)
-    return _status_for_record(Lifecycle(directory).current(), TransitionJournal(directory).records())
+    with RunDirectoryLock(directory):
+        return _project_status_held(Lifecycle(directory))
+
+
+def _project_status_held(lifecycle: Lifecycle) -> dict[str, object]:
+    record = lifecycle.current()
+    journal_tail = TransitionJournal(lifecycle.run_directory).tail()
+    if journal_tail is not None and journal_tail.run_id != record.run_id:
+        raise JournalError("journal run ID does not match lifecycle authority")
+    return _status_for_record(record, journal_tail)
 
 
 def write_status(run_directory: str | Path) -> dict[str, object]:
@@ -42,15 +51,12 @@ def write_status(run_directory: str | Path) -> dict[str, object]:
 
 
 def _write_status_held(lifecycle: Lifecycle) -> dict[str, object]:
-    status = _status_for_record(
-        lifecycle.current(), TransitionJournal(lifecycle.run_directory).records()
-    )
+    status = _project_status_held(lifecycle)
     _atomic_projection(lifecycle.run_directory / "status.json", status)
     return status
 
 
-def _status_for_record(record: LifecycleRecord, journal_records: tuple[object, ...] = ()) -> dict[str, object]:
-    journal_tail = journal_records[-1] if journal_records else None
+def _status_for_record(record: LifecycleRecord, journal_tail: object | None = None) -> dict[str, object]:
     return {"schema_version": 1, "authoritative": False, "authority": Lifecycle.filename,
             "run_id": record.run_id, "lifecycle": record.state.value,
             "lifecycle_sequence": record.sequence, "last_reason": record.reason,
@@ -99,6 +105,11 @@ def stop(run_directory: str | Path) -> LifecycleRecord:
 def recover(run_directory: str | Path) -> LifecycleRecord:
     lifecycle = Lifecycle(run_directory)
     with RunDirectoryLock(run_directory):
+        journal = TransitionJournal(run_directory)
+        journal_tail = journal._repair_tail_held()
+        current = lifecycle.current()
+        if journal_tail is not None and journal_tail.run_id != current.run_id:
+            raise JournalError("journal run ID does not match lifecycle authority")
         lifecycle._transition_held(LifecycleState.RECOVERING, "recovery requested")
         record = lifecycle._transition_held(LifecycleState.RUNNING, "lifecycle authority validated")
         _write_status_held(lifecycle)
@@ -109,7 +120,7 @@ def audit(run_directory: str | Path) -> bool:
     """Validate lifecycle authority and require the projection to match it exactly."""
     try:
         with RunDirectoryLock(run_directory):
-            expected = project_status(run_directory)
+            expected = _project_status_held(Lifecycle(run_directory))
             actual = json.loads((Path(run_directory) / "status.json").read_text(encoding="utf-8"))
     except (LifecycleError, JournalError, OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False

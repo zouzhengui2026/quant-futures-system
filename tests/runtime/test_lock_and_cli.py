@@ -10,9 +10,10 @@ import pytest
 
 from quant_futures.paper_runtime.control import start
 from quant_futures.paper_runtime import control as paper_control
+from quant_futures.paper_runtime import journal as journal_module
 from quant_futures.paper_runtime.lifecycle import Lifecycle, LifecycleState
 from quant_futures.paper_runtime.lock import RunDirectoryLock, RunLockError
-from quant_futures.paper_runtime.journal import TransitionJournal
+from quant_futures.paper_runtime.journal import JournalError, TransitionJournal
 from quant_futures.product.cli import main
 
 
@@ -40,6 +41,29 @@ def _slow_pause(directory: str, ready: multiprocessing.synchronize.Event,
 
     paper_control._atomic_projection = slow_projection
     results.put(main(["paper", "pause", directory]))
+
+
+def _slow_journal_append(directory: str, ready: multiprocessing.synchronize.Event) -> None:
+    journal = TransitionJournal(directory)
+    original = journal._persist
+
+    def slow_persist(frame: bytes) -> None:
+        descriptor = paper_control.os.open(journal.path, paper_control.os.O_WRONLY |
+                                           paper_control.os.O_CREAT | paper_control.os.O_APPEND, 0o600)
+        try:
+            midpoint = len(frame) // 2
+            paper_control.os.write(descriptor, frame[:midpoint])
+            ready.set()
+            time.sleep(0.25)
+            paper_control.os.write(descriptor, frame[midpoint:])
+            paper_control.os.fsync(descriptor)
+        finally:
+            paper_control.os.close(descriptor)
+
+    journal._persist = slow_persist  # type: ignore[method-assign]
+    run_id = Lifecycle(directory).current().run_id
+    journal.append(run_id, "slow-1", "INPUT", "INPUT_ACCEPTED",
+                   "2026-01-01T00:00:00Z", 0, {})
 
 
 def test_second_process_writer_is_rejected(tmp_path: Path) -> None:
@@ -199,7 +223,9 @@ def test_paper_audit_journal_corruption_returns_exit_three(
     paper_control.write_status(directory)
     assert paper_control.audit(directory)
     data = journal.path.read_bytes()
-    first_length = int.from_bytes(data[4:8], "big") + 8
+    first_length = int.from_bytes(data[4:8], "big")
+    # Header and committed footer are part of the frame boundary.
+    first_length += journal_module._HEADER.size + journal_module._FOOTER.size
     if corruption == "tamper":
         damaged = bytearray(data); damaged[damaged.index(b"true")] = ord("f")
         data = bytes(damaged)
@@ -209,3 +235,51 @@ def test_paper_audit_journal_corruption_returns_exit_three(
     journal.path.write_bytes(data)
     assert main(["paper", "audit", str(directory)]) == 3
     assert "paper runtime audit: mismatch" in capsys.readouterr().out
+
+
+def _failed_run_with_journal(tmp_path: Path) -> tuple[Path, TransitionJournal]:
+    directory = start(tmp_path)
+    paper_control.transition(directory, LifecycleState.FAILED_RECOVERABLE, "simulated failure")
+    journal = TransitionJournal(directory)
+    run_id = Lifecycle(directory).current().run_id
+    journal.append(run_id, "product-1", "INPUT", "INPUT_ACCEPTED",
+                   "2026-01-01T00:00:00Z", 0, {})
+    paper_control.write_status(directory)
+    return directory, journal
+
+
+def test_recover_repairs_tail_before_lifecycle_mutation(tmp_path: Path) -> None:
+    directory, journal = _failed_run_with_journal(tmp_path)
+    committed = journal.path.read_bytes()
+    journal.path.write_bytes(committed + b"QF")
+    record = paper_control.recover(directory)
+    assert record.state is LifecycleState.RUNNING
+    assert journal.path.read_bytes() == committed
+    assert journal.tail() is not None
+    assert json.loads((directory / "status.json").read_text()) == paper_control.project_status(directory)
+
+
+def test_recover_corrupt_journal_does_not_mutate_lifecycle(tmp_path: Path) -> None:
+    directory, journal = _failed_run_with_journal(tmp_path)
+    damaged = bytearray(journal.path.read_bytes()); damaged[-1] ^= 1
+    journal.path.write_bytes(damaged)
+    lifecycle_before = Lifecycle(directory).path.read_bytes()
+    journal_before = journal.path.read_bytes()
+    with pytest.raises(JournalError):
+        paper_control.recover(directory)
+    assert Lifecycle(directory).path.read_bytes() == lifecycle_before
+    assert journal.path.read_bytes() == journal_before
+
+
+def test_status_never_reads_partial_journal_frame(tmp_path: Path) -> None:
+    directory = start(tmp_path)
+    ready = multiprocessing.Event()
+    process = multiprocessing.Process(target=_slow_journal_append, args=(str(directory), ready))
+    process.start()
+    assert ready.wait(5)
+    with pytest.raises(RunLockError, match="another writer"):
+        paper_control.project_status(directory)
+    process.join(5)
+    assert process.exitcode == 0
+    status = paper_control.project_status(directory)
+    assert status["journal_sequence"] == 1
