@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Callable, Mapping
@@ -27,6 +28,7 @@ class CheckpointStore:
     """Versioned checkpoint authority using durable same-directory replacement."""
 
     filename = "checkpoint.json"
+    _temporary_name = re.compile(r"^\.checkpoint\.json\.[^.]+\.tmp$")
 
     def __init__(self, run_directory: str | Path,
                  failure_injector: Callable[[str], None] | None = None) -> None:
@@ -51,6 +53,7 @@ class CheckpointStore:
 
     def _write_held(self, value: Mapping[str, object]) -> bytes:
         """Replace the authority while the enclosing runtime transaction holds the lock."""
+        self._remove_orphaned_temporaries_held()
         encoded = canonical_checkpoint(value)
         descriptor, name = tempfile.mkstemp(
             prefix=f".{self.path.name}.", suffix=".tmp", dir=self.run_directory)
@@ -79,3 +82,32 @@ class CheckpointStore:
                 raise
             raise CheckpointError(f"cannot persist checkpoint: {exc}") from exc
         return encoded
+
+    def _remove_orphaned_temporaries_held(self) -> None:
+        """Remove only checkpoint temporaries while the run lock is held.
+
+        A process cut cannot execute the writer's exception cleanup.  These
+        files are never authority (only ``checkpoint.json`` is), so the next
+        locked checkpoint transaction removes the exact mkstemp name pattern
+        and makes those directory-entry deletions durable before proceeding.
+        """
+        removed = False
+        try:
+            entries = tuple(self.run_directory.iterdir())
+        except OSError as exc:
+            raise CheckpointError(f"cannot inspect checkpoint temporaries: {exc}") from exc
+        for candidate in entries:
+            if (self._temporary_name.fullmatch(candidate.name) is None
+                    or not candidate.is_file()):
+                continue
+            try:
+                candidate.unlink()
+            except OSError as exc:
+                raise CheckpointError(f"cannot remove orphaned checkpoint temporary: {exc}") from exc
+            removed = True
+        if removed:
+            try:
+                _fsync_directory(self.run_directory)
+            except OSError as exc:
+                raise CheckpointError(
+                    f"cannot persist checkpoint temporary cleanup: {exc}") from exc

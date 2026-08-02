@@ -206,7 +206,7 @@ class PortfolioLedger:
                     raise PortfolioLedgerError("identity commitment entry was replaced")
             if set(self._positions) != set(self._history) | set(self._checkpoint_positions):
                 raise PortfolioLedgerError("position and history keys must match")
-            if any(self._positions.get(key) is not value
+            if any(key not in self._history and self._positions.get(key) is not value
                    for key, value in self._checkpoint_positions.items()):
                 raise PortfolioLedgerError("checkpoint position authority changed")
             seen: dict[str, PositionUpdate] = {}

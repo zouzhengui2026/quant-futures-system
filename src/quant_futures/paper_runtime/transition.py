@@ -197,6 +197,7 @@ class PaperTransitionCoordinator:
         """Restore bounded Product authority without replaying historical transitions."""
         try:
             store = CheckpointStore(self.journal.run_directory)
+            store._remove_orphaned_temporaries_held()
             checkpoint_bytes = store.path.read_bytes()
             value = store.read()
             lifecycle_before = Lifecycle(self.journal.run_directory).current()

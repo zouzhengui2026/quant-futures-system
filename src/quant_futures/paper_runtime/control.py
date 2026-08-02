@@ -381,6 +381,7 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
               if tail is not None and tail.run_id != run_id:
                   raise JournalError("journal run ID does not match lifecycle authority")
               store = CheckpointStore(directory)
+              store._remove_orphaned_temporaries_held()
               checkpoint = store.read() if store.path.exists() else None
               checkpoint_digest = (checkpoint.get("journal", {}).get("digest")
                                    if isinstance(checkpoint, dict) else None)

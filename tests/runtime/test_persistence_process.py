@@ -4,11 +4,110 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import json
+from pathlib import Path
 
 import pytest
 
 from quant_futures.paper_runtime.checkpoint import CheckpointStore, canonical_checkpoint
 from quant_futures.paper_runtime.journal import TransitionJournal
+
+
+def _initialize_product_run(directory: str, config_path: str, replay: str) -> None:
+    from quant_futures.paper_runtime import Lifecycle, LifecycleState
+    from quant_futures.paper_runtime import control
+
+    path = os.fspath(directory)
+    os.makedirs(path)
+    lifecycle = Lifecycle(path)
+    lifecycle.initialize("process-matrix-run")
+    lifecycle.transition(LifecycleState.STARTING, "start")
+    lifecycle.transition(LifecycleState.RUNNING, "run")
+    control.write_runtime_metadata(path, Path(config_path), Path(replay))
+
+
+def _produce_product_cut(directory: str, config_path: str, replay: str,
+                         cut_index: int, stage: str | None) -> None:
+    from dataclasses import replace
+    from quant_futures.paper_runtime import Lifecycle, PaperTransitionCoordinator
+    from quant_futures.product.config import load_config
+    from quant_futures.product.data import load_bars
+    from quant_futures.product.strategy import build_strategy
+
+    config = load_config(config_path)
+    config = replace(config, data=replace(config.data, path=replay))
+    bars, fingerprint = load_bars(replay, config.data.schema,
+                                  timeframe=config.data.timeframe)
+    armed = {"value": False}
+
+    def cut(boundary: str) -> None:
+        if armed["value"] and stage is not None and boundary == f"durable:{stage}":
+            os._exit(93)
+
+    coordinator = PaperTransitionCoordinator(
+        Lifecycle(directory).current().run_id, config,
+        build_strategy(config.strategy.name, config.strategy.parameters),
+        TransitionJournal(directory), failure_injector=cut,
+        data_fingerprint=f"sha256:{fingerprint}",
+    )
+    for index, item in enumerate(bars):
+        armed["value"] = index == cut_index
+        coordinator.transition(item)
+    os._exit(0)
+
+
+def _recover_product_process(directory: str, repeat: bool = True) -> None:
+    from quant_futures.paper_runtime import control
+
+    control.recover(directory)
+    if repeat:
+        control.recover(directory)
+    control.continue_runtime(directory)
+    os._exit(0)
+
+
+def _write_product_fixture(root, timing):
+    replay = root / f"{timing}.csv"
+    replay.write_text(
+        "timestamp,open,high,low,close,volume,funding_rate\n"
+        "2025-01-01T00:00:00Z,100,101,99,100,1,0.001\n"
+        "2025-01-01T01:00:00Z,100,111,99,110,1,0.002\n"
+        "2025-01-01T02:00:00Z,90,91,79,80,1,0.003\n"
+        "2025-01-01T03:00:00Z,85,96,84,95,1,0.004\n",
+        encoding="utf-8",
+    )
+    config = root / f"{timing}.yml"
+    config.write_text(
+        "mode: paper\n"
+        f"data:\n  path: {replay.name}\n  source: test\n  symbol: BTC\n  timeframe: 1h\n"
+        "  schema:\n    timestamp: timestamp\n    open: open\n    high: high\n"
+        "    low: low\n    close: close\n    volume: volume\n    funding_rate: funding_rate\n"
+        "strategy:\n  name: moving_average_crossover\n  parameters:\n    fast: 1\n    slow: 2\n"
+        "costs:\n  commission_bps: 7\n  slippage_bps: 5\n  funding_rate: 0\n"
+        f"fill_timing: {timing}\noutput_directory: .\n",
+        encoding="utf-8",
+    )
+    return config, replay
+
+
+def _checkpoint_core(path):
+    value = json.loads((path / "checkpoint.json").read_text(encoding="utf-8"))
+    value.pop("recovery_digest", None)
+    return value
+
+
+def _assert_recovery_chain(path, attempts=2):
+    from quant_futures.paper_runtime import RecoveryAttempts
+
+    records = RecoveryAttempts(path).read()
+    starts = [record for record in records if record["outcome"] == "started"]
+    assert len(starts) == attempts
+    assert len(records) == attempts * 2
+    assert all(records[index + 1]["previous_digest"] == records[index]["digest"]
+               for index in range(len(records) - 1))
+    checkpoint = json.loads((path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["recovery_counter"] == attempts
+    assert checkpoint["recovery_digest"] == records[-1]["digest"]
 
 
 def _crash_journal(directory: str, boundary: str) -> None:
@@ -77,5 +176,119 @@ def test_child_exit_at_physical_checkpoint_boundary_leaves_exact_old_or_new(
     assert process.exitcode == 92
     assert store.path.read_bytes() in {old, new}
     assert store.read()["value"] in {"old", "new"}
-    assert all(path == store.path for path in tmp_path.glob("checkpoint.json"))
+    orphaned = list(tmp_path.glob(".checkpoint.json.*.tmp"))
+    if boundary in {
+        "checkpoint_temporary_written", "checkpoint_file_flush_completed",
+        "checkpoint_file_fsync_completed",
+    }:
+        assert len(orphaned) == 1
+    else:
+        assert orphaned == []
 
+    # The next public write is the deterministic reopen point: it treats no
+    # temporary as authority, removes only exact checkpoint temporaries, and
+    # leaves a complete canonical old-or-new checkpoint throughout.
+    final = store.write({"schema_version": 1, "value": "continued"})
+    assert store.path.read_bytes() == final
+    assert list(tmp_path.glob(".checkpoint.json.*.tmp")) == []
+
+
+def test_repeated_pre_replace_process_cuts_cannot_grow_checkpoint_temporaries(tmp_path):
+    store = CheckpointStore(tmp_path)
+    old = store.write({"schema_version": 1, "value": "old"})
+    for _ in range(6):
+        process = multiprocessing.Process(
+            target=_crash_checkpoint,
+            args=(str(tmp_path), "checkpoint_file_fsync_completed"),
+        )
+        process.start(); process.join(10)
+        assert process.exitcode == 92
+        assert store.path.read_bytes() == old
+        assert len(list(tmp_path.glob(".checkpoint.json.*.tmp"))) == 1
+
+    store.write({"schema_version": 1, "value": "reopened"})
+    assert list(tmp_path.glob(".checkpoint.json.*.tmp")) == []
+
+
+def test_checkpoint_cleanup_matches_only_exact_temporary_protocol_names(tmp_path):
+    store = CheckpointStore(tmp_path)
+    keep = [
+        tmp_path / ".checkpoint.json.tmp",
+        tmp_path / ".checkpoint.json.extra.tmp.more",
+        tmp_path / "checkpoint.json.extra.tmp",
+    ]
+    for path in keep:
+        path.write_text("not protocol state", encoding="utf-8")
+    store.write({"schema_version": 1, "value": "authority"})
+    assert all(path.exists() for path in keep)
+
+
+@pytest.mark.parametrize("timing,cut_index", [
+    ("current_close", 1),
+    ("next_open", 1),  # pending-order creation
+    ("next_open", 2),  # carried open fill and target replacement
+])
+def test_fresh_process_product_recovery_matrix(tmp_path, timing, cut_index):
+    """Producer, recovery, and continuation never share Product process memory."""
+    from quant_futures.paper_runtime import Lifecycle, LifecycleState
+
+    config, replay = _write_product_fixture(tmp_path, timing)
+    expected = tmp_path / f"expected-{timing}-{cut_index}"
+    _initialize_product_run(str(expected), str(config), str(replay))
+    producer = multiprocessing.Process(
+        target=_produce_product_cut,
+        args=(str(expected), str(config), str(replay), len(replay.read_text().splitlines()), None),
+    )
+    producer.start(); producer.join(20)
+    assert producer.exitcode == 0
+    recovery = multiprocessing.Process(target=_recover_product_process, args=(str(expected),))
+    recovery.start(); recovery.join(20)
+    assert recovery.exitcode == 0
+
+    expected_records = TransitionJournal(expected).records()
+    # Select by the one-based transition cursor rather than relying on stage names.
+    transition_ids = []
+    for record in expected_records:
+        if record.product_transition_id not in transition_ids:
+            transition_ids.append(record.product_transition_id)
+    target_id = transition_ids[cut_index]
+    stages = [record.stage for record in expected_records
+              if record.product_transition_id == target_id]
+
+    for stage in stages:
+        recovered = tmp_path / f"recovered-{timing}-{cut_index}-{stage}"
+        _initialize_product_run(str(recovered), str(config), str(replay))
+        child = multiprocessing.Process(
+            target=_produce_product_cut,
+            args=(str(recovered), str(config), str(replay), cut_index, stage),
+        )
+        child.start(); child.join(20)
+        assert child.exitcode == 93
+        # The cut happened after the named record became durable.
+        assert TransitionJournal(recovered).records()[-1].stage == stage
+
+        restarter = multiprocessing.Process(
+            target=_recover_product_process, args=(str(recovered),))
+        restarter.start(); restarter.join(20)
+        assert restarter.exitcode == 0
+
+        actual_records = TransitionJournal(recovered).records()
+        assert (recovered / "transitions.journal").read_bytes() == (
+            expected / "transitions.journal").read_bytes()
+        assert actual_records == expected_records
+        assert _checkpoint_core(recovered) == _checkpoint_core(expected)
+        _assert_recovery_chain(recovered)
+        _assert_recovery_chain(expected)
+        assert Lifecycle(recovered).current().state is LifecycleState.COMPLETED
+
+        event_ids = [record.journal_event_id for record in actual_records]
+        input_ids = [record.payload["input_event_id"] for record in actual_records
+                     if record.stage == "transition_started"]
+        order_ids = [record.payload["order_id"] for record in actual_records
+                     if record.stage == "order_submitted"]
+        fill_ids = [record.payload["fill_id"] for record in actual_records
+                    if record.stage == "fill_committed"]
+        assert len(event_ids) == len(set(event_ids))
+        assert len(input_ids) == len(set(input_ids))
+        assert len(order_ids) == len(set(order_ids))
+        assert len(fill_ids) == len(set(fill_ids))
