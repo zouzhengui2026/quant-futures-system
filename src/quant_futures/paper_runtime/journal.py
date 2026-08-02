@@ -175,18 +175,37 @@ class TransitionJournal:
             descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             try:
                 view = memoryview(frame)
+                # Write the first byte separately.  Besides making short-write
+                # handling explicit, this is the physical crash boundary used
+                # by process-level durability tests: an injected process exit
+                # leaves a genuinely incomplete frame on disk, rather than an
+                # in-process approximation of one.
+                written = os.write(descriptor, view[:1])
+                if written != 1:
+                    raise OSError("zero-byte journal write")
+                view = view[1:]
+                self._failure_injector("journal_partial_frame_written")
                 while view:
                     written = os.write(descriptor, view)
                     if not written:
                         raise OSError("zero-byte journal write")
                     view = view[written:]
+                self._failure_injector("journal_frame_write_completed")
+                # Backward-compatible name retained for existing injectors.
                 self._failure_injector("journal_frame_written_before_flush")
+                self._failure_injector("journal_before_flush")
+                # Python's unbuffered descriptor has no userspace buffer, but
+                # this named boundary distinguishes completed write from the
+                # following durability operation.
+                self._failure_injector("journal_flush_completed")
                 os.fsync(descriptor)
+                self._failure_injector("journal_fsync_completed")
                 self._failure_injector("journal_frame_flush_completed")
             finally:
                 os.close(descriptor)
             if created:
                 _fsync_directory(self.run_directory)
+            self._failure_injector("journal_post_fsync_published")
         except OSError as exc:
             raise JournalError(f"cannot persist transition journal: {exc}") from exc
 

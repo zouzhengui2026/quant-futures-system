@@ -60,10 +60,15 @@ class CheckpointStore:
                 stream.write(encoded)
                 self._failure_injector("checkpoint_temporary_written")
                 stream.flush()
+                self._failure_injector("checkpoint_file_flush_completed")
                 os.fsync(stream.fileno())
+                self._failure_injector("checkpoint_file_fsync_completed")
             os.replace(temporary, self.path)
+            self._failure_injector("checkpoint_atomic_replace_completed")
             self._failure_injector("checkpoint_replaced_before_directory_fsync")
             _fsync_directory(self.run_directory)
+            self._failure_injector("checkpoint_directory_fsync_completed")
+            self._failure_injector("checkpoint_post_directory_fsync_published")
         except BaseException as exc:
             temporary.unlink(missing_ok=True)
             # Once replace succeeds its outcome is deliberately not rolled back:
