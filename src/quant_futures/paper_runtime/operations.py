@@ -111,6 +111,10 @@ class PaperRuntime:
     def run(self, bars: Iterable[Bar]) -> RuntimeResult:
         lease = self._consumer_lease or RuntimeConsumerLease(
             self.coordinator.journal.run_directory).acquire()
+        # A non-None object is not authority.  Validate the private held
+        # capability and exact run-directory binding before even inspecting a
+        # control boundary or invoking the Product coordinator.
+        lease.assert_held_for(self.coordinator.journal.run_directory)
         try:
             processed = 0
             for bar in bars:

@@ -56,6 +56,42 @@ def test_recover_fails_before_mutation_while_live_consumer_owns_run(tmp_path):
     process.kill(); process.join(5)
 
 
+@pytest.mark.parametrize("kind", ["unacquired", "wrong-directory", "released", "reused"])
+def test_supplied_consumer_lease_cannot_bypass_live_owner(tmp_path, kind):
+    """Caller-supplied objects must prove a live, exact-directory capability."""
+    from quant_futures.paper_runtime import RunLockError, RuntimeConsumerLease
+
+    run = tmp_path / "run"
+    run.mkdir()
+    coordinator = authorized_coordinator(
+        f"lease-{kind}", config(), FixedStrategy(0.0), TransitionJournal(run))
+    ready = multiprocessing.Event()
+    owner = multiprocessing.Process(target=_hold_consumer_lease, args=(run, ready))
+    owner.start(); assert ready.wait(5)
+    authority_names = ("lifecycle.jsonl", "transitions.journal", "checkpoint.json")
+    before = {name: (run / name).read_bytes() if (run / name).exists() else None
+              for name in authority_names}
+
+    if kind == "wrong-directory":
+        (tmp_path / "other").mkdir()
+        supplied = RuntimeConsumerLease(tmp_path / "other").acquire()
+    else:
+        supplied = RuntimeConsumerLease(run)
+        if kind in {"released", "reused"}:
+            owner.kill(); owner.join(5)
+            supplied.acquire(); supplied.release()
+
+    with pytest.raises(RunLockError, match="not held for this run directory"):
+        PaperRuntime(coordinator, consumer_lease=supplied).run((bar(0),))
+    after = {name: (run / name).read_bytes() if (run / name).exists() else None
+             for name in authority_names}
+    assert after == before
+
+    supplied.release()
+    if owner.is_alive():
+        owner.kill(); owner.join(5)
+
+
 def test_finite_runtime_stops_only_after_committed_boundary(tmp_path):
     coordinator = authorized_coordinator(
         "runtime", config(), FixedStrategy(1.0), TransitionJournal(tmp_path))

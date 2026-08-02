@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import IO
 
 
+_HELD_CONSUMER_CAPABILITY = object()
+
+
 class RunLockError(RuntimeError):
     """Another writer owns the run directory or the lock cannot be opened."""
 
@@ -70,8 +73,41 @@ class RuntimeConsumerLease(RunDirectoryLock):
     """
 
     def __init__(self, run_directory: str | Path) -> None:
-        self.path = Path(run_directory) / ".paper-runtime-consumer.lock"
+        self.run_directory = Path(run_directory).resolve()
+        self.path = self.run_directory / ".paper-runtime-consumer.lock"
         self._stream = None
+        self._capability: object | None = None
+
+    def acquire(self) -> "RuntimeConsumerLease":
+        super().acquire()
+        self._capability = _HELD_CONSUMER_CAPABILITY
+        return self
+
+    def release(self) -> None:
+        # Invalidate the capability before unlocking.  A runtime that is handed
+        # this object cannot reuse it after ownership has been returned.
+        self._capability = None
+        super().release()
+
+    def assert_held_for(self, run_directory: str | Path) -> None:
+        """Prove this is the live capability for exactly ``run_directory``.
+
+        Merely constructing a lease object is deliberately insufficient.  The
+        private capability is installed only after a successful OS lock and is
+        destroyed before release, while the open descriptor and canonical run
+        directory are checked again at the consumer boundary.
+        """
+        expected = Path(run_directory).resolve()
+        stream = self._stream
+        if (self._capability is not _HELD_CONSUMER_CAPABILITY
+                or stream is None or stream.closed
+                or self.run_directory != expected
+                or self.path != expected / ".paper-runtime-consumer.lock"):
+            raise RunLockError("runtime consumer lease is not held for this run directory")
+        try:
+            os.fstat(stream.fileno())
+        except (OSError, ValueError) as exc:
+            raise RunLockError("runtime consumer lease descriptor is not live") from exc
 
     @classmethod
     def is_owned(cls, run_directory: str | Path) -> bool:
