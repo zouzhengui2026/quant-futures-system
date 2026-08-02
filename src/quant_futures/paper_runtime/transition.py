@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from math import isfinite
@@ -31,6 +32,7 @@ from quant_futures.risk.portfolio_engine import PortfolioRiskEngine
 from quant_futures.risk.portfolio_models import PortfolioRiskLimits
 
 from .journal import JournalSnapshot, TransitionJournal
+from .checkpoint import CheckpointError, CheckpointStore
 from .lifecycle import Lifecycle, LifecycleError, LifecycleState
 from .lock import RunDirectoryLock
 
@@ -116,11 +118,22 @@ class PaperTransitionCoordinator:
 
     def __init__(self, run_id: str, config: ProductConfig, strategy: Strategy,
                  journal: TransitionJournal,
-                 failure_injector: Callable[[str], None] | None = None) -> None:
+                 failure_injector: Callable[[str], None] | None = None,
+                 *, config_digest: str | None = None,
+                 data_fingerprint: str | None = None,
+                 restore_checkpoint: bool = True,
+                 _publish_checkpoints: bool = True) -> None:
         if not run_id.strip():
             raise TransitionError("run ID must be non-empty")
         self.run_id, self.config, self.strategy, self.journal = run_id, config, strategy, journal
         self._failure_injector = failure_injector or (lambda boundary: None)
+        self.config_digest = config_digest or _digest_value(config.normalized())
+        self.data_fingerprint = data_fingerprint or _digest_value({
+            "path": config.data.path, "source": config.data.source,
+            "symbol": config.data.symbol, "timeframe": config.data.timeframe,
+        })
+        self._publish_checkpoints = _publish_checkpoints
+        self._bars: list[Bar] = []
         self._bus = EventBus()
         self._clock = {"value": None}
         self._paper = PaperExecutionEngine(self._bus, lambda: self._clock["value"])
@@ -142,13 +155,82 @@ class PaperTransitionCoordinator:
         if snapshot.tail is not None and snapshot.tail.run_id != run_id:
             raise TransitionError("journal/lifecycle run ID mismatch")
         if snapshot.tail is not None:
-            raise TransitionError(
-                "non-empty journal requires Checkpoint 4 authoritative restoration"
-            )
+            if not restore_checkpoint:
+                raise TransitionError("non-empty journal requires authoritative restoration")
+            self._restore(snapshot)
+            return
         self._journal_snapshot = snapshot
         self._portfolio_snapshot = self._ledger.snapshot()
         self._account_snapshot = self._account.value(self._portfolio_snapshot, ())
         self._risk_snapshot = self._portfolio_risk.evaluate(self._account_snapshot)
+
+    def _restore(self, snapshot: JournalSnapshot) -> None:
+        """Validate a committed checkpoint and reconstruct the canonical authorities."""
+        try:
+            value = CheckpointStore(self.journal.run_directory).read()
+            _validate_checkpoint(value, self, snapshot)
+            bars = tuple(_bar_from_dict(item) for item in value["history"])  # type: ignore[arg-type]
+            with tempfile.TemporaryDirectory() as name:
+                directory = __import__("pathlib").Path(name)
+                lifecycle = Lifecycle(directory)
+                lifecycle.initialize(self.run_id)
+                lifecycle.transition(LifecycleState.STARTING, "restore validation")
+                lifecycle.transition(LifecycleState.RUNNING, "restore validation")
+                rebuilt = PaperTransitionCoordinator(
+                    self.run_id, self.config, self.strategy, TransitionJournal(directory),
+                    config_digest=self.config_digest, data_fingerprint=self.data_fingerprint,
+                    restore_checkpoint=False, _publish_checkpoints=False)
+                for bar in bars:
+                    rebuilt.transition(bar)
+                expected = value["journal"]
+                tail = rebuilt._journal_snapshot.tail
+                if tail is None or {"sequence": tail.sequence, "digest": tail.digest,
+                                    "product_transition_id": tail.product_transition_id,
+                                    "input_cursor": tail.input_cursor} != expected:
+                    raise CheckpointError("checkpoint history does not reconstruct journal authority")
+                for name in ("strategy", "_bus", "_clock", "_paper", "_ledger", "_account",
+                             "_portfolio_risk", "_closes", "_pending", "_cash_flow", "_cursor",
+                             "_orders", "_fills", "_events", "_portfolio_snapshot",
+                             "_account_snapshot", "_risk_snapshot", "_last_committed_timestamp"):
+                    setattr(self, name, getattr(rebuilt, name))
+                self._bars = list(bars)
+            self._journal_snapshot = snapshot
+        except (CheckpointError, KeyError, TypeError, ValueError) as exc:
+            raise TransitionError(f"authoritative checkpoint restoration failed: {exc}") from exc
+
+    def checkpoint_document(self) -> dict[str, object]:
+        tail = self._journal_snapshot.tail
+        lifecycle = Lifecycle(self.journal.run_directory).current()
+        if tail is None:
+            raise TransitionError("cannot checkpoint an empty journal")
+        return {
+            "schema_version": 1, "run_id": self.run_id,
+            "checkpoint_sequence": self._cursor,
+            "config_digest": self.config_digest, "data_fingerprint": self.data_fingerprint,
+            "cursor": self._cursor,
+            "last_committed_ordering_key": self.state.last_committed_ordering_key,
+            "strategy": {"name": self.strategy.name, "version": self.strategy.version,
+                         "closes": list(self._closes)},
+            "history": [_bar_to_dict(bar) for bar in self._bars],
+            "execution": {"pending_order_id": (self._pending.order.order_id
+                                                 if self._pending else None),
+                          "orders": self._orders, "fills": self._fills},
+            "portfolio": _positions_payload(self._portfolio_snapshot),
+            "account": {"equity": self._account_snapshot.equity,
+                        "cash_flow": self._cash_flow,
+                        "total_realized_pnl": self._account_snapshot.total_realized_pnl,
+                        "total_unrealized_pnl": self._account_snapshot.total_unrealized_pnl},
+            "risk": {"outcome": self._risk_snapshot.outcome.value,
+                     "drawdown": self._risk_snapshot.drawdown_ratio},
+            "counters": {"inputs": self._cursor, "orders": self._orders,
+                         "fills": self._fills, "journal_events": self._events},
+            "journal": {"sequence": tail.sequence, "digest": tail.digest,
+                        "product_transition_id": tail.product_transition_id,
+                        "input_cursor": tail.input_cursor},
+            "lifecycle": {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
+                          "sequence": lifecycle.sequence},
+            "recovery_counter": 0,
+        }
 
     @property
     def state(self) -> PaperTransitionState:
@@ -333,6 +415,10 @@ class PaperTransitionCoordinator:
         self._cursor = cursor
         self._last_committed_timestamp = bar.timestamp
         self._journal_snapshot = self.journal._snapshot_held()
+        self._bars.append(bar)
+        if self._publish_checkpoints:
+            self._failure_injector("checkpoint")
+            CheckpointStore(self.journal.run_directory).write_held(self.checkpoint_document())
         return self.state
 
 
@@ -343,3 +429,60 @@ def _positions_payload(snapshot: object) -> list[dict[str, object]]:
          "average_entry_price": position.average_entry_price}
         for position in snapshot.positions
     ]
+
+
+def _digest_value(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True).encode("ascii")).hexdigest()
+
+
+def _bar_to_dict(bar: Bar) -> dict[str, object]:
+    return {"timestamp": bar.timestamp.isoformat().replace("+00:00", "Z"),
+            "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close,
+            "volume": bar.volume, "funding_rate": bar.funding_rate}
+
+
+def _bar_from_dict(value: object) -> Bar:
+    if not isinstance(value, dict) or set(value) != {
+            "timestamp", "open", "high", "low", "close", "volume", "funding_rate"}:
+        raise CheckpointError("invalid checkpoint market history")
+    return Bar(datetime.fromisoformat(str(value["timestamp"]).replace("Z", "+00:00")),
+               value["open"], value["high"], value["low"], value["close"],
+               value["volume"], value["funding_rate"])  # type: ignore[arg-type]
+
+
+def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionCoordinator,
+                         snapshot: JournalSnapshot) -> None:
+    fields = {"schema_version", "run_id", "checkpoint_sequence", "config_digest",
+              "data_fingerprint", "cursor", "last_committed_ordering_key", "strategy",
+              "history", "execution", "portfolio", "account", "risk", "counters",
+              "journal", "lifecycle", "recovery_counter"}
+    if set(value) != fields or value["schema_version"] != 1:
+        raise CheckpointError("unsupported checkpoint schema")
+    if value["run_id"] != coordinator.run_id:
+        raise CheckpointError("checkpoint run ID mismatch")
+    if value["config_digest"] != coordinator.config_digest:
+        raise CheckpointError("checkpoint config digest mismatch")
+    if value["data_fingerprint"] != coordinator.data_fingerprint:
+        raise CheckpointError("checkpoint data fingerprint mismatch")
+    cursor = value["cursor"]
+    if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 1 or value["checkpoint_sequence"] != cursor:
+        raise CheckpointError("invalid checkpoint cursor")
+    if not isinstance(value["history"], list) or len(value["history"]) != cursor:
+        raise CheckpointError("checkpoint history/cursor mismatch")
+    strategy = value["strategy"]
+    if not isinstance(strategy, dict) or strategy.get("name") != coordinator.strategy.name or strategy.get("version") != coordinator.strategy.version:
+        raise CheckpointError("unsupported strategy identity or version")
+    tail = snapshot.tail
+    if tail is None or value["journal"] != {"sequence": tail.sequence, "digest": tail.digest,
+                                            "product_transition_id": tail.product_transition_id,
+                                            "input_cursor": tail.input_cursor}:
+        raise CheckpointError("checkpoint journal lineage mismatch")
+    lifecycle = Lifecycle(coordinator.journal.run_directory).current()
+    if value["lifecycle"] != {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
+                              "sequence": lifecycle.sequence} or lifecycle.state is not LifecycleState.RUNNING:
+        raise CheckpointError("checkpoint lifecycle mismatch")
+    if value["last_committed_ordering_key"] != tail.effective_market_timestamp:
+        raise CheckpointError("checkpoint ordering key mismatch")
+    if value["recovery_counter"] != 0:
+        raise CheckpointError("invalid recovery counter")

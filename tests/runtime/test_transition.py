@@ -285,8 +285,9 @@ def test_reopening_completed_or_partial_journal_fails_closed(tmp_path, monkeypat
         coordinator.transition(bar(0))
     with pytest.raises(TransitionError, match="unusable"):
         coordinator.transition(bar(1))
-    with pytest.raises(TransitionError, match="Checkpoint 4"):
-        authorized_coordinator("run-e", config(), HoldStrategy(), TransitionJournal(tmp_path))
+    restored = authorized_coordinator(
+        "run-e", config(), HoldStrategy(), TransitionJournal(tmp_path))
+    assert restored.state.input_cursor == 1
 
     partial = tmp_path / "partial"
     partial.mkdir()
@@ -298,7 +299,7 @@ def test_reopening_completed_or_partial_journal_fails_closed(tmp_path, monkeypat
     ))
     with pytest.raises(OSError):
         coordinator.transition(bar(0))
-    with pytest.raises(TransitionError, match="Checkpoint 4"):
+    with pytest.raises(TransitionError, match="checkpoint restoration"):
         authorized_coordinator("run-f", config(), HoldStrategy(), TransitionJournal(partial))
 
 

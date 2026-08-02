@@ -50,10 +50,19 @@ the run-locked recovery path to truncate and fsync only a provably incomplete fi
 changing lifecycle state. Completed-frame corruption, invalid schema,
 reordering, duplication, modification, and oversized frames fail closed. `paper audit` validates
 this authority (a missing or empty journal is valid during Checkpoint 2) and projects its sequence
-and tail digest from a lock-consistent snapshot. Market-event consumption, checkpoints, and state
-restoration remain subsequent checkpoints. `recover` is legal only for a persisted
+and tail digest from a lock-consistent snapshot. Incremental market-event transitions reuse the
+Product strategy, execution, portfolio, account, and risk authorities under one writer lock.
+After each durable `transition_committed` record, a versioned canonical `checkpoint.json` is
+published with atomic same-directory replacement, file and directory fsync. It records the
+committed cursor/order key, input and strategy history, pending execution, canonical authority
+outputs, counters/cash flow, lifecycle and journal lineage, and configuration/data identities.
+A fresh coordinator validates those identities and reconstructs the real Product authorities,
+including a pending next-open order, before accepting the next input. Corrupt, stale, foreign,
+or incomplete checkpoints fail closed rather than falling back to empty state. `recover` is legal
+only for a persisted
 `FAILED_RECOVERABLE` lifecycle and validates or safely repairs journal framing before lifecycle
-mutation; it does not yet restore trading state.
+mutation. Reconciliation of a crash inside a partially journaled transition, signal-driven
+continuation, and exactly-once recovery remain later checkpoints and are not claimed here.
 Invalid or repeated transitions fail closed with exit code 2, while an audit mismatch exits 3.
 
 `lifecycle.jsonl` is the checkpoint-one lifecycle authority. `status.json` is explicitly a
