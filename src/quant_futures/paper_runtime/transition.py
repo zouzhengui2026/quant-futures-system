@@ -203,7 +203,6 @@ class PaperTransitionCoordinator:
             _validate_checkpoint(value, self, snapshot, lifecycle_before)
             self._install_bounded_state(value)
             self._checkpoint_lifecycle_override = value["lifecycle"]
-            self._checkpoint_recovery_override = value["recovery_counter"]
             if (store.path.read_bytes() != checkpoint_bytes
                     or self.journal._snapshot_held() != (authority_snapshot or snapshot)
                     or Lifecycle(self.journal.run_directory).current() != lifecycle_before):
@@ -240,8 +239,8 @@ class PaperTransitionCoordinator:
             "lifecycle": getattr(self, "_checkpoint_lifecycle_override",
                                  {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
                                   "sequence": lifecycle.sequence}),
-            "recovery_counter": getattr(self, "_checkpoint_recovery_override",
-                                        _recovery_counter(self.journal.run_directory)),
+            "recovery_counter": _recovery_counter(self.journal.run_directory),
+            "recovery_digest": _recovery_digest(self.journal.run_directory),
         }
         document["state_digest"] = _bounded_state_digest(document)
         return document
@@ -556,6 +555,7 @@ class PaperTransitionCoordinator:
             "lifecycle": {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
                           "sequence": lifecycle.sequence},
             "recovery_counter": _recovery_counter(self.journal.run_directory),
+            "recovery_digest": _recovery_digest(self.journal.run_directory),
         }
 
 
@@ -750,7 +750,8 @@ def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionC
     fields = {"schema_version", "run_id", "checkpoint_sequence", "config_digest",
               "data_fingerprint", "cursor", "last_committed_ordering_key", "strategy",
               "execution", "portfolio", "account", "risk", "counters",
-              "journal", "lifecycle", "recovery_counter", "state_digest"}
+              "journal", "lifecycle", "recovery_counter", "recovery_digest",
+              "state_digest"}
     if set(value) != fields or value["schema_version"] != 1:
         raise CheckpointError("unsupported checkpoint schema")
     if value["run_id"] != coordinator.run_id:
@@ -804,9 +805,25 @@ def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionC
                  if lifecycle.state is LifecycleState.RECOVERING else {actual_recoveries})
     if value["recovery_counter"] not in permitted:
         raise CheckpointError("recovery counter is not bound to checkpoint authority")
+    from .operations import RecoveryAttempts
+    recovery_records = RecoveryAttempts(coordinator.journal.run_directory).read()
+    actual_digest = recovery_records[-1]["digest"] if recovery_records else None
+    permitted_digests = {actual_digest}
+    if lifecycle.state is LifecycleState.RECOVERING:
+        permitted_digests.add(recovery_records[-2]["digest"]
+                              if len(recovery_records) >= 2 else None)
+    if value["recovery_digest"] not in permitted_digests:
+        raise CheckpointError("recovery digest is not bound to checkpoint authority")
 
 
 def _recovery_counter(run_directory: Path) -> int:
     """Read the lock-protected recovery authority without making it optional."""
     from .operations import RecoveryAttempts
     return RecoveryAttempts(run_directory).attempt_count()
+
+
+def _recovery_digest(run_directory: Path) -> str | None:
+    """Return the protected tail commitment for recovery-attempt authority."""
+    from .operations import RecoveryAttempts
+    records = RecoveryAttempts(run_directory).read()
+    return records[-1]["digest"] if records else None

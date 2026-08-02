@@ -1,3 +1,4 @@
+import json
 import signal
 import pytest
 
@@ -102,16 +103,26 @@ def test_fresh_process_recovery_completes_each_durable_current_close_prefix(tmp_
     expected = create(tmp_path / "expected")
     paper_control.write_runtime_metadata(expected, config_path, replay)
     execute(expected)
+    # Compare authorities at the same operational recovery count.
+    paper_control.recover(expected)
+    paper_control.continue_runtime(expected)
     recovered = create(tmp_path / "recovered")
     paper_control.write_runtime_metadata(recovered, config_path, replay)
     execute(recovered, stage)
     paper_control.recover(recovered)
+    paper_control.continue_runtime(recovered)
 
     records = TransitionJournal(recovered).records()
     second_id = records[-1].product_transition_id
     second = [record.stage for record in records
               if record.product_transition_id == second_id]
     assert len(second) == len(set(second))
-    assert (recovered / "checkpoint.json").read_bytes() == (expected / "checkpoint.json").read_bytes()
+    recovered_checkpoint = json.loads((recovered / "checkpoint.json").read_text())
+    expected_checkpoint = json.loads((expected / "checkpoint.json").read_text())
+    # The protected recovery outcome digests intentionally distinguish a
+    # recovered invocation from a coherent no-op invocation.
+    recovered_checkpoint.pop("recovery_digest")
+    expected_checkpoint.pop("recovery_digest")
+    assert recovered_checkpoint == expected_checkpoint
     assert [record.stage for record in records] == [
         record.stage for record in TransitionJournal(expected).records()]

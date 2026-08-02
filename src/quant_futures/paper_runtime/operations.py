@@ -206,6 +206,24 @@ class RecoveryAttempts:
         """Return attempts, rather than the number of outcome records."""
         return sum(record["outcome"] == "started" for record in self.read())
 
+    def validate_checkpoint_anchor(self) -> None:
+        """Reject deletion, truncation, replacement, or reset of this authority."""
+        from .checkpoint import CheckpointStore
+        store = CheckpointStore(self.run_directory)
+        if not store.path.exists():
+            # Lifecycle-only Checkpoint 1/2 runs legitimately have no product
+            # checkpoint. Their chain remains self-validating, but there is no
+            # product authority into which it can be committed.
+            self.read()
+            return
+        checkpoint = store.read()
+        records = self.read()
+        count = sum(record["outcome"] == "started" for record in records)
+        digest = records[-1]["digest"] if records else None
+        if (checkpoint.get("recovery_counter") != count
+                or checkpoint.get("recovery_digest") != digest):
+            raise OperationalError("recovery authority does not match checkpoint commitment")
+
     def read(self) -> list[dict[str, object]]:
         if not self.path.exists():
             return []

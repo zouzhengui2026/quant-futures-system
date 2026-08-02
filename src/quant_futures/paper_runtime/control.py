@@ -69,6 +69,7 @@ def _project_status_held(
         })
     from .operations import RecoveryAttempts
     attempts = RecoveryAttempts(lifecycle.run_directory)
+    attempts.validate_checkpoint_anchor()
     status["recovery_attempts"] = attempts.attempt_count()
     coherent = (journal_tail is None and checkpoint is None) or (
         checkpoint is not None and journal_tail is not None
@@ -217,89 +218,118 @@ def stop(run_directory: str | Path) -> LifecycleRecord:
         return record
 
 
-def recover(run_directory: str | Path) -> LifecycleRecord:
-    """Repair product authority, then leave the run in its pre-crash disposition.
+def _publish_recovery_commitment_held(directory: Path) -> None:
+    """Atomically bind the completed recovery invocation into the checkpoint."""
+    from .operations import RecoveryAttempts
+    store = CheckpointStore(directory)
+    if not store.path.exists():
+        return
+    document = store.read()
+    records = RecoveryAttempts(directory).read()
+    document["recovery_counter"] = sum(r["outcome"] == "started" for r in records)
+    document["recovery_digest"] = records[-1]["digest"] if records else None
+    store._write_held(document)
 
-    Validation ambiguity is terminal.  A failure after an otherwise valid
-    recovery has started is recoverable, so a later invocation may retry it.
-    One invocation is represented by a ``started``/outcome pair.
-    """
+
+def _desired_recovery_disposition(lifecycle: Lifecycle) -> LifecycleState:
+    """Preserve the last operational disposition across arbitrarily many retries."""
+    for record in reversed(lifecycle.records()):
+        if record.state in {LifecycleState.RUNNING, LifecycleState.PAUSED}:
+            return record.state
+    return LifecycleState.RUNNING
+
+
+def recover(run_directory: str | Path) -> LifecycleRecord:
+    """Close exactly one durable recovery attempt and publish its commitment."""
     directory = Path(run_directory)
-    lifecycle = Lifecycle(run_directory)
-    with RunDirectoryLock(run_directory):
-        current = lifecycle.current()
+    lifecycle = Lifecycle(directory)
+    with RunDirectoryLock(directory):
         from .operations import RecoveryAttempts
-        attempts = RecoveryAttempts(run_directory)
-        metadata = _runtime_metadata(directory) if (directory / "runtime.json").exists() else None
-        attempts.append_held(current.run_id, "started")
-        journal = TransitionJournal(run_directory)
+        attempts = RecoveryAttempts(directory)
+        current = lifecycle.current()
+        run_id = current.run_id
+        desired = _desired_recovery_disposition(lifecycle)
+        # Validate the last atomic publication before mutation.  A process cut
+        # after ``started`` is closed as failed so the next invocation remains
+        # admissible without resetting its attempt number.
         try:
+            attempts.validate_checkpoint_anchor()
+        except Exception:
+            records = attempts.read()
+            if not records or records[-1]["outcome"] != "started":
+                raise
+            attempts.append_held(run_id, "failed")
+            _publish_recovery_commitment_held(directory)
+            attempts.validate_checkpoint_anchor()
+        attempts.append_held(run_id, "started")
+        closed = False
+
+        def close(outcome: str) -> None:
+            nonlocal closed
+            if closed:
+                raise LifecycleError("recovery invocation already closed")
+            attempts.append_held(run_id, outcome)
+            closed = True
+            _publish_recovery_commitment_held(directory)
+
+        try:
+            metadata = _runtime_metadata(directory) if (directory / "runtime.json").exists() else None
+            journal = TransitionJournal(directory)
             journal_snapshot = journal._repair_tail_held()
-        except BaseException:
-            attempts.append_held(current.run_id, "failed")
-            raise
-        journal_tail = journal_snapshot.tail
-        if journal_tail is not None and journal_tail.run_id != current.run_id:
-            raise JournalError("journal run ID does not match lifecycle authority")
-        checkpoint = CheckpointStore(run_directory).read() if CheckpointStore(run_directory).path.exists() else None
-        checkpoint_digest = (checkpoint.get("journal", {}).get("digest")
-                             if isinstance(checkpoint, dict) else None)
-        incoherent = (metadata is not None and journal_tail is not None
-                      and journal_tail.digest != checkpoint_digest)
-        desired = (LifecycleState.PAUSED if current.state is LifecycleState.PAUSED
-                   else LifecycleState.RUNNING)
-        if current.state is LifecycleState.FAILED_RECOVERABLE:
-            # The last healthy disposition is recovered from the legal lineage.
-            prior = lifecycle.records()[-2].state if len(lifecycle.records()) > 1 else None
-            desired = LifecycleState.PAUSED if prior is LifecycleState.PAUSED else LifecycleState.RUNNING
-        if incoherent and current.state in {LifecycleState.RUNNING, LifecycleState.PAUSED}:
-            lifecycle._transition_held(LifecycleState.FAILED_RECOVERABLE,
-                                       "incomplete durable product transition detected")
-            current = lifecycle.current()
-        if incoherent and current.state is LifecycleState.FAILED_RECOVERABLE:
-            lifecycle._transition_held(LifecycleState.RECOVERING, "recovery requested")
-            current = lifecycle.current()
-        if incoherent and current.state is not LifecycleState.RECOVERING:
-            attempts.append_held(current.run_id, "failed")
-            raise LifecycleError(f"lifecycle state is not recoverable: {current.state.value}")
-        if incoherent and metadata is not None:
-            try:
-                _recover_product_suffix_held(Path(run_directory), current.run_id,
-                                             journal, journal_snapshot, checkpoint)
+            tail = journal_snapshot.tail
+            if tail is not None and tail.run_id != run_id:
+                raise JournalError("journal run ID does not match lifecycle authority")
+            store = CheckpointStore(directory)
+            checkpoint = store.read() if store.path.exists() else None
+            checkpoint_digest = (checkpoint.get("journal", {}).get("digest")
+                                 if isinstance(checkpoint, dict) else None)
+            incoherent = bool(metadata is not None and tail is not None
+                              and tail.digest != checkpoint_digest)
+            state = lifecycle.current().state
+            if incoherent and state in {LifecycleState.RUNNING, LifecycleState.PAUSED}:
+                lifecycle._transition_held(LifecycleState.FAILED_RECOVERABLE,
+                                           "incomplete durable product transition detected")
+                state = LifecycleState.FAILED_RECOVERABLE
+            if state is LifecycleState.FAILED_RECOVERABLE:
+                lifecycle._transition_held(LifecycleState.RECOVERING, "recovery requested")
+                state = LifecycleState.RECOVERING
+            if incoherent:
+                if state is not LifecycleState.RECOVERING:
+                    raise LifecycleError(f"lifecycle state is not recoverable: {state.value}")
+                if metadata is None:
+                    raise LifecycleError("runtime metadata required for product recovery")
+                _recover_product_suffix_held(directory, run_id, journal, journal_snapshot, checkpoint)
                 journal_snapshot = journal._snapshot_held()
                 lifecycle._transition_held(desired, "product authority recovered")
-                attempts.append_held(current.run_id, "recovered")
+                close("recovered")
                 _write_status_held(lifecycle, journal_snapshot)
                 return lifecycle.current()
-            except BaseException as exc:
-                attempts.append_held(current.run_id, "failed")
-                if lifecycle.current().state is LifecycleState.RECOVERING:
-                    # Deterministic rule: unverifiable durable input is terminal;
-                    # environmental/runtime failures remain retryable.
-                    target = (LifecycleState.FAILED_TERMINAL
-                              if isinstance(exc, (JournalError, CheckpointError, ValueError))
-                              else LifecycleState.FAILED_RECOVERABLE)
-                    lifecycle._transition_held(target, "recovery attempt failed")
-                raise
-        if incoherent:
-            attempts.append_held(current.run_id, "failed")
-            if lifecycle.current().state is LifecycleState.RECOVERING:
-                lifecycle._transition_held(LifecycleState.FAILED_TERMINAL,
-                                           "runtime metadata required for product recovery")
-            raise LifecycleError("runtime metadata required for product recovery")
-        if current.state in {LifecycleState.RUNNING, LifecycleState.PAUSED}:
-            attempts.append_held(current.run_id, "no-op")
+            if state is LifecycleState.RECOVERING:
+                lifecycle._transition_held(desired, "lifecycle authority validated")
+                close("recovered")
+            elif state in {LifecycleState.RUNNING, LifecycleState.PAUSED}:
+                close("no-op")
+            else:
+                raise LifecycleError(f"lifecycle state is not recoverable: {state.value}")
             _write_status_held(lifecycle, journal_snapshot)
-            return current
-        if current.state is not LifecycleState.FAILED_RECOVERABLE:
-            attempts.append_held(current.run_id, "failed")
-            raise LifecycleError(f"lifecycle state is not recoverable: {current.state.value}")
-        lifecycle._transition_held(LifecycleState.RECOVERING, "recovery requested")
-        record = lifecycle._transition_held(desired, "lifecycle authority validated")
-        attempts.append_held(current.run_id, "recovered")
-        _write_status_held(lifecycle, journal_snapshot)
-        return record
-
+            return lifecycle.current()
+        except BaseException as exc:
+            if not closed:
+                attempts.append_held(run_id, "failed")
+                closed = True
+                # Keep retries legal and preserve the original desired disposition.
+                try:
+                    if lifecycle.current().state is LifecycleState.RECOVERING:
+                        lifecycle._transition_held(LifecycleState.FAILED_RECOVERABLE,
+                                                   f"recovery attempt failed: {type(exc).__name__}")
+                finally:
+                    # This may legitimately fail when the checkpoint itself is corrupt;
+                    # the closed attempt chain still permits the next repair attempt.
+                    try:
+                        _publish_recovery_commitment_held(directory)
+                    except (CheckpointError, OSError, ValueError):
+                        pass
+            raise
 
 def _recover_product_suffix_held(directory: Path, run_id: str,
                                  journal: TransitionJournal,
