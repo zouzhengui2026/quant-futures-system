@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 from math import isfinite
@@ -128,10 +129,7 @@ class PaperTransitionCoordinator:
         self.run_id, self.config, self.strategy, self.journal = run_id, config, strategy, journal
         self._failure_injector = failure_injector or (lambda boundary: None)
         self.config_digest = config_digest or _digest_value(config.normalized())
-        self.data_fingerprint = data_fingerprint or _digest_value({
-            "path": config.data.path, "source": config.data.source,
-            "symbol": config.data.symbol, "timeframe": config.data.timeframe,
-        })
+        self.data_fingerprint = data_fingerprint or _data_fingerprint(config)
         self._publish_checkpoints = _publish_checkpoints
         self._bars: list[Bar] = []
         self._bus = EventBus()
@@ -151,24 +149,28 @@ class PaperTransitionCoordinator:
         self._orders = self._fills = self._events = 0
         self._poisoned = False
         self._last_committed_timestamp: datetime | None = None
-        snapshot = journal.snapshot()
-        if snapshot.tail is not None and snapshot.tail.run_id != run_id:
-            raise TransitionError("journal/lifecycle run ID mismatch")
-        if snapshot.tail is not None:
-            if not restore_checkpoint:
-                raise TransitionError("non-empty journal requires authoritative restoration")
-            self._restore(snapshot)
-            return
+        with RunDirectoryLock(journal.run_directory):
+            snapshot = journal._snapshot_held()
+            if snapshot.tail is not None and snapshot.tail.run_id != run_id:
+                raise TransitionError("journal/lifecycle run ID mismatch")
+            if snapshot.tail is not None:
+                if not restore_checkpoint:
+                    raise TransitionError("non-empty journal requires authoritative restoration")
+                self._restore_held(snapshot)
+                return
         self._journal_snapshot = snapshot
         self._portfolio_snapshot = self._ledger.snapshot()
         self._account_snapshot = self._account.value(self._portfolio_snapshot, ())
         self._risk_snapshot = self._portfolio_risk.evaluate(self._account_snapshot)
 
-    def _restore(self, snapshot: JournalSnapshot) -> None:
+    def _restore_held(self, snapshot: JournalSnapshot) -> None:
         """Validate a committed checkpoint and reconstruct the canonical authorities."""
         try:
-            value = CheckpointStore(self.journal.run_directory).read()
-            _validate_checkpoint(value, self, snapshot)
+            store = CheckpointStore(self.journal.run_directory)
+            checkpoint_bytes = store.path.read_bytes()
+            value = store.read()
+            lifecycle_before = Lifecycle(self.journal.run_directory).current()
+            _validate_checkpoint(value, self, snapshot, lifecycle_before)
             bars = tuple(_bar_from_dict(item) for item in value["history"])  # type: ignore[arg-type]
             with tempfile.TemporaryDirectory() as name:
                 directory = __import__("pathlib").Path(name)
@@ -188,6 +190,20 @@ class PaperTransitionCoordinator:
                                     "product_transition_id": tail.product_transition_id,
                                     "input_cursor": tail.input_cursor} != expected:
                     raise CheckpointError("checkpoint history does not reconstruct journal authority")
+                # Every field advertised as checkpoint authority must equal the
+                # independently reconstructed Product authority before install.
+                rebuilt_document = rebuilt.checkpoint_document()
+                for section in ("strategy", "history", "execution", "portfolio", "account",
+                                "risk", "counters", "journal"):
+                    if value[section] != rebuilt_document[section]:
+                        raise CheckpointError(f"checkpoint {section} authority mismatch")
+                # Replay uses an isolated temporary authority.  The real run lock
+                # remains held, and all three real authorities are revalidated at
+                # the cut immediately before reconstructed objects are installed.
+                if (store.path.read_bytes() != checkpoint_bytes
+                        or self.journal._snapshot_held() != snapshot
+                        or Lifecycle(self.journal.run_directory).current() != lifecycle_before):
+                    raise CheckpointError("authority changed during restoration")
                 for name in ("strategy", "_bus", "_clock", "_paper", "_ledger", "_account",
                              "_portfolio_risk", "_closes", "_pending", "_cash_flow", "_cursor",
                              "_orders", "_fills", "_events", "_portfolio_snapshot",
@@ -195,7 +211,7 @@ class PaperTransitionCoordinator:
                     setattr(self, name, getattr(rebuilt, name))
                 self._bars = list(bars)
             self._journal_snapshot = snapshot
-        except (CheckpointError, KeyError, TypeError, ValueError) as exc:
+        except (CheckpointError, KeyError, OSError, TypeError, ValueError) as exc:
             raise TransitionError(f"authoritative checkpoint restoration failed: {exc}") from exc
 
     def checkpoint_document(self) -> dict[str, object]:
@@ -418,7 +434,7 @@ class PaperTransitionCoordinator:
         self._bars.append(bar)
         if self._publish_checkpoints:
             self._failure_injector("checkpoint")
-            CheckpointStore(self.journal.run_directory).write_held(self.checkpoint_document())
+            CheckpointStore(self.journal.run_directory)._write_held(self.checkpoint_document())
         return self.state
 
 
@@ -434,6 +450,19 @@ def _positions_payload(snapshot: object) -> list[dict[str, object]]:
 def _digest_value(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=True).encode("ascii")).hexdigest()
+
+
+def _data_fingerprint(config: ProductConfig) -> str:
+    """Bind local replay identities to content, not merely to a pathname."""
+    path = Path(config.data.path)
+    content_digest = None
+    if path.is_file():
+        content_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return _digest_value({
+        "path": config.data.path, "source": config.data.source,
+        "symbol": config.data.symbol, "timeframe": config.data.timeframe,
+        "content_sha256": content_digest,
+    })
 
 
 def _bar_to_dict(bar: Bar) -> dict[str, object]:
@@ -452,7 +481,7 @@ def _bar_from_dict(value: object) -> Bar:
 
 
 def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionCoordinator,
-                         snapshot: JournalSnapshot) -> None:
+                         snapshot: JournalSnapshot, lifecycle: object) -> None:
     fields = {"schema_version", "run_id", "checkpoint_sequence", "config_digest",
               "data_fingerprint", "cursor", "last_committed_ordering_key", "strategy",
               "history", "execution", "portfolio", "account", "risk", "counters",
@@ -478,7 +507,6 @@ def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionC
                                             "product_transition_id": tail.product_transition_id,
                                             "input_cursor": tail.input_cursor}:
         raise CheckpointError("checkpoint journal lineage mismatch")
-    lifecycle = Lifecycle(coordinator.journal.run_directory).current()
     if value["lifecycle"] != {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
                               "sequence": lifecycle.sequence} or lifecycle.state is not LifecycleState.RUNNING:
         raise CheckpointError("checkpoint lifecycle mismatch")

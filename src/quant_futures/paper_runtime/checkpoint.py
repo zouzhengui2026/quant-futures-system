@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .lifecycle import _fsync_directory
+from .lock import RunDirectoryLock
 
 
 class CheckpointError(ValueError):
@@ -41,35 +42,30 @@ class CheckpointStore:
             raise CheckpointError("checkpoint is not a canonical object")
         return value
 
-    def write_held(self, value: Mapping[str, object]) -> bytes:
-        """Replace the authority; the caller must hold ``RunDirectoryLock``."""
+    def write(self, value: Mapping[str, object]) -> bytes:
+        """Lock and atomically replace the checkpoint authority."""
+        with RunDirectoryLock(self.run_directory):
+            return self._write_held(value)
+
+    def _write_held(self, value: Mapping[str, object]) -> bytes:
+        """Replace the authority while the enclosing runtime transaction holds the lock."""
         encoded = canonical_checkpoint(value)
-        previous = self.path.read_bytes() if self.path.exists() else None
         descriptor, name = tempfile.mkstemp(
             prefix=f".{self.path.name}.", suffix=".tmp", dir=self.run_directory)
         temporary = Path(name)
-        replaced = False
         try:
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
-            replaced = True
             _fsync_directory(self.run_directory)
         except BaseException as exc:
             temporary.unlink(missing_ok=True)
-            if replaced:
-                try:
-                    if previous is None:
-                        self.path.unlink(missing_ok=True)
-                    else:
-                        self.path.write_bytes(previous)
-                        with self.path.open("rb") as stream:
-                            os.fsync(stream.fileno())
-                    _fsync_directory(self.run_directory)
-                except OSError:
-                    pass
+            # Once replace succeeds its outcome is deliberately not rolled back:
+            # rewriting the authority in place could expose torn bytes.  A failed
+            # directory fsync is an indeterminate (and therefore fail-closed)
+            # publication, but the pathname still names one complete old/new file.
             if isinstance(exc, CheckpointError):
                 raise
             raise CheckpointError(f"cannot persist checkpoint: {exc}") from exc

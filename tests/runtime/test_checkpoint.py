@@ -1,10 +1,12 @@
 import json
+import multiprocessing
 import os
 
 import pytest
 
 from quant_futures.paper_runtime import (
-    CheckpointError, CheckpointStore, PaperTransitionCoordinator, TransitionError,
+    CheckpointError, CheckpointStore, PaperTransitionCoordinator, RunDirectoryLock,
+    RunLockError, TransitionError,
 )
 from quant_futures.paper_runtime.journal import TransitionJournal
 from quant_futures.product.strategy import FixedStrategy
@@ -74,10 +76,67 @@ def test_corrupt_or_foreign_checkpoint_fails_closed(tmp_path, mutation):
 def test_atomic_failure_preserves_previous_checkpoint_and_cleans_temp(tmp_path, monkeypatch):
     store = CheckpointStore(tmp_path)
     original = {"schema_version": 1, "value": "old"}
-    store.write_held(original)
+    store.write(original)
     before = store.path.read_bytes()
     monkeypatch.setattr(os, "replace", lambda *args: (_ for _ in ()).throw(OSError("cut")))
     with pytest.raises(CheckpointError):
-        store.write_held({"schema_version": 1, "value": "new"})
+        store.write({"schema_version": 1, "value": "new"})
     assert store.path.read_bytes() == before
+    assert list(tmp_path.glob(".checkpoint.json.*.tmp")) == []
+
+
+def _hold_run_lock(path, ready, release):
+    with RunDirectoryLock(path):
+        ready.set()
+        release.wait(10)
+
+
+def test_public_checkpoint_write_obeys_multiprocess_run_lock(tmp_path):
+    store = CheckpointStore(tmp_path)
+    store.write({"schema_version": 1, "value": "old"})
+    before = store.path.read_bytes()
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(target=_hold_run_lock, args=(tmp_path, ready, release))
+    process.start()
+    assert ready.wait(10)
+    try:
+        with pytest.raises(RunLockError):
+            store.write({"schema_version": 1, "value": "new"})
+        assert store.path.read_bytes() == before
+    finally:
+        release.set()
+        process.join(10)
+    assert process.exitcode == 0
+
+
+@pytest.mark.parametrize("section", [
+    "strategy", "history", "execution", "portfolio", "account", "risk", "counters",
+])
+def test_every_retained_authority_section_is_validated(tmp_path, section):
+    journal = TransitionJournal(tmp_path)
+    authorized_coordinator("authority", config(), FixedStrategy(1.0), journal).transition(bar(0))
+    path = tmp_path / "checkpoint.json"
+    value = json.loads(path.read_bytes())
+    target = value[section]
+    if isinstance(target, list):
+        target[0][next(iter(target[0]))] = "corrupt"
+    else:
+        target[next(iter(target))] = "corrupt"
+    path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+    with pytest.raises(TransitionError, match="checkpoint restoration"):
+        PaperTransitionCoordinator("authority", config(), FixedStrategy(1.0),
+                                   TransitionJournal(tmp_path))
+
+
+def test_directory_fsync_failure_leaves_complete_new_authority(tmp_path, monkeypatch):
+    store = CheckpointStore(tmp_path)
+    store.write({"schema_version": 1, "value": "old"})
+    new = {"schema_version": 1, "value": "new"}
+    monkeypatch.setattr("quant_futures.paper_runtime.checkpoint._fsync_directory",
+                        lambda path: (_ for _ in ()).throw(OSError("uncertain")))
+    with pytest.raises(CheckpointError):
+        store.write(new)
+    assert store.path.read_bytes() == (json.dumps(new, sort_keys=True,
+        separators=(",", ":")) + "\n").encode("ascii")
     assert list(tmp_path.glob(".checkpoint.json.*.tmp")) == []
