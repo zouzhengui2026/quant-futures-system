@@ -57,3 +57,29 @@ class RunDirectoryLock:
 
     def __exit__(self, *_: object) -> None:
         self.release()
+
+
+class RuntimeConsumerLease(RunDirectoryLock):
+    """OS-released, non-blocking lease held by one replay consumer for its life.
+
+    This is intentionally a different inode from the short transaction lock:
+    controls may still take :class:`RunDirectoryLock` while a consumer is alive,
+    but a second consumer (or recovery coordinator) cannot be constructed.
+    ``flock`` releases the lease automatically when a process exits, including
+    ungraceful death.
+    """
+
+    def __init__(self, run_directory: str | Path) -> None:
+        self.path = Path(run_directory) / ".paper-runtime-consumer.lock"
+        self._stream = None
+
+    @classmethod
+    def is_owned(cls, run_directory: str | Path) -> bool:
+        probe = cls(run_directory)
+        try:
+            probe.acquire()
+        except RunLockError:
+            return True
+        else:
+            probe.release()
+            return False

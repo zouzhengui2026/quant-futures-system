@@ -64,7 +64,11 @@ def main(argv: list[str] | None = None) -> int:
                     start=effective.data.start, end=effective.data.end,
                     timeframe=effective.data.timeframe)
                 from quant_futures.paper_runtime import (PaperRuntime,
-                    PaperTransitionCoordinator, StopFlag, TransitionJournal)
+                    PaperTransitionCoordinator, RuntimeConsumerLease, StopFlag,
+                    TransitionJournal)
+                # Claim lifetime ownership before constructing Product
+                # authorities. Process death releases this OS lease.
+                consumer_lease = RuntimeConsumerLease(directory).acquire()
                 run_id = paper_control.project_status(directory)["run_id"]
                 coordinator = PaperTransitionCoordinator(
                     str(run_id), effective,
@@ -72,7 +76,8 @@ def main(argv: list[str] | None = None) -> int:
                     TransitionJournal(directory), data_fingerprint=f"sha256:{fingerprint}")
                 stop_flag = StopFlag(); stop_flag.install()
                 PaperRuntime(coordinator, pace_seconds=pace_seconds,
-                             stop_flag=stop_flag).run(bars)
+                             stop_flag=stop_flag,
+                             consumer_lease=consumer_lease).run(bars)
                 return 0
             if args.paper_command == "status":
                 print(json.dumps(paper_control.project_status(args.run_directory), sort_keys=True))

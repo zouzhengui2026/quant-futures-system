@@ -20,7 +20,7 @@ from quant_futures.product.data import Bar
 
 from .control import _atomic_projection, _write_status_held
 from .lifecycle import Lifecycle, LifecycleState, _fsync_directory
-from .lock import RunDirectoryLock
+from .lock import RunDirectoryLock, RuntimeConsumerLease
 from .transition import PaperTransitionCoordinator, PaperTransitionState
 
 
@@ -95,7 +95,8 @@ class PaperRuntime:
     """Finite one-event-at-a-time service around the domain coordinator."""
 
     def __init__(self, coordinator: PaperTransitionCoordinator, *, pace_seconds: float = 0,
-                 stop_flag: StopFlag | None = None, request_baseline: int = 0) -> None:
+                 stop_flag: StopFlag | None = None, request_baseline: int = 0,
+                 consumer_lease: RuntimeConsumerLease | None = None) -> None:
         if not isinstance(pace_seconds, (int, float)) or pace_seconds < 0:
             raise OperationalError("pace must be non-negative")
         self.coordinator = coordinator
@@ -105,18 +106,24 @@ class PaperRuntime:
         if type(request_baseline) is not int or request_baseline < 0:
             raise OperationalError("request baseline must be a non-negative integer")
         self._seen_request = request_baseline
+        self._consumer_lease = consumer_lease
 
     def run(self, bars: Iterable[Bar]) -> RuntimeResult:
-        processed = 0
-        for bar in bars:
-            if self._at_boundary():
-                return RuntimeResult(processed, True, self.coordinator.state)
-            self.coordinator.transition(bar)
-            processed += 1
-            if self.pace_seconds:
-                time.sleep(self.pace_seconds)
-        stopped = self._at_boundary(final=True)
-        return RuntimeResult(processed, stopped, self.coordinator.state)
+        lease = self._consumer_lease or RuntimeConsumerLease(
+            self.coordinator.journal.run_directory).acquire()
+        try:
+            processed = 0
+            for bar in bars:
+                if self._at_boundary():
+                    return RuntimeResult(processed, True, self.coordinator.state)
+                self.coordinator.transition(bar)
+                processed += 1
+                if self.pace_seconds:
+                    time.sleep(self.pace_seconds)
+            stopped = self._at_boundary(final=True)
+            return RuntimeResult(processed, stopped, self.coordinator.state)
+        finally:
+            lease.release()
 
     def _at_boundary(self, *, final: bool = False) -> bool:
         directory = self.coordinator.journal.run_directory

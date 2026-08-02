@@ -1,5 +1,6 @@
 import json
 import signal
+import multiprocessing
 import pytest
 
 from quant_futures.paper_runtime import (OperationalRequests, PaperRuntime,
@@ -8,6 +9,51 @@ from quant_futures.paper_runtime.journal import TransitionJournal
 from quant_futures.product.strategy import FixedStrategy
 
 from test_transition import authorized_coordinator, bar, config
+
+
+def _hold_consumer_lease(directory, ready):
+    from quant_futures.paper_runtime import RuntimeConsumerLease
+    lease = RuntimeConsumerLease(directory).acquire()
+    ready.set()
+    signal.pause()
+    lease.release()
+
+
+def test_consumer_lease_is_process_lifetime_and_status_detects_owner_death(tmp_path):
+    """A killed owner relinquishes the lease and RUNNING becomes stalled."""
+    from quant_futures.paper_runtime import RuntimeConsumerLease, RunLockError
+    from quant_futures.paper_runtime import control as paper_control
+
+    run = paper_control.start(tmp_path / "runs")
+    ready = multiprocessing.Event()
+    process = multiprocessing.Process(target=_hold_consumer_lease, args=(run, ready))
+    process.start()
+    assert ready.wait(5)
+    assert paper_control.project_status(run)["consumer_owner"] == "live"
+    with pytest.raises(RunLockError):
+        RuntimeConsumerLease(run).acquire()
+    process.kill(); process.join(5)
+    assert process.exitcode is not None
+    status = paper_control.project_status(run)
+    assert status["consumer_owner"] == "relinquished"
+    assert status["health"] == "stalled"
+    assert status["stalled"] is True
+
+
+def test_recover_fails_before_mutation_while_live_consumer_owns_run(tmp_path):
+    from quant_futures.paper_runtime import RunLockError
+    from quant_futures.paper_runtime import control as paper_control
+
+    run = paper_control.start(tmp_path / "runs")
+    ready = multiprocessing.Event()
+    process = multiprocessing.Process(target=_hold_consumer_lease, args=(run, ready))
+    process.start(); assert ready.wait(5)
+    lifecycle = (run / "lifecycle.jsonl").read_bytes()
+    with pytest.raises(RunLockError):
+        paper_control.recover(run)
+    assert (run / "lifecycle.jsonl").read_bytes() == lifecycle
+    assert not (run / "recovery-attempts.jsonl").exists()
+    process.kill(); process.join(5)
 
 
 def test_finite_runtime_stops_only_after_committed_boundary(tmp_path):
