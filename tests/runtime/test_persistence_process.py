@@ -121,6 +121,30 @@ def _checkpoint_core(path):
     return value
 
 
+def _product_core(path):
+    """Return the complete Product authority, excluding recovery-only lineage."""
+    value = _checkpoint_core(path)
+    value.pop("lifecycle", None)
+    value.pop("recovery_counter", None)
+    return value
+
+
+def _assert_unique_product_identities(records):
+    selectors = {
+        "journal": [record.journal_event_id for record in records],
+        "input": [record.payload["input_event_id"] for record in records
+                  if record.stage == "transition_started"],
+        "transition": [record.product_transition_id for record in records
+                       if record.stage == "transition_started"],
+        "order": [record.payload["order_id"] for record in records
+                  if record.stage == "order_submitted"],
+        "fill": [record.payload["fill_id"] for record in records
+                 if record.stage == "fill_committed"],
+    }
+    for name, identities in selectors.items():
+        assert len(identities) == len(set(identities)), name
+
+
 def _assert_recovery_chain(path, attempts=2):
     from quant_futures.paper_runtime import RecoveryAttempts
 
@@ -337,13 +361,20 @@ def test_public_recovery_publication_cuts_converge_in_fresh_processes(
 
     config, replay = _write_product_fixture(tmp_path, "current_close")
     run = tmp_path / "recovery-publication"
-    _initialize_product_run(str(run), str(config), str(replay))
-    producer = multiprocessing.Process(
-        target=_produce_product_cut,
-        args=(str(run), str(config), str(replay), 1, "strategy_committed"),
-    )
-    producer.start(); producer.join(20)
-    assert producer.exitcode == 93
+    baseline = tmp_path / "recovery-publication-baseline"
+    for candidate in (baseline, run):
+        _initialize_product_run(str(candidate), str(config), str(replay))
+        producer = multiprocessing.Process(
+            target=_produce_product_cut,
+            args=(str(candidate), str(config), str(replay), 1,
+                  "strategy_committed"),
+        )
+        producer.start(); producer.join(20)
+        assert producer.exitcode == 93
+
+    # The baseline begins at the identical durable incomplete Product prefix,
+    # then converges without a recovery-publication crash.
+    _recover_twice_then_continue(baseline)
 
     crashed = multiprocessing.Process(
         target=_crash_public_recovery, args=(str(run), boundary))
@@ -358,7 +389,7 @@ def test_public_recovery_publication_cuts_converge_in_fresh_processes(
         args=(str(run), "recovery_started_durable"),
     )
     second.start(); second.join(30)
-    assert second.exitcode in {0, 94}
+    assert second.exitcode == 94
     _recover_twice_then_continue(run)
 
     records = RecoveryAttempts(run).read()
@@ -373,5 +404,17 @@ def test_public_recovery_publication_cuts_converge_in_fresh_processes(
     checkpoint = CheckpointStore(run).read()
     assert checkpoint["recovery_counter"] == len(records) // 2
     assert checkpoint["recovery_digest"] == records[-1]["digest"]
-    assert len(list(run.glob(".checkpoint.json.*.tmp"))) <= 1
+    assert list(run.glob(".checkpoint.json.*.tmp")) == []
     assert not RuntimeConsumerLease.is_owned(run)
+
+    # Recovery-publication crashes may add attempts/lifecycle records, but may
+    # never alter the protected Product journal or bounded Product authority.
+    actual = TransitionJournal(run).records()
+    expected = TransitionJournal(baseline).records()
+    assert (run / "transitions.journal").read_bytes() == (
+        baseline / "transitions.journal").read_bytes()
+    assert actual == expected
+    assert _product_core(run) == _product_core(baseline)
+    _assert_unique_product_identities(actual)
+    assert not RuntimeConsumerLease.is_owned(baseline)
+    assert list(baseline.glob(".checkpoint.json.*.tmp")) == []

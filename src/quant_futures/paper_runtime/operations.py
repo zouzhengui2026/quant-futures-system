@@ -128,6 +128,12 @@ class PaperRuntime:
             return RuntimeResult(processed, stopped, self.coordinator.state)
         finally:
             lease.release()
+            # Boundary projection is written while this process still owns the
+            # lifetime lease.  Republish only the disposable status after
+            # relinquishment so a fresh status/audit process observes the exact
+            # post-exit ownership state rather than a stale "live" owner.
+            from .control import write_status
+            write_status(self.coordinator.journal.run_directory)
 
     def _at_boundary(self, *, final: bool = False) -> bool:
         directory = self.coordinator.journal.run_directory
