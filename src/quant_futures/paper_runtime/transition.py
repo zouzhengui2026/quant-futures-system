@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,6 +22,7 @@ from quant_futures.decision.policies import ThresholdDecisionPolicy
 from quant_futures.execution import ExecutionEngine, FixedQuantityExecutionPolicy, PaperExecutionEngine
 from quant_futures.market_data.models import MarketDataKind, MarketDataRecord
 from quant_futures.portfolio import PortfolioLedger, PositionSide
+from quant_futures.portfolio.models import PortfolioSnapshot, PositionSnapshot
 from quant_futures.product.config import ProductConfig
 from quant_futures.product.data import Bar
 from quant_futures.product.engine import _candidate, _position
@@ -129,9 +129,16 @@ class PaperTransitionCoordinator:
         self.run_id, self.config, self.strategy, self.journal = run_id, config, strategy, journal
         self._failure_injector = failure_injector or (lambda boundary: None)
         self.config_digest = config_digest or _digest_value(config.normalized())
-        self.data_fingerprint = data_fingerprint or _data_fingerprint(config)
+        if data_fingerprint is not None:
+            if (not isinstance(data_fingerprint, str)
+                    or not data_fingerprint.startswith("sha256:")
+                    or len(data_fingerprint) != 71
+                    or any(c not in "0123456789abcdef" for c in data_fingerprint[7:])):
+                raise TransitionError("explicit data fingerprint must be a verified SHA-256")
+            self.data_fingerprint = data_fingerprint
+        else:
+            self.data_fingerprint = _data_fingerprint(config)
         self._publish_checkpoints = _publish_checkpoints
-        self._bars: list[Bar] = []
         self._bus = EventBus()
         self._clock = {"value": None}
         self._paper = PaperExecutionEngine(self._bus, lambda: self._clock["value"])
@@ -164,52 +171,18 @@ class PaperTransitionCoordinator:
         self._risk_snapshot = self._portfolio_risk.evaluate(self._account_snapshot)
 
     def _restore_held(self, snapshot: JournalSnapshot) -> None:
-        """Validate a committed checkpoint and reconstruct the canonical authorities."""
+        """Restore bounded Product authority without replaying historical transitions."""
         try:
             store = CheckpointStore(self.journal.run_directory)
             checkpoint_bytes = store.path.read_bytes()
             value = store.read()
             lifecycle_before = Lifecycle(self.journal.run_directory).current()
             _validate_checkpoint(value, self, snapshot, lifecycle_before)
-            bars = tuple(_bar_from_dict(item) for item in value["history"])  # type: ignore[arg-type]
-            with tempfile.TemporaryDirectory() as name:
-                directory = __import__("pathlib").Path(name)
-                lifecycle = Lifecycle(directory)
-                lifecycle.initialize(self.run_id)
-                lifecycle.transition(LifecycleState.STARTING, "restore validation")
-                lifecycle.transition(LifecycleState.RUNNING, "restore validation")
-                rebuilt = PaperTransitionCoordinator(
-                    self.run_id, self.config, self.strategy, TransitionJournal(directory),
-                    config_digest=self.config_digest, data_fingerprint=self.data_fingerprint,
-                    restore_checkpoint=False, _publish_checkpoints=False)
-                for bar in bars:
-                    rebuilt.transition(bar)
-                expected = value["journal"]
-                tail = rebuilt._journal_snapshot.tail
-                if tail is None or {"sequence": tail.sequence, "digest": tail.digest,
-                                    "product_transition_id": tail.product_transition_id,
-                                    "input_cursor": tail.input_cursor} != expected:
-                    raise CheckpointError("checkpoint history does not reconstruct journal authority")
-                # Every field advertised as checkpoint authority must equal the
-                # independently reconstructed Product authority before install.
-                rebuilt_document = rebuilt.checkpoint_document()
-                for section in ("strategy", "history", "execution", "portfolio", "account",
-                                "risk", "counters", "journal"):
-                    if value[section] != rebuilt_document[section]:
-                        raise CheckpointError(f"checkpoint {section} authority mismatch")
-                # Replay uses an isolated temporary authority.  The real run lock
-                # remains held, and all three real authorities are revalidated at
-                # the cut immediately before reconstructed objects are installed.
-                if (store.path.read_bytes() != checkpoint_bytes
-                        or self.journal._snapshot_held() != snapshot
-                        or Lifecycle(self.journal.run_directory).current() != lifecycle_before):
-                    raise CheckpointError("authority changed during restoration")
-                for name in ("strategy", "_bus", "_clock", "_paper", "_ledger", "_account",
-                             "_portfolio_risk", "_closes", "_pending", "_cash_flow", "_cursor",
-                             "_orders", "_fills", "_events", "_portfolio_snapshot",
-                             "_account_snapshot", "_risk_snapshot", "_last_committed_timestamp"):
-                    setattr(self, name, getattr(rebuilt, name))
-                self._bars = list(bars)
+            self._install_bounded_state(value)
+            if (store.path.read_bytes() != checkpoint_bytes
+                    or self.journal._snapshot_held() != snapshot
+                    or Lifecycle(self.journal.run_directory).current() != lifecycle_before):
+                raise CheckpointError("authority changed during restoration")
             self._journal_snapshot = snapshot
         except (CheckpointError, KeyError, OSError, TypeError, ValueError) as exc:
             raise TransitionError(f"authoritative checkpoint restoration failed: {exc}") from exc
@@ -226,18 +199,17 @@ class PaperTransitionCoordinator:
             "cursor": self._cursor,
             "last_committed_ordering_key": self.state.last_committed_ordering_key,
             "strategy": {"name": self.strategy.name, "version": self.strategy.version,
+                         "lookback_bound": _strategy_bound(self.strategy),
                          "closes": list(self._closes)},
-            "history": [_bar_to_dict(bar) for bar in self._bars],
             "execution": {"pending_order_id": (self._pending.order.order_id
                                                  if self._pending else None),
+                          "pending": _pending_payload(self._pending),
                           "orders": self._orders, "fills": self._fills},
-            "portfolio": _positions_payload(self._portfolio_snapshot),
-            "account": {"equity": self._account_snapshot.equity,
-                        "cash_flow": self._cash_flow,
-                        "total_realized_pnl": self._account_snapshot.total_realized_pnl,
-                        "total_unrealized_pnl": self._account_snapshot.total_unrealized_pnl},
-            "risk": {"outcome": self._risk_snapshot.outcome.value,
-                     "drawdown": self._risk_snapshot.drawdown_ratio},
+            "portfolio": _portfolio_authority(self._portfolio_snapshot),
+            "account": _account_authority(self._account_snapshot, self._cash_flow),
+            "risk": _risk_authority(self._risk_snapshot, max(
+                (x.account_snapshot.equity for x in self._portfolio_risk.history()),
+                default=self.config.starting_equity)),
             "counters": {"inputs": self._cursor, "orders": self._orders,
                          "fills": self._fills, "journal_events": self._events},
             "journal": {"sequence": tail.sequence, "digest": tail.digest,
@@ -247,6 +219,52 @@ class PaperTransitionCoordinator:
                           "sequence": lifecycle.sequence},
             "recovery_counter": 0,
         }
+
+    def _install_bounded_state(self, value: dict[str, object]) -> None:
+        """Validate and install exact bounded reconstruction inputs."""
+        strategy = value["strategy"]
+        execution = value["execution"]
+        counters = value["counters"]
+        account = value["account"]
+        risk = value["risk"]
+        if not all(isinstance(x, dict) for x in (strategy, execution, counters, account, risk)):
+            raise CheckpointError("invalid bounded authority sections")
+        closes = strategy.get("closes")
+        if (not isinstance(closes, list) or len(closes) > _strategy_bound(self.strategy)
+                or not all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                           and isfinite(x) for x in closes)):
+            raise CheckpointError("invalid bounded strategy state")
+        self._closes = [float(x) for x in closes]
+        self._cursor = _nonnegative_int(value["cursor"], "cursor")
+        self._orders = _nonnegative_int(execution.get("orders"), "orders")
+        self._fills = _nonnegative_int(execution.get("fills"), "fills")
+        self._events = _nonnegative_int(counters.get("journal_events"), "journal events")
+        if counters != {"inputs": self._cursor, "orders": self._orders,
+                        "fills": self._fills, "journal_events": self._events}:
+            raise CheckpointError("checkpoint counters mismatch")
+        self._cash_flow = _finite_number(account.get("cash_flow"), "cash flow")
+        self._last_committed_timestamp = datetime.fromisoformat(
+            str(value["last_committed_ordering_key"]).replace("Z", "+00:00"))
+        portfolio = _portfolio_from_authority(value["portfolio"])
+        self._ledger.restore_checkpoint(portfolio)
+        self._portfolio_snapshot = self._ledger.snapshot()
+        mark_price = account.get("mark_price")
+        marks = (() if not portfolio.positions else (MarketDataRecord(
+            MarketDataKind.MARK_PRICE, portfolio.positions[0].symbol,
+            portfolio.positions[0].source, self._last_committed_timestamp,
+            {"price": _finite_number(mark_price, "mark price")}),))
+        self._account_snapshot = self._account.value(portfolio, marks, cash_flow=self._cash_flow)
+        self._portfolio_risk.restore_checkpoint_peak(
+            _finite_number(risk.get("peak_equity"), "peak equity"))
+        self._risk_snapshot = self._portfolio_risk.evaluate(self._account_snapshot)
+        if _account_authority(self._account_snapshot, self._cash_flow) != account:
+            raise CheckpointError("checkpoint account authority mismatch")
+        if _risk_authority(self._risk_snapshot, risk["peak_equity"]) != risk:
+            raise CheckpointError("checkpoint risk authority mismatch")
+        self._pending = _restore_pending(execution.get("pending"), self)
+        pending_id = self._pending.order.order_id if self._pending else None
+        if pending_id != execution.get("pending_order_id"):
+            raise CheckpointError("checkpoint pending execution mismatch")
 
     @property
     def state(self) -> PaperTransitionState:
@@ -366,6 +384,7 @@ class PaperTransitionCoordinator:
 
         current = _position(self._ledger, self.config.data.source, self.config.data.symbol)
         self._closes.append(bar.close)
+        del self._closes[:-_strategy_bound(self.strategy)]
         self._failure_injector("strategy")
         normalized = self.strategy.target(StrategyContext(bar, tuple(self._closes),
                                                            current / self.config.risk.max_position))
@@ -431,7 +450,6 @@ class PaperTransitionCoordinator:
         self._cursor = cursor
         self._last_committed_timestamp = bar.timestamp
         self._journal_snapshot = self.journal._snapshot_held()
-        self._bars.append(bar)
         if self._publish_checkpoints:
             self._failure_injector("checkpoint")
             CheckpointStore(self.journal.run_directory)._write_held(self.checkpoint_document())
@@ -447,6 +465,98 @@ def _positions_payload(snapshot: object) -> list[dict[str, object]]:
     ]
 
 
+def _time(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _strategy_bound(strategy: Strategy) -> int:
+    """Fixed documented maximum close window required by Product v0.1 strategies."""
+    if strategy.name == "moving_average_crossover":
+        return int(getattr(strategy, "slow"))
+    if strategy.name == "channel_breakout":
+        return int(getattr(strategy, "lookback")) + 1
+    return 1
+
+
+def _portfolio_authority(snapshot: PortfolioSnapshot) -> list[dict[str, object]]:
+    return [{"source": p.source, "symbol": p.symbol, "quantity": p.signed_quantity,
+             "side": p.side.value, "average_entry_price": p.average_entry_price,
+             "realized_pnl": p.realized_pnl, "updated_at": _time(p.updated_at),
+             "last_order_id": p.last_order_id} for p in snapshot.positions]
+
+
+def _portfolio_from_authority(value: object) -> PortfolioSnapshot:
+    if not isinstance(value, list):
+        raise CheckpointError("invalid portfolio authority")
+    positions = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"source", "symbol", "quantity", "side",
+                "average_entry_price", "realized_pnl", "updated_at", "last_order_id"}:
+            raise CheckpointError("invalid portfolio position authority")
+        positions.append(PositionSnapshot(
+            item["source"], item["symbol"], item["quantity"], PositionSide(item["side"]),
+            item["average_entry_price"], item["realized_pnl"],
+            datetime.fromisoformat(str(item["updated_at"]).replace("Z", "+00:00")),
+            item["last_order_id"]))
+    return PortfolioLedger._make_snapshot({(p.source, p.symbol): p for p in positions})
+
+
+def _account_authority(snapshot: object, cash_flow: float) -> dict[str, object]:
+    return {"equity": snapshot.equity, "cash_flow": cash_flow,
+            "total_realized_pnl": snapshot.total_realized_pnl,
+            "total_unrealized_pnl": snapshot.total_unrealized_pnl,
+            "mark_price": (snapshot.valuations[0].mark_price if snapshot.valuations else None),
+            "valued_at": _time(snapshot.valued_at)}
+
+
+def _risk_authority(snapshot: object, peak: object) -> dict[str, object]:
+    return {"outcome": snapshot.outcome.value, "drawdown": snapshot.drawdown_ratio,
+            "peak_equity": peak}
+
+
+def _pending_payload(intent: object | None) -> dict[str, object] | None:
+    if intent is None:
+        return None
+    observation = intent.risk_assessment.decision_intent.alpha_candidate.observation
+    signed = intent.order.quantity * (1 if intent.order.side.value == "buy" else -1)
+    return {"order_id": intent.order.order_id, "quantity": signed,
+            "timestamp": _time(observation.timestamp), "price": observation.price}
+
+
+def _restore_pending(value: object, coordinator: PaperTransitionCoordinator) -> object | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"order_id", "quantity", "timestamp", "price"}:
+        raise CheckpointError("invalid pending execution authority")
+    quantity = _finite_number(value["quantity"], "pending quantity")
+    timestamp = datetime.fromisoformat(str(value["timestamp"]).replace("Z", "+00:00"))
+    price = _finite_number(value["price"], "pending price")
+    direction = AlphaDirection.LONG if quantity > 0 else AlphaDirection.SHORT
+    synthetic = Bar(timestamp, price, price, price, price, 0.0, None)
+    decision = DecisionEngine(coordinator._bus, ThresholdDecisionPolicy(
+        clock=lambda: timestamp)).decide(_candidate(coordinator.config, synthetic, direction))
+    assessment = RiskEngine(coordinator._bus, ThresholdRiskPolicy(
+        clock=lambda: timestamp)).assess(decision)
+    intent = ExecutionEngine(coordinator._bus, FixedQuantityExecutionPolicy(
+        abs(quantity), clock=lambda: timestamp,
+        order_id_factory=lambda: value["order_id"])).create_intent(assessment)
+    coordinator._clock["value"] = timestamp
+    coordinator._paper.submit(intent)
+    return intent
+
+
+def _finite_number(value: object, name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value):
+        raise CheckpointError(f"invalid checkpoint {name}")
+    return float(value)
+
+
+def _nonnegative_int(value: object, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise CheckpointError(f"invalid checkpoint {name}")
+    return value
+
+
 def _digest_value(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=True).encode("ascii")).hexdigest()
@@ -455,13 +565,19 @@ def _digest_value(value: object) -> str:
 def _data_fingerprint(config: ProductConfig) -> str:
     """Bind local replay identities to content, not merely to a pathname."""
     path = Path(config.data.path)
-    content_digest = None
-    if path.is_file():
-        content_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if not path.is_file():
+        raise TransitionError("replay data requires a readable regular file or explicit verified fingerprint")
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise TransitionError("replay data content cannot be verified") from exc
     return _digest_value({
         "path": config.data.path, "source": config.data.source,
         "symbol": config.data.symbol, "timeframe": config.data.timeframe,
-        "content_sha256": content_digest,
+        "content_sha256": digest.hexdigest(),
     })
 
 
@@ -484,7 +600,7 @@ def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionC
                          snapshot: JournalSnapshot, lifecycle: object) -> None:
     fields = {"schema_version", "run_id", "checkpoint_sequence", "config_digest",
               "data_fingerprint", "cursor", "last_committed_ordering_key", "strategy",
-              "history", "execution", "portfolio", "account", "risk", "counters",
+              "execution", "portfolio", "account", "risk", "counters",
               "journal", "lifecycle", "recovery_counter"}
     if set(value) != fields or value["schema_version"] != 1:
         raise CheckpointError("unsupported checkpoint schema")
@@ -497,11 +613,11 @@ def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionC
     cursor = value["cursor"]
     if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 1 or value["checkpoint_sequence"] != cursor:
         raise CheckpointError("invalid checkpoint cursor")
-    if not isinstance(value["history"], list) or len(value["history"]) != cursor:
-        raise CheckpointError("checkpoint history/cursor mismatch")
     strategy = value["strategy"]
     if not isinstance(strategy, dict) or strategy.get("name") != coordinator.strategy.name or strategy.get("version") != coordinator.strategy.version:
         raise CheckpointError("unsupported strategy identity or version")
+    if strategy.get("lookback_bound") != _strategy_bound(coordinator.strategy):
+        raise CheckpointError("strategy lookback mismatch")
     tail = snapshot.tail
     if tail is None or value["journal"] != {"sequence": tail.sequence, "digest": tail.digest,
                                             "product_transition_id": tail.product_transition_id,

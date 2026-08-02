@@ -7,7 +7,7 @@ from contextvars import ContextVar
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
-from math import fsum
+from math import fsum, isfinite
 from threading import RLock, local
 from weakref import ReferenceType, WeakKeyDictionary, ref
 
@@ -82,6 +82,7 @@ class PortfolioRiskEngine:
     _history: list[PortfolioRiskSnapshot] = field(init=False, repr=False)
     _lock: RLock = field(init=False, repr=False)
     _transition_active: bool = field(init=False, repr=False)
+    _checkpoint_peak_equity: float | None = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.event_bus, EventBus):
@@ -93,6 +94,7 @@ class PortfolioRiskEngine:
         self._history = []
         self._lock = RLock()
         self._transition_active = False
+        self._checkpoint_peak_equity = None
         limits_values = tuple(
             (item.name, getattr(self.limits, item.name))
             for item in fields(PortfolioRiskLimits)
@@ -125,8 +127,11 @@ class PortfolioRiskEngine:
             largest = max((e.position_notional for e in exposure_tuple), default=0.0)
             concentration = 0.0 if gross == 0 else largest / gross
             multiple = None if account_snapshot.equity <= 0 else gross / account_snapshot.equity
-            previous_peak = max((item.account_snapshot.equity for item in _anchor(self).history),
-                                default=account_snapshot.starting_equity)
+            previous_peak = max(
+                (item.account_snapshot.equity for item in _anchor(self).history),
+                default=(self._checkpoint_peak_equity
+                         if self._checkpoint_peak_equity is not None
+                         else account_snapshot.starting_equity))
             peak = max(previous_peak, account_snapshot.equity)
             drawdown = 0.0 if peak <= 0 else (peak - account_snapshot.equity) / peak
             breach_tuple = build_portfolio_risk_breaches(
@@ -158,6 +163,16 @@ class PortfolioRiskEngine:
                 "breaches": snapshot.breaches,
             }, occurred_at=snapshot.evaluated_at))
             return snapshot
+
+    def restore_checkpoint_peak(self, peak_equity: float) -> None:
+        """Restore the bounded peak required for exact drawdown continuation."""
+        if (not isinstance(peak_equity, (int, float)) or isinstance(peak_equity, bool)
+                or not isfinite(peak_equity) or peak_equity < 0):
+            raise PortfolioRiskError("checkpoint peak equity must be finite and non-negative")
+        with _anchor(self).lock:
+            if _anchor(self).history:
+                raise PortfolioRiskError("checkpoint restore requires a fresh risk engine")
+            self._checkpoint_peak_equity = float(peak_equity)
 
     def latest(self) -> PortfolioRiskSnapshot:
         with _anchor(self).lock:

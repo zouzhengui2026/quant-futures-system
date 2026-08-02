@@ -54,9 +54,12 @@ and tail digest from a lock-consistent snapshot. Incremental market-event transi
 Product strategy, execution, portfolio, account, and risk authorities under one writer lock.
 After each durable `transition_committed` record, a versioned canonical `checkpoint.json` is
 published with atomic same-directory replacement, file and directory fsync. It records the
-committed cursor/order key, input and strategy history, pending execution, canonical authority
-outputs, counters/cash flow, lifecycle and journal lineage, and configuration/data identities.
-A fresh coordinator validates those identities and reconstructs the real Product authorities,
+committed cursor/order key, a fixed strategy-lookback window, pending execution, bounded
+portfolio/account/risk authority, counters/cash flow, lifecycle and journal lineage, and
+configuration/data identities. Checkpoint size and publication work therefore do not grow with
+processed bars. Replay identity is bound to a streaming SHA-256 content digest, or to an explicit
+externally verified SHA-256 fingerprint; unreadable replay content never silently downgrades the
+identity. A fresh coordinator validates those identities and restores the real Product authorities
 including a pending next-open order, before accepting the next input. Corrupt, stale, foreign,
 or incomplete checkpoints fail closed rather than falling back to empty state. `recover` is legal
 only for a persisted

@@ -15,6 +15,8 @@ from quant_futures.product.data import Bar
 from quant_futures.product.engine import simulate
 from quant_futures.product.strategy import FixedStrategy, HoldStrategy
 
+VERIFIED_DATA = "sha256:" + "1" * 64
+
 
 class SequenceStrategy:
     name = "sequence"
@@ -67,13 +69,15 @@ def authorized_coordinator(run_id, cfg, strategy, journal, failure_injector=None
     lifecycle_path = journal.run_directory / Lifecycle.filename
     if not lifecycle_path.exists():
         running_lifecycle(journal.run_directory, run_id)
-    return PaperTransitionCoordinator(run_id, cfg, strategy, journal, failure_injector)
+    return PaperTransitionCoordinator(run_id, cfg, strategy, journal, failure_injector,
+                                      data_fingerprint=VERIFIED_DATA)
 
 
 def _run_slow_transition(path, entered, release, outcomes):
     try:
         coordinator = PaperTransitionCoordinator(
-            "process-run", config(), SlowStrategy(entered, release), TransitionJournal(path))
+            "process-run", config(), SlowStrategy(entered, release), TransitionJournal(path),
+            data_fingerprint=VERIFIED_DATA)
         coordinator.transition(bar(0))
         outcomes.put(("transition", "committed"))
     except BaseException as exc:
@@ -83,7 +87,8 @@ def _run_slow_transition(path, entered, release, outcomes):
 def _attempt_transition(path, outcomes):
     try:
         coordinator = PaperTransitionCoordinator(
-            "process-run", config(), HoldStrategy(), TransitionJournal(path))
+            "process-run", config(), HoldStrategy(), TransitionJournal(path),
+            data_fingerprint=VERIFIED_DATA)
         coordinator.transition(bar(1))
         outcomes.put(("second", "committed"))
     except BaseException as exc:
@@ -124,7 +129,8 @@ def test_transition_requires_running_matching_lifecycle_authority(tmp_path, auth
     elif authority == "wrong-run":
         running_lifecycle(tmp_path, "different-run")
     coordinator = PaperTransitionCoordinator(
-        "authority-run", config(), HoldStrategy(), TransitionJournal(tmp_path))
+        "authority-run", config(), HoldStrategy(), TransitionJournal(tmp_path),
+        data_fingerprint=VERIFIED_DATA)
     before = (tmp_path / "transitions.journal").read_bytes() if (
         tmp_path / "transitions.journal").exists() else b""
     with pytest.raises(TransitionError, match="lifecycle"):
