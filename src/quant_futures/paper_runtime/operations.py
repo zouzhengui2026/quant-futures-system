@@ -64,12 +64,18 @@ class OperationalRequests:
         if command not in {"pause", "resume", "stop"}:
             raise OperationalError(f"unsupported operational request: {command}")
         with RunDirectoryLock(self.run_directory):
-            current = self._read_held()
-            sequence = int(current.get("sequence", 0)) + 1 if current else 1
-            value = {"schema_version": 1, "sequence": sequence, "command": command}
-            _atomic_projection(self.path, value)
-            _fsync_directory(self.run_directory)
-            return value
+            return self._request_held(command)
+
+    def _request_held(self, command: str) -> dict[str, object]:
+        """Publish a request while the caller holds ``RunDirectoryLock``."""
+        if command not in {"pause", "resume", "stop"}:
+            raise OperationalError(f"unsupported operational request: {command}")
+        current = self._read_held()
+        sequence = int(current.get("sequence", 0)) + 1 if current else 1
+        value = {"schema_version": 1, "sequence": sequence, "command": command}
+        _atomic_projection(self.path, value)
+        _fsync_directory(self.run_directory)
+        return value
 
     def _read_held(self) -> dict[str, object] | None:
         if not self.path.exists():
@@ -89,14 +95,16 @@ class PaperRuntime:
     """Finite one-event-at-a-time service around the domain coordinator."""
 
     def __init__(self, coordinator: PaperTransitionCoordinator, *, pace_seconds: float = 0,
-                 stop_flag: StopFlag | None = None) -> None:
+                 stop_flag: StopFlag | None = None, request_baseline: int = 0) -> None:
         if not isinstance(pace_seconds, (int, float)) or pace_seconds < 0:
             raise OperationalError("pace must be non-negative")
         self.coordinator = coordinator
         self.pace_seconds = float(pace_seconds)
         self.stop_flag = stop_flag or StopFlag()
         self.requests = OperationalRequests(coordinator.journal.run_directory)
-        self._seen_request = 0
+        if type(request_baseline) is not int or request_baseline < 0:
+            raise OperationalError("request baseline must be a non-negative integer")
+        self._seen_request = request_baseline
 
     def run(self, bars: Iterable[Bar]) -> RuntimeResult:
         processed = 0

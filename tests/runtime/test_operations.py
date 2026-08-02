@@ -55,6 +55,70 @@ def test_committed_pause_terminates_runtime_ownership(tmp_path):
     assert Lifecycle(tmp_path).current().state is LifecycleState.PAUSED
 
 
+def _runtime_files(root):
+    replay = root / "bars.csv"
+    replay.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "2025-01-01T00:00:00Z,100,101,99,100,1\n"
+        "2025-01-01T01:00:00Z,100,102,99,101,1\n", encoding="utf-8")
+    config_path = root / "paper.yml"
+    config_path.write_text(
+        "mode: paper\n"
+        "data:\n  path: bars.csv\n  source: test\n  symbol: BTC\n  timeframe: 1h\n"
+        "strategy:\n  name: flat\n  parameters: {}\n"
+        "fill_timing: current_close\noutput_directory: .\n", encoding="utf-8")
+    return config_path, replay
+
+
+def test_fresh_runtime_pause_resume_baselines_consumed_request(tmp_path):
+    """A reopened runtime cannot replay the pause request consumed by its predecessor."""
+    from dataclasses import replace
+    from quant_futures.paper_runtime import Lifecycle, LifecycleState, PaperTransitionCoordinator
+    from quant_futures.paper_runtime import control as paper_control
+    from quant_futures.product.config import load_config
+    from quant_futures.product.data import load_bars
+    from quant_futures.product.strategy import build_strategy
+
+    config_path, replay = _runtime_files(tmp_path)
+    run = paper_control.start(tmp_path / "runs")
+    paper_control.write_runtime_metadata(run, config_path, replay)
+    cfg = load_config(config_path)
+    cfg = replace(cfg, data=replace(cfg.data, path=str(replay)))
+    bars, fingerprint = load_bars(replay, cfg.data.schema, timeframe=cfg.data.timeframe)
+    lifecycle = Lifecycle(run)
+    coordinator = PaperTransitionCoordinator(
+        lifecycle.current().run_id, cfg,
+        build_strategy(cfg.strategy.name, cfg.strategy.parameters),
+        TransitionJournal(run), data_fingerprint=f"sha256:{fingerprint}")
+
+    pause = OperationalRequests(run).request("pause")
+    first = PaperRuntime(coordinator).run(bars)
+    assert first.processed == 0
+    assert lifecycle.current().state is LifecycleState.PAUSED
+
+    resumed = paper_control.resume_runtime(run)
+    assert resumed.processed == len(bars)
+    assert lifecycle.current().state is LifecycleState.COMPLETED
+    assert OperationalRequests(run)._read_held()["sequence"] == pause["sequence"] + 1
+
+
+def test_paused_stop_completes_without_a_consumer(tmp_path):
+    from quant_futures.paper_runtime import Lifecycle, LifecycleState
+    from quant_futures.paper_runtime import control as paper_control
+
+    config_path, replay = _runtime_files(tmp_path)
+    run = paper_control.start(tmp_path / "runs")
+    paper_control.write_runtime_metadata(run, config_path, replay)
+    paper_control.transition(run, LifecycleState.PAUSED, "test relinquished pause")
+
+    paper_control.request_stop(run)
+    assert Lifecycle(run).current().state is LifecycleState.COMPLETED
+    # Repeated stop is deterministic and does not add lifecycle records.
+    before = (run / "lifecycle.jsonl").read_bytes()
+    paper_control.request_stop(run)
+    assert (run / "lifecycle.jsonl").read_bytes() == before
+
+
 def test_recovery_attempt_authority_is_monotonic_and_hash_chained(tmp_path):
     attempts = RecoveryAttempts(tmp_path)
     assert attempts.append_held("run", "started") == 1

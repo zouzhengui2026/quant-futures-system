@@ -218,6 +218,53 @@ def stop(run_directory: str | Path) -> LifecycleRecord:
         return record
 
 
+def resume_runtime(run_directory: str | Path, *, install_signals: bool = False) -> object:
+    """Atomically hand a relinquished PAUSED run to exactly one new consumer.
+
+    The newer durable resume request and RUNNING lifecycle transition share the
+    run lock.  The returned sequence is handed directly to the new runtime as
+    its consumed baseline, so the pause request that stopped the old owner can
+    never be replayed while any still-later request remains observable.
+    """
+    from .operations import OperationalRequests
+
+    directory = Path(run_directory)
+    with RunDirectoryLock(directory):
+        lifecycle = Lifecycle(directory)
+        state = lifecycle.current().state
+        if state is not LifecycleState.PAUSED:
+            raise LifecycleError("runtime resume requires PAUSED authority")
+        request = OperationalRequests(directory)._request_held("resume")
+        lifecycle._transition_held(LifecycleState.RUNNING, "existing runtime reopened")
+        _write_status_held(lifecycle)
+        baseline = int(request["sequence"])
+    return continue_runtime(directory, install_signals=install_signals,
+                            request_baseline=baseline)
+
+
+def request_stop(run_directory: str | Path) -> LifecycleRecord | dict[str, object]:
+    """Stop a relinquished PAUSED run directly, or request a live boundary stop."""
+    from .operations import OperationalRequests
+
+    directory = Path(run_directory)
+    with RunDirectoryLock(directory):
+        lifecycle = Lifecycle(directory)
+        state = lifecycle.current().state
+        if state is LifecycleState.RUNNING:
+            return OperationalRequests(directory)._request_held("stop")
+        if state is LifecycleState.PAUSED:
+            OperationalRequests(directory)._request_held("stop")
+            lifecycle._transition_held(LifecycleState.STOPPING,
+                                       "relinquished paused runtime stopped")
+            record = lifecycle._transition_held(
+                LifecycleState.COMPLETED, "final committed boundary retained")
+            _write_status_held(lifecycle)
+            return record
+        if state is LifecycleState.COMPLETED:
+            return lifecycle.current()
+        raise LifecycleError(f"runtime stop is illegal from {state.value}")
+
+
 def _publish_recovery_commitment_held(directory: Path) -> None:
     """Atomically bind the completed recovery invocation into the checkpoint."""
     from .operations import RecoveryAttempts
@@ -414,7 +461,8 @@ def _recover_product_suffix_held(directory: Path, run_id: str,
         raise TransitionError(f"cannot recover product transition: {exc}") from exc
 
 
-def continue_runtime(run_directory: str | Path, *, install_signals: bool = False) -> object:
+def continue_runtime(run_directory: str | Path, *, install_signals: bool = False,
+                     request_baseline: int = 0) -> object:
     """Reopen one existing run and consume only bars after its durable cursor."""
     from dataclasses import replace
     from quant_futures.product.config import load_config
@@ -446,7 +494,7 @@ def continue_runtime(run_directory: str | Path, *, install_signals: bool = False
     if install_signals:
         flag.install()
     return PaperRuntime(coordinator, pace_seconds=float(metadata["pace_seconds"]),
-                        stop_flag=flag).run(bars[cursor:])
+                        stop_flag=flag, request_baseline=request_baseline).run(bars[cursor:])
 
 
 def audit(run_directory: str | Path) -> bool:

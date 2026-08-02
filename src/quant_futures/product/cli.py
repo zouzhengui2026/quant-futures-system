@@ -85,15 +85,10 @@ def main(argv: list[str] | None = None) -> int:
                     paper_control.transition(args.run_directory, LifecycleState.PAUSED, "pause requested")
             elif args.paper_command == "resume":
                 if (Path(args.run_directory) / "runtime.json").exists():
-                    # A crashed PAUSED run has no service to consume a request.
-                    # Reopen it here; a live runtime observes the same durable
-                    # lifecycle transition at its next committed boundary.
                     status = paper_control.project_status(args.run_directory)
                     if status["lifecycle"] == LifecycleState.PAUSED.value:
-                        paper_control.transition(args.run_directory, LifecycleState.RUNNING,
-                                                 "existing runtime reopened")
-                        paper_control.continue_runtime(args.run_directory,
-                                                       install_signals=True)
+                        paper_control.resume_runtime(args.run_directory,
+                                                     install_signals=True)
                     else:
                         from quant_futures.paper_runtime import OperationalRequests
                         OperationalRequests(args.run_directory).request("resume")
@@ -101,8 +96,7 @@ def main(argv: list[str] | None = None) -> int:
                     paper_control.transition(args.run_directory, LifecycleState.RUNNING, "resume requested")
             elif args.paper_command == "stop":
                 if (Path(args.run_directory) / "runtime.json").exists():
-                    from quant_futures.paper_runtime import OperationalRequests
-                    OperationalRequests(args.run_directory).request("stop")
+                    paper_control.request_stop(args.run_directory)
                 else:
                     paper_control.stop(args.run_directory)
             elif args.paper_command == "recover":
