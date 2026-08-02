@@ -179,6 +179,35 @@ def _checkpoint_product_core(checkpoint):
             if key not in {"lifecycle", "recovery_counter", "recovery_digest"}}
 
 
+def test_audit_requires_checkpoint_independently_of_rewritten_status(tmp_path):
+    """Disposable status cannot bless missing or corrupt Product authority."""
+    from quant_futures.paper_runtime import control as paper_control
+
+    config_path, replay = _runtime_files(tmp_path)
+    env = _source_cli_env()[1]
+    env["QFS_RUNTIME_TEST_ROOT"] = str(tmp_path / "runs")
+    env["QFS_RUNTIME_TEST_RUN_ID"] = "a" * 32
+    started = subprocess.run(
+        [sys.executable, "-m", "quant_futures.product.cli", "paper", "start",
+         "--config", str(config_path), "--replay", str(replay), "--pace", "0s"],
+        cwd=Path(__file__).parents[2], env=env, text=True, capture_output=True, timeout=20)
+    assert started.returncode == 0, started.stderr
+    run = tmp_path / "runs" / ("a" * 32)
+    checkpoint = run / "checkpoint.json"
+    original = checkpoint.read_bytes()
+
+    checkpoint.unlink()
+    # Reproduce the formerly vulnerable condition: status is regenerated to
+    # exactly the projection produced when the checkpoint is treated absent.
+    (run / "status.json").write_text(
+        json.dumps(paper_control.project_status(run), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8")
+    assert not paper_control.audit(run)
+
+    checkpoint.write_bytes(original[:-1] + b" ")
+    assert not paper_control.audit(run)
+
+
 def _assert_terminal_authority(run):
     from quant_futures.paper_runtime import (CheckpointStore, Lifecycle,
                                                LifecycleState,

@@ -228,6 +228,22 @@ def test_paper_audit_does_not_reject_similarly_named_operator_file(tmp_path: Pat
     assert paper_control.audit(directory)
 
 
+@pytest.mark.parametrize("entry_kind", ["directory", "broken-symlink"])
+def test_paper_audit_rejects_non_file_protocol_temporary_entries(
+    tmp_path: Path, entry_kind: str,
+) -> None:
+    directory = start(tmp_path)
+    artifact = directory / ".checkpoint.json.crash.tmp"
+    if entry_kind == "directory":
+        artifact.mkdir()
+    else:
+        try:
+            artifact.symlink_to(directory / "missing-target")
+        except (NotImplementedError, OSError):
+            pytest.skip("symbolic links are unavailable on this platform")
+    assert not paper_control.audit(directory)
+
+
 @pytest.mark.parametrize("corruption", ["tamper", "truncate", "duplicate", "reorder"])
 def test_paper_audit_journal_corruption_returns_exit_three(
     tmp_path: Path, corruption: str, capsys: pytest.CaptureFixture[str],

@@ -11,9 +11,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
-
 def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, env=env, text=True,
                           capture_output=True, timeout=60, check=False)
@@ -26,12 +23,11 @@ def test_built_wheel_console_script_runs_without_source_tree_imports(tmp_path: P
     environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
-    built = subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps",
+    built = subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-build-isolation", "--no-deps",
                             "--wheel-dir", str(wheelhouse), str(repository)],
                            cwd=tmp_path, env=environment, capture_output=True,
                            text=True, timeout=120, check=False)
-    if built.returncode:
-        pytest.skip(f"isolated build dependencies unavailable: {built.stderr[-300:]}")
+    assert built.returncode == 0, built.stderr
     wheels = list(wheelhouse.glob("quant_futures_system-*.whl"))
     assert len(wheels) == 1
     venv = tmp_path / "venv"
@@ -42,11 +38,19 @@ def test_built_wheel_console_script_runs_without_source_tree_imports(tmp_path: P
     console = venv / "bin" / "quant-futures"
 
     imported = _run([str(python), "-c",
-        "import json,quant_futures; print(json.dumps(quant_futures.__path__._path))"],
+        "import json,quant_futures; print(json.dumps(list(quant_futures.__path__)))"],
         cwd=tmp_path, env=environment)
     assert imported.returncode == 0, imported.stderr
     import_paths = json.loads(imported.stdout)
     assert import_paths and all(str(repository / "src") not in path for path in import_paths)
+    assert all(str(venv) in path for path in import_paths)
+    provenance = _run([str(python), "-c",
+        "import importlib.metadata as m,quant_futures.product.cli as c; "
+        "print(m.version('quant-futures-system')); print(c.__file__)"],
+        cwd=tmp_path, env=environment)
+    assert provenance.returncode == 0, provenance.stderr
+    assert provenance.stdout.splitlines()[0] == "0.1.0"
+    assert str(venv) in provenance.stdout and str(repository) not in provenance.stdout
 
     runtime_root = tmp_path / "installed-runs"
     environment["QFS_RUNTIME_TEST_ROOT"] = str(runtime_root)

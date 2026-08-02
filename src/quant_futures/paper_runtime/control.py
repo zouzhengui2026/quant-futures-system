@@ -54,10 +54,8 @@ def _project_status_held(
     status = _status_for_record(record, journal_tail)
     # A checkpoint is authoritative only when it names the validated committed
     # tail.  Status never attempts to repair or infer trading state.
-    try:
-        checkpoint = CheckpointStore(lifecycle.run_directory).read()
-    except CheckpointError:
-        checkpoint = None
+    checkpoint_path = lifecycle.run_directory / CheckpointStore.filename
+    checkpoint = CheckpointStore(lifecycle.run_directory).read() if checkpoint_path.exists() else None
     if (checkpoint is not None and journal_tail is not None
             and isinstance(checkpoint.get("journal"), dict)
             and checkpoint["journal"].get("digest") == journal_tail.digest):
@@ -571,8 +569,27 @@ def audit(run_directory: str | Path) -> bool:
                 ".runtime.json.*.tmp",
                 ".control-request.json.*.tmp",
             )
-            if any(candidate.is_file() for pattern in temporary_patterns
+            if any(candidate.exists() or candidate.is_symlink() for pattern in temporary_patterns
                    for candidate in directory.glob(pattern)):
+                return False
+            # Once product authority exists, its complete-boundary checkpoint
+            # is independently mandatory.  Disposable status must never make
+            # a missing, malformed, stale, or foreign checkpoint acceptable.
+            checkpoint_path = directory / CheckpointStore.filename
+            journal = TransitionJournal(directory)._snapshot_held()
+            product_protocol = (directory / "runtime.json").exists()
+            if journal.tail is not None and product_protocol:
+                checkpoint = CheckpointStore(directory).read()
+                authority = checkpoint.get("journal")
+                if (not isinstance(authority, dict)
+                        or authority.get("sequence") != journal.tail.sequence
+                        or authority.get("digest") != journal.tail.digest
+                        or checkpoint.get("run_id") != lifecycle.current().run_id
+                        or authority.get("input_cursor") != journal.tail.input_cursor):
+                    return False
+            elif checkpoint_path.exists() and journal.tail is None:
+                # A checkpoint without a committed product journal has no
+                # coherent authority boundary.
                 return False
     except (LifecycleError, JournalError, CheckpointError, OSError, UnicodeDecodeError,
             json.JSONDecodeError, ValueError, OperationalError):
