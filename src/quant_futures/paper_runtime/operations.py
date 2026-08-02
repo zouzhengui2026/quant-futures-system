@@ -160,11 +160,40 @@ class RecoveryAttempts:
             return self.append_held(run_id, outcome)
 
     def append_held(self, run_id: str, outcome: str) -> int:
+        if (not isinstance(run_id, str) or not run_id
+                or outcome not in {"started", "recovered", "no-op", "failed"}):
+            raise OperationalError("invalid recovery attempt record")
         records = self.read()
         previous = records[-1] if records else None
+        if previous is not None:
+            if previous["run_id"] != run_id:
+                raise OperationalError("recovery run ID changed")
+            if ((outcome == "started") == (previous["outcome"] == "started")):
+                raise OperationalError("invalid recovery outcome lineage")
         sequence = len(records) + 1
+        from .journal import TransitionJournal
+        from .checkpoint import CheckpointStore
+        from .lifecycle import Lifecycle
+        try:
+            tail = TransitionJournal(self.run_directory)._snapshot_held().tail
+        except Exception:
+            # A failed attempt must still be durable when the product journal
+            # itself is the authority that needs repair or classification.
+            tail = None
+        checkpoint = CheckpointStore(self.run_directory)
+        checkpoint_digest = (hashlib.sha256(checkpoint.path.read_bytes()).hexdigest()
+                             if checkpoint.path.exists() else None)
+        try:
+            lifecycle_sequence = Lifecycle(self.run_directory).current().sequence
+        except Exception:
+            # Kept only for isolated authority-unit construction. Runtime
+            # recovery always has lifecycle authority and therefore a >0 anchor.
+            lifecycle_sequence = 0
         unsigned = {"schema_version": 1, "run_id": run_id, "sequence": sequence,
-                    "outcome": outcome, "previous_digest": previous["digest"] if previous else None}
+                    "outcome": outcome, "previous_digest": previous["digest"] if previous else None,
+                    "journal_digest": tail.digest if tail else None,
+                    "checkpoint_digest": checkpoint_digest,
+                    "lifecycle_sequence": lifecycle_sequence}
         unsigned["digest"] = hashlib.sha256(json.dumps(unsigned, sort_keys=True,
             separators=(",", ":")).encode("ascii")).hexdigest()
         with self.path.open("a", encoding="ascii") as stream:
@@ -185,12 +214,28 @@ class RecoveryAttempts:
         for number, line in enumerate(self.path.read_text(encoding="ascii").splitlines(), 1):
             try: value = json.loads(line)
             except json.JSONDecodeError as exc: raise OperationalError("corrupt recovery authority") from exc
+            if (not isinstance(value, dict) or set(value) != {"schema_version", "run_id",
+                    "sequence", "outcome", "previous_digest", "journal_digest",
+                    "checkpoint_digest", "lifecycle_sequence", "digest"}):
+                raise OperationalError("corrupt recovery authority schema")
             digest = value.pop("digest", None)
             expected = hashlib.sha256(json.dumps(value, sort_keys=True,
                 separators=(",", ":")).encode("ascii")).hexdigest()
             value["digest"] = digest
-            if (digest != expected or value.get("sequence") != number
+            if (digest != expected or value.get("schema_version") != 1
+                    or type(value.get("sequence")) is not int or value["sequence"] != number
+                    or not isinstance(value.get("run_id"), str) or not value["run_id"]
+                    or value.get("outcome") not in {"started", "recovered", "no-op", "failed"}
+                    or type(value.get("lifecycle_sequence")) is not int
+                    or value["lifecycle_sequence"] < 0
+                    or any(x is not None and (not isinstance(x, str) or len(x) != 64)
+                           for x in (value.get("previous_digest"), value.get("journal_digest"),
+                                     value.get("checkpoint_digest")))
                     or value.get("previous_digest") != previous):
                 raise OperationalError("corrupt recovery authority")
+            if result and (result[-1]["run_id"] != value["run_id"]
+                    or ((value["outcome"] == "started") ==
+                        (result[-1]["outcome"] == "started"))):
+                raise OperationalError("corrupt recovery outcome lineage")
             previous = digest; result.append(value)
         return result

@@ -202,6 +202,8 @@ class PaperTransitionCoordinator:
             lifecycle_before = Lifecycle(self.journal.run_directory).current()
             _validate_checkpoint(value, self, snapshot, lifecycle_before)
             self._install_bounded_state(value)
+            self._checkpoint_lifecycle_override = value["lifecycle"]
+            self._checkpoint_recovery_override = value["recovery_counter"]
             if (store.path.read_bytes() != checkpoint_bytes
                     or self.journal._snapshot_held() != (authority_snapshot or snapshot)
                     or Lifecycle(self.journal.run_directory).current() != lifecycle_before):
@@ -235,9 +237,11 @@ class PaperTransitionCoordinator:
             "journal": {"sequence": tail.sequence, "digest": tail.digest,
                         "product_transition_id": tail.product_transition_id,
                         "input_cursor": tail.input_cursor},
-            "lifecycle": {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
-                          "sequence": lifecycle.sequence},
-            "recovery_counter": 0,
+            "lifecycle": getattr(self, "_checkpoint_lifecycle_override",
+                                 {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
+                                  "sequence": lifecycle.sequence}),
+            "recovery_counter": getattr(self, "_checkpoint_recovery_override",
+                                        _recovery_counter(self.journal.run_directory)),
         }
         document["state_digest"] = _bounded_state_digest(document)
         return document
@@ -375,7 +379,8 @@ class PaperTransitionCoordinator:
             lifecycle = Lifecycle(self.journal.run_directory).current()
         except LifecycleError as exc:
             raise TransitionError("valid lifecycle authority is required for a market transition") from exc
-        if lifecycle.run_id != self.run_id or lifecycle.state is not LifecycleState.RUNNING:
+        if (lifecycle.run_id != self.run_id
+                or lifecycle.state not in {LifecycleState.RUNNING, LifecycleState.RECOVERING}):
             raise TransitionError("lifecycle is not eligible for a market transition")
         if bar.timestamp.tzinfo is None or bar.timestamp.utcoffset() is None:
             raise TransitionError("market timestamp must be timezone-aware")
@@ -517,7 +522,7 @@ class PaperTransitionCoordinator:
         final_events = self._events + 1
         state_for_digest = self._bounded_state_for_commit(cursor, bar.timestamp, final_events,
                                                           lifecycle)
-        state_digest = _digest_value(state_for_digest)
+        state_digest = _bounded_state_digest(state_for_digest)
         emit("transition_committed", {"orders": self._orders, "fills": self._fills,
                                       "state_digest": state_digest})
         protocol.complete()
@@ -549,7 +554,8 @@ class PaperTransitionCoordinator:
             "counters": {"inputs": cursor, "orders": self._orders, "fills": self._fills,
                          "journal_events": events},
             "lifecycle": {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
-                          "sequence": lifecycle.sequence}, "recovery_counter": 0,
+                          "sequence": lifecycle.sequence},
+            "recovery_counter": _recovery_counter(self.journal.run_directory),
         }
 
 
@@ -617,7 +623,7 @@ def _strategy_codec_state(strategy: Strategy) -> dict[str, object]:
 def _bounded_state_digest(document: dict[str, object]) -> str:
     names = {"run_id", "config_digest", "data_fingerprint", "cursor",
              "last_committed_ordering_key", "strategy", "execution", "portfolio",
-             "account", "risk", "counters", "lifecycle", "recovery_counter"}
+             "account", "risk", "counters"}
     return _digest_value({name: document[name] for name in names})
 
 
@@ -775,10 +781,32 @@ def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionC
             or state_digest != _bounded_state_digest(value)
             or tail.payload.get("state_digest") != state_digest):
         raise CheckpointError("checkpoint bounded state digest mismatch")
-    if value["lifecycle"] != {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
-                              "sequence": lifecycle.sequence} or lifecycle.state is not LifecycleState.RUNNING:
+    lifecycle_value = value["lifecycle"]
+    if not isinstance(lifecycle_value, dict):
         raise CheckpointError("checkpoint lifecycle mismatch")
+    records = Lifecycle(coordinator.journal.run_directory).records()
+    sequence = lifecycle_value.get("sequence")
+    if (type(sequence) is not int or sequence < 1 or sequence > len(records)
+            or records[sequence - 1].run_id != coordinator.run_id
+            or records[sequence - 1].state.value != lifecycle_value.get("state")
+            or lifecycle_value.get("run_id") != coordinator.run_id
+            or lifecycle.run_id != coordinator.run_id
+            or lifecycle.state not in {LifecycleState.RUNNING, LifecycleState.PAUSED,
+                                       LifecycleState.FAILED_RECOVERABLE,
+                                       LifecycleState.RECOVERING}):
+        raise CheckpointError("checkpoint lifecycle is not an ancestor of current authority")
     if value["last_committed_ordering_key"] != tail.effective_market_timestamp:
         raise CheckpointError("checkpoint ordering key mismatch")
-    if value["recovery_counter"] != 0:
+    if (type(value["recovery_counter"]) is not int or value["recovery_counter"] < 0):
         raise CheckpointError("invalid recovery counter")
+    actual_recoveries = _recovery_counter(coordinator.journal.run_directory)
+    permitted = ({actual_recoveries, max(0, actual_recoveries - 1)}
+                 if lifecycle.state is LifecycleState.RECOVERING else {actual_recoveries})
+    if value["recovery_counter"] not in permitted:
+        raise CheckpointError("recovery counter is not bound to checkpoint authority")
+
+
+def _recovery_counter(run_directory: Path) -> int:
+    """Read the lock-protected recovery authority without making it optional."""
+    from .operations import RecoveryAttempts
+    return RecoveryAttempts(run_directory).attempt_count()

@@ -56,7 +56,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"run_directory: {directory}", flush=True)
                 replay_path = Path(args.replay).resolve()
                 config_path = Path(args.config).resolve()
-                paper_control.write_runtime_metadata(directory, config_path, replay_path)
+                pace_seconds = float(args.pace[:-1])
+                paper_control.write_runtime_metadata(directory, config_path, replay_path,
+                                                     pace_seconds)
                 effective = replace(config, data=replace(config.data, path=str(replay_path)))
                 bars, fingerprint = load_bars(replay_path, effective.data.schema,
                     start=effective.data.start, end=effective.data.end,
@@ -69,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
                     build_strategy(effective.strategy.name, effective.strategy.parameters),
                     TransitionJournal(directory), data_fingerprint=f"sha256:{fingerprint}")
                 stop_flag = StopFlag(); stop_flag.install()
-                PaperRuntime(coordinator, pace_seconds=float(args.pace[:-1]),
+                PaperRuntime(coordinator, pace_seconds=pace_seconds,
                              stop_flag=stop_flag).run(bars)
                 return 0
             if args.paper_command == "status":
@@ -95,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
                     paper_control.stop(args.run_directory)
             elif args.paper_command == "recover":
                 paper_control.recover(args.run_directory)
+                paper_control.continue_runtime(args.run_directory, install_signals=True)
             else:
                 valid = paper_control.audit(args.run_directory)
                 print("paper runtime audit: exact match" if valid else "paper runtime audit: mismatch")

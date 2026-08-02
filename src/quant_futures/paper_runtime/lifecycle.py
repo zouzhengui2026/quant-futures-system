@@ -50,6 +50,7 @@ LEGAL_TRANSITIONS: frozenset[tuple[LifecycleState, LifecycleState]] = frozenset(
     (LifecycleState.FAILED_RECOVERABLE, LifecycleState.RECOVERING),
     (LifecycleState.FAILED_RECOVERABLE, LifecycleState.FAILED_TERMINAL),
     (LifecycleState.RECOVERING, LifecycleState.RUNNING),
+    (LifecycleState.RECOVERING, LifecycleState.PAUSED),
     (LifecycleState.RECOVERING, LifecycleState.FAILED_RECOVERABLE),
     (LifecycleState.RECOVERING, LifecycleState.FAILED_TERMINAL),
 })
