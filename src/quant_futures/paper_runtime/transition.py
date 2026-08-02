@@ -372,6 +372,7 @@ class PaperTransitionCoordinator:
                 {"input_event_id": input_id, **payload},
             )
             self._events += 1
+            self._failure_injector(f"durable:{stage}")
 
         emit("transition_started", {})
         emit("input_committed", input_domain)
@@ -479,7 +480,8 @@ class PaperTransitionCoordinator:
         self._journal_snapshot = self.journal._snapshot_held()
         if self._publish_checkpoints:
             self._failure_injector("checkpoint")
-            CheckpointStore(self.journal.run_directory)._write_held(self.checkpoint_document())
+            CheckpointStore(self.journal.run_directory, self._failure_injector)._write_held(
+                self.checkpoint_document())
         return self.state
 
     def _bounded_state_for_commit(self, cursor: int, timestamp: datetime, events: int,

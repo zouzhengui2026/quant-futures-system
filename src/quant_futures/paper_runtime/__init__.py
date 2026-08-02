@@ -8,6 +8,8 @@ from .transition import (
     PaperTransitionCoordinator, PaperTransitionState, StageProtocol,
     TransitionCounters, TransitionError, deterministic_id,
 )
+from .operations import (OperationalError, OperationalRequests, PaperRuntime,
+                         RecoveryAttempts, RuntimeResult, StopFlag)
 
 __all__ = [
     "CheckpointError", "CheckpointStore", "canonical_checkpoint",
@@ -15,4 +17,6 @@ __all__ = [
     "JournalSnapshot", "RunLockError", "TransitionJournal", "TransitionRecord",
     "PaperTransitionCoordinator", "PaperTransitionState", "StageProtocol",
     "TransitionCounters", "TransitionError", "deterministic_id",
+    "OperationalError", "OperationalRequests", "PaperRuntime", "RecoveryAttempts",
+    "RuntimeResult", "StopFlag",
 ]

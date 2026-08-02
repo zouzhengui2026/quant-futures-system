@@ -11,6 +11,7 @@ from pathlib import Path
 from .lifecycle import Lifecycle, LifecycleError, LifecycleRecord, LifecycleState
 from .journal import JournalError, JournalSnapshot, TransitionJournal
 from .lock import RunDirectoryLock
+from .checkpoint import CheckpointError, CheckpointStore
 
 
 def _atomic_projection(path: Path, value: dict[str, object]) -> None:
@@ -46,7 +47,33 @@ def _project_status_held(
     journal_tail = journal_snapshot.tail
     if journal_tail is not None and journal_tail.run_id != record.run_id:
         raise JournalError("journal run ID does not match lifecycle authority")
-    return _status_for_record(record, journal_tail)
+    status = _status_for_record(record, journal_tail)
+    # A checkpoint is authoritative only when it names the validated committed
+    # tail.  Status never attempts to repair or infer trading state.
+    try:
+        checkpoint = CheckpointStore(lifecycle.run_directory).read()
+    except CheckpointError:
+        checkpoint = None
+    if (checkpoint is not None and journal_tail is not None
+            and isinstance(checkpoint.get("journal"), dict)
+            and checkpoint["journal"].get("digest") == journal_tail.digest):
+        execution = checkpoint.get("execution", {})
+        status.update({
+            "pending_order": execution.get("pending_order_id"),
+            "positions": checkpoint.get("portfolio", []),
+            "equity": checkpoint.get("account", {}).get("equity"),
+            "risk_outcome": checkpoint.get("risk", {}).get("outcome"),
+            "counters": checkpoint.get("counters", status["counters"]),
+            "last_committed_ordering_key": checkpoint.get("last_committed_ordering_key"),
+        })
+    from .operations import RecoveryAttempts
+    attempts = RecoveryAttempts(lifecycle.run_directory).read()
+    status["recovery_attempts"] = len(attempts)
+    status["health"] = "healthy" if record.state in {
+        LifecycleState.RUNNING, LifecycleState.PAUSED, LifecycleState.COMPLETED
+    } else "attention"
+    status["stalled"] = False
+    return status
 
 
 def write_status(run_directory: str | Path) -> dict[str, object]:
@@ -111,14 +138,27 @@ def stop(run_directory: str | Path) -> LifecycleRecord:
 def recover(run_directory: str | Path) -> LifecycleRecord:
     lifecycle = Lifecycle(run_directory)
     with RunDirectoryLock(run_directory):
-        journal = TransitionJournal(run_directory)
-        journal_snapshot = journal._repair_tail_held()
-        journal_tail = journal_snapshot.tail
         current = lifecycle.current()
+        from .operations import RecoveryAttempts
+        attempts = RecoveryAttempts(run_directory)
+        attempts.append_held(current.run_id, "started")
+        journal = TransitionJournal(run_directory)
+        try:
+            journal_snapshot = journal._repair_tail_held()
+        except BaseException:
+            # The durable attempt remains visible; corruption never leaves an
+            # apparently successful status or advances lifecycle authority.
+            raise
+        journal_tail = journal_snapshot.tail
         if journal_tail is not None and journal_tail.run_id != current.run_id:
             raise JournalError("journal run ID does not match lifecycle authority")
+        if current.state is LifecycleState.RUNNING:
+            attempts.append_held(current.run_id, "no-op")
+            _write_status_held(lifecycle, journal_snapshot)
+            return current
         lifecycle._transition_held(LifecycleState.RECOVERING, "recovery requested")
         record = lifecycle._transition_held(LifecycleState.RUNNING, "lifecycle authority validated")
+        attempts.append_held(current.run_id, "recovered")
         _write_status_held(lifecycle, journal_snapshot)
         return record
 

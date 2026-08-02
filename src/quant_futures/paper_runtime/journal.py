@@ -8,7 +8,7 @@ import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Callable, Iterator, Mapping
 
 from .lifecycle import _fsync_directory
 from .lock import RunDirectoryLock
@@ -70,10 +70,12 @@ class TransitionJournal:
 
     filename = "transitions.journal"
 
-    def __init__(self, run_directory: str | Path) -> None:
+    def __init__(self, run_directory: str | Path,
+                 failure_injector: Callable[[str], None] | None = None) -> None:
         self.run_directory = Path(run_directory)
         self.path = self.run_directory / self.filename
         self._tail: _Tail | None = None
+        self._failure_injector = failure_injector or (lambda _boundary: None)
 
     def records(self) -> tuple[TransitionRecord, ...]:
         """Materialize all records for diagnostics; prefer ``iter_records`` or ``tail``."""
@@ -178,7 +180,9 @@ class TransitionJournal:
                     if not written:
                         raise OSError("zero-byte journal write")
                     view = view[written:]
+                self._failure_injector("journal_frame_written_before_flush")
                 os.fsync(descriptor)
+                self._failure_injector("journal_frame_flush_completed")
             finally:
                 os.close(descriptor)
             if created:

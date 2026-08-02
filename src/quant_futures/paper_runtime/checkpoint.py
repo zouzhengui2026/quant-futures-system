@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .lifecycle import _fsync_directory
 from .lock import RunDirectoryLock
@@ -28,9 +28,11 @@ class CheckpointStore:
 
     filename = "checkpoint.json"
 
-    def __init__(self, run_directory: str | Path) -> None:
+    def __init__(self, run_directory: str | Path,
+                 failure_injector: Callable[[str], None] | None = None) -> None:
         self.run_directory = Path(run_directory)
         self.path = self.run_directory / self.filename
+        self._failure_injector = failure_injector or (lambda _boundary: None)
 
     def read(self) -> dict[str, object]:
         try:
@@ -56,9 +58,11 @@ class CheckpointStore:
         try:
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(encoded)
+                self._failure_injector("checkpoint_temporary_written")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
+            self._failure_injector("checkpoint_replaced_before_directory_fsync")
             _fsync_directory(self.run_directory)
         except BaseException as exc:
             temporary.unlink(missing_ok=True)
