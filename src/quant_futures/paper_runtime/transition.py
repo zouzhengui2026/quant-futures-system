@@ -139,6 +139,7 @@ class PaperTransitionCoordinator:
         else:
             self.data_fingerprint = _data_fingerprint(config)
         self._publish_checkpoints = _publish_checkpoints
+        self._strategy_codec = (_strategy_codec(strategy) if _publish_checkpoints else None)
         self._bus = EventBus()
         self._clock = {"value": None}
         self._paper = PaperExecutionEngine(self._bus, lambda: self._clock["value"])
@@ -192,24 +193,21 @@ class PaperTransitionCoordinator:
         lifecycle = Lifecycle(self.journal.run_directory).current()
         if tail is None:
             raise TransitionError("cannot checkpoint an empty journal")
-        return {
+        document = {
             "schema_version": 1, "run_id": self.run_id,
             "checkpoint_sequence": self._cursor,
             "config_digest": self.config_digest, "data_fingerprint": self.data_fingerprint,
             "cursor": self._cursor,
             "last_committed_ordering_key": self.state.last_committed_ordering_key,
-            "strategy": {"name": self.strategy.name, "version": self.strategy.version,
-                         "lookback_bound": _strategy_bound(self.strategy),
-                         "closes": list(self._closes)},
+            "strategy": self._strategy_document(),
             "execution": {"pending_order_id": (self._pending.order.order_id
                                                  if self._pending else None),
                           "pending": _pending_payload(self._pending),
                           "orders": self._orders, "fills": self._fills},
             "portfolio": _portfolio_authority(self._portfolio_snapshot),
             "account": _account_authority(self._account_snapshot, self._cash_flow),
-            "risk": _risk_authority(self._risk_snapshot, max(
-                (x.account_snapshot.equity for x in self._portfolio_risk.history()),
-                default=self.config.starting_equity)),
+            "risk": _risk_authority(
+                self._risk_snapshot, self._portfolio_risk.checkpoint_peak_equity()),
             "counters": {"inputs": self._cursor, "orders": self._orders,
                          "fills": self._fills, "journal_events": self._events},
             "journal": {"sequence": tail.sequence, "digest": tail.digest,
@@ -219,6 +217,16 @@ class PaperTransitionCoordinator:
                           "sequence": lifecycle.sequence},
             "recovery_counter": 0,
         }
+        document["state_digest"] = _bounded_state_digest(document)
+        return document
+
+    def _strategy_document(self) -> dict[str, object]:
+        return {"name": self.strategy.name, "version": self.strategy.version,
+                "codec": self._strategy_codec,
+                "codec_state": _strategy_codec_state(self.strategy),
+                "lookback_bound": _strategy_bound(
+                    self.strategy, allow_unsupported=self._strategy_codec is None),
+                "closes": list(self._closes)}
 
     def _install_bounded_state(self, value: dict[str, object]) -> None:
         """Validate and install exact bounded reconstruction inputs."""
@@ -384,7 +392,8 @@ class PaperTransitionCoordinator:
 
         current = _position(self._ledger, self.config.data.source, self.config.data.symbol)
         self._closes.append(bar.close)
-        del self._closes[:-_strategy_bound(self.strategy)]
+        del self._closes[:-_strategy_bound(
+            self.strategy, allow_unsupported=self._strategy_codec is None)]
         self._failure_injector("strategy")
         normalized = self.strategy.target(StrategyContext(bar, tuple(self._closes),
                                                            current / self.config.risk.max_position))
@@ -445,7 +454,14 @@ class PaperTransitionCoordinator:
         emit("risk_committed", {"outcome": self._risk_snapshot.outcome.value,
                                 "drawdown": self._risk_snapshot.drawdown_ratio,
                                 "breaches": [b.code.value for b in self._risk_snapshot.breaches]})
-        emit("transition_committed", {"orders": self._orders, "fills": self._fills})
+        # Bind the complete bounded authority to the protected final journal record.
+        # The digest deliberately excludes journal tail identity to avoid a cycle.
+        final_events = self._events + 1
+        state_for_digest = self._bounded_state_for_commit(cursor, bar.timestamp, final_events,
+                                                          lifecycle)
+        state_digest = _digest_value(state_for_digest)
+        emit("transition_committed", {"orders": self._orders, "fills": self._fills,
+                                      "state_digest": state_digest})
         protocol.complete()
         self._cursor = cursor
         self._last_committed_timestamp = bar.timestamp
@@ -454,6 +470,26 @@ class PaperTransitionCoordinator:
             self._failure_injector("checkpoint")
             CheckpointStore(self.journal.run_directory)._write_held(self.checkpoint_document())
         return self.state
+
+    def _bounded_state_for_commit(self, cursor: int, timestamp: datetime, events: int,
+                                  lifecycle: object) -> dict[str, object]:
+        return {
+            "run_id": self.run_id, "config_digest": self.config_digest,
+            "data_fingerprint": self.data_fingerprint, "cursor": cursor,
+            "last_committed_ordering_key": _time(timestamp),
+            "strategy": self._strategy_document(),
+            "execution": {"pending_order_id": (self._pending.order.order_id if self._pending else None),
+                          "pending": _pending_payload(self._pending), "orders": self._orders,
+                          "fills": self._fills},
+            "portfolio": _portfolio_authority(self._portfolio_snapshot),
+            "account": _account_authority(self._account_snapshot, self._cash_flow),
+            "risk": _risk_authority(self._risk_snapshot,
+                                      self._portfolio_risk.checkpoint_peak_equity()),
+            "counters": {"inputs": cursor, "orders": self._orders, "fills": self._fills,
+                         "journal_events": events},
+            "lifecycle": {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
+                          "sequence": lifecycle.sequence}, "recovery_counter": 0,
+        }
 
 
 def _positions_payload(snapshot: object) -> list[dict[str, object]]:
@@ -469,13 +505,45 @@ def _time(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
-def _strategy_bound(strategy: Strategy) -> int:
+def _strategy_bound(strategy: Strategy, *, allow_unsupported: bool = False) -> int:
     """Fixed documented maximum close window required by Product v0.1 strategies."""
     if strategy.name == "moving_average_crossover":
         return int(getattr(strategy, "slow"))
     if strategy.name == "channel_breakout":
         return int(getattr(strategy, "lookback")) + 1
-    return 1
+    if strategy.name in {"fixed", "flat", "hold"}:
+        return 1
+    if allow_unsupported:
+        return 1
+    raise TransitionError("strategy has no bounded checkpoint codec")
+
+
+def _strategy_codec(strategy: Strategy) -> str:
+    """Validate the explicit Product v0.1 bounded restoration contract."""
+    supported = {"moving_average_crossover", "channel_breakout", "fixed", "flat", "hold"}
+    if (strategy.name not in supported or strategy.version != "1"
+            or (strategy.name in {"fixed", "flat"} and not hasattr(strategy, "value"))):
+        raise TransitionError("strategy has no bounded checkpoint codec")
+    return f"product-v0.1/{strategy.name}/1"
+
+
+def _strategy_codec_state(strategy: Strategy) -> dict[str, object]:
+    if strategy.name == "moving_average_crossover":
+        return {"fast": int(getattr(strategy, "fast")), "slow": int(getattr(strategy, "slow"))}
+    if strategy.name == "channel_breakout":
+        return {"lookback": int(getattr(strategy, "lookback"))}
+    if strategy.name in {"fixed", "flat"}:
+        return {"value": float(getattr(strategy, "value"))}
+    if strategy.name == "hold":
+        return {}
+    return {}
+
+
+def _bounded_state_digest(document: dict[str, object]) -> str:
+    names = {"run_id", "config_digest", "data_fingerprint", "cursor",
+             "last_committed_ordering_key", "strategy", "execution", "portfolio",
+             "account", "risk", "counters", "lifecycle", "recovery_counter"}
+    return _digest_value({name: document[name] for name in names})
 
 
 def _portfolio_authority(snapshot: PortfolioSnapshot) -> list[dict[str, object]]:
@@ -601,7 +669,7 @@ def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionC
     fields = {"schema_version", "run_id", "checkpoint_sequence", "config_digest",
               "data_fingerprint", "cursor", "last_committed_ordering_key", "strategy",
               "execution", "portfolio", "account", "risk", "counters",
-              "journal", "lifecycle", "recovery_counter"}
+              "journal", "lifecycle", "recovery_counter", "state_digest"}
     if set(value) != fields or value["schema_version"] != 1:
         raise CheckpointError("unsupported checkpoint schema")
     if value["run_id"] != coordinator.run_id:
@@ -618,11 +686,20 @@ def _validate_checkpoint(value: dict[str, object], coordinator: PaperTransitionC
         raise CheckpointError("unsupported strategy identity or version")
     if strategy.get("lookback_bound") != _strategy_bound(coordinator.strategy):
         raise CheckpointError("strategy lookback mismatch")
+    if strategy.get("codec") != coordinator._strategy_codec:
+        raise CheckpointError("strategy codec mismatch")
+    if strategy.get("codec_state") != _strategy_codec_state(coordinator.strategy):
+        raise CheckpointError("strategy codec state mismatch")
     tail = snapshot.tail
     if tail is None or value["journal"] != {"sequence": tail.sequence, "digest": tail.digest,
                                             "product_transition_id": tail.product_transition_id,
                                             "input_cursor": tail.input_cursor}:
         raise CheckpointError("checkpoint journal lineage mismatch")
+    state_digest = value["state_digest"]
+    if (not isinstance(state_digest, str) or len(state_digest) != 64
+            or state_digest != _bounded_state_digest(value)
+            or tail.payload.get("state_digest") != state_digest):
+        raise CheckpointError("checkpoint bounded state digest mismatch")
     if value["lifecycle"] != {"run_id": lifecycle.run_id, "state": lifecycle.state.value,
                               "sequence": lifecycle.sequence} or lifecycle.state is not LifecycleState.RUNNING:
         raise CheckpointError("checkpoint lifecycle mismatch")

@@ -64,20 +64,22 @@ def running_lifecycle(path, run_id):
     return lifecycle
 
 
-def authorized_coordinator(run_id, cfg, strategy, journal, failure_injector=None):
+def authorized_coordinator(run_id, cfg, strategy, journal, failure_injector=None,
+                           *, publish_checkpoints=True):
     """Focused-test harness that explicitly materializes production lifecycle authority."""
     lifecycle_path = journal.run_directory / Lifecycle.filename
     if not lifecycle_path.exists():
         running_lifecycle(journal.run_directory, run_id)
     return PaperTransitionCoordinator(run_id, cfg, strategy, journal, failure_injector,
-                                      data_fingerprint=VERIFIED_DATA)
+                                      data_fingerprint=VERIFIED_DATA,
+                                      _publish_checkpoints=publish_checkpoints)
 
 
 def _run_slow_transition(path, entered, release, outcomes):
     try:
         coordinator = PaperTransitionCoordinator(
             "process-run", config(), SlowStrategy(entered, release), TransitionJournal(path),
-            data_fingerprint=VERIFIED_DATA)
+            data_fingerprint=VERIFIED_DATA, _publish_checkpoints=False)
         coordinator.transition(bar(0))
         outcomes.put(("transition", "committed"))
     except BaseException as exc:
@@ -211,7 +213,7 @@ def test_next_open_target_change_records_real_causal_order_and_payloads(tmp_path
     journal = TransitionJournal(tmp_path)
     coordinator = authorized_coordinator(
         "changing", config(timing="next_open", commission=10.0, slippage=10.0),
-        SequenceStrategy((1.0, -1.0)), journal)
+        SequenceStrategy((1.0, -1.0)), journal, publish_checkpoints=False)
     first = coordinator.transition(bar(0))
     prior_order = first.pending_order.order.order_id
     second = coordinator.transition(bar(1, open_=105.0, close=106.0, funding=0.01))
@@ -332,7 +334,8 @@ def test_whole_transition_excludes_second_coordinator_and_control(tmp_path):
     lifecycle.transition(LifecycleState.RUNNING, "run")
     entered, release = ThreadEvent(), ThreadEvent()
     first = authorized_coordinator(
-        "locked-run", config(), SlowStrategy(entered, release), TransitionJournal(tmp_path))
+        "locked-run", config(), SlowStrategy(entered, release), TransitionJournal(tmp_path),
+        publish_checkpoints=False)
     second = authorized_coordinator(
         "locked-run", config(), HoldStrategy(), TransitionJournal(tmp_path))
     outcomes = []

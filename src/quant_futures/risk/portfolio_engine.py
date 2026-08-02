@@ -62,6 +62,7 @@ class _Anchor:
     limits_fingerprint: object
     history: list[PortfolioRiskSnapshot]
     commitments: list[_Commitment]
+    committed_peak_equity: list[float | None]
 
 
 _ANCHORS: WeakKeyDictionary[PortfolioRiskEngine, _Anchor] = WeakKeyDictionary()
@@ -82,7 +83,6 @@ class PortfolioRiskEngine:
     _history: list[PortfolioRiskSnapshot] = field(init=False, repr=False)
     _lock: RLock = field(init=False, repr=False)
     _transition_active: bool = field(init=False, repr=False)
-    _checkpoint_peak_equity: float | None = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.event_bus, EventBus):
@@ -94,14 +94,13 @@ class PortfolioRiskEngine:
         self._history = []
         self._lock = RLock()
         self._transition_active = False
-        self._checkpoint_peak_equity = None
         limits_values = tuple(
             (item.name, getattr(self.limits, item.name))
             for item in fields(PortfolioRiskLimits)
         )
         _ANCHORS[self] = _Anchor(
             self._lock, ref(self.event_bus), self.limits, limits_values,
-            _fingerprint(self.limits), self._history, [],
+            _fingerprint(self.limits), self._history, [], [None],
         )
 
     def evaluate(self, account_snapshot: AccountSnapshot) -> PortfolioRiskSnapshot:
@@ -127,11 +126,9 @@ class PortfolioRiskEngine:
             largest = max((e.position_notional for e in exposure_tuple), default=0.0)
             concentration = 0.0 if gross == 0 else largest / gross
             multiple = None if account_snapshot.equity <= 0 else gross / account_snapshot.equity
-            previous_peak = max(
-                (item.account_snapshot.equity for item in _anchor(self).history),
-                default=(self._checkpoint_peak_equity
-                         if self._checkpoint_peak_equity is not None
-                         else account_snapshot.starting_equity))
+            committed_peak = _anchor(self).committed_peak_equity[0]
+            previous_peak = (account_snapshot.starting_equity
+                             if committed_peak is None else committed_peak)
             peak = max(previous_peak, account_snapshot.equity)
             drawdown = 0.0 if peak <= 0 else (peak - account_snapshot.equity) / peak
             breach_tuple = build_portfolio_risk_breaches(
@@ -154,6 +151,7 @@ class PortfolioRiskEngine:
                 raise PortfolioRiskError("portfolio risk limits changed during evaluation")
             anchor.history.append(snapshot)
             anchor.commitments.append(commitment)
+            anchor.committed_peak_equity[0] = peak
             self._latest = snapshot
             event_bus.publish(Event(PORTFOLIO_RISK_UPDATED, {
                 "portfolio_risk_snapshot": snapshot,
@@ -172,7 +170,18 @@ class PortfolioRiskEngine:
         with _anchor(self).lock:
             if _anchor(self).history:
                 raise PortfolioRiskError("checkpoint restore requires a fresh risk engine")
-            self._checkpoint_peak_equity = float(peak_equity)
+            _anchor(self).committed_peak_equity[0] = float(peak_equity)
+
+    def checkpoint_peak_equity(self) -> float | None:
+        """Return the protected committed peak in O(1), without copying history."""
+        anchor = _anchor(self)
+        with anchor.lock:
+            if self._history is not anchor.history:
+                raise PortfolioRiskError("portfolio risk history authority was replaced")
+            peak = anchor.committed_peak_equity[0]
+            if peak is not None and (not isfinite(peak) or peak < 0):
+                raise PortfolioRiskError("committed portfolio risk peak is corrupt")
+            return peak
 
     def latest(self) -> PortfolioRiskSnapshot:
         with _anchor(self).lock:
@@ -198,6 +207,11 @@ class PortfolioRiskEngine:
             expected_latest = anchor.history[-1] if anchor.history else None
             if self._latest is not expected_latest:
                 raise PortfolioRiskError("latest portfolio risk identity was replaced")
+            committed_peak = anchor.committed_peak_equity[0]
+            if (committed_peak is not None and
+                    committed_peak < max((item.account_snapshot.equity
+                                          for item in anchor.history), default=committed_peak)):
+                raise PortfolioRiskError("committed portfolio risk peak differs from authority")
             for snapshot, commitment in zip(anchor.history, anchor.commitments):
                 if snapshot is not commitment.snapshot:
                     raise PortfolioRiskError("portfolio risk history identity was replaced")

@@ -10,7 +10,9 @@ from quant_futures.paper_runtime import (
     RunLockError, TransitionError,
 )
 from quant_futures.paper_runtime.journal import TransitionJournal
-from quant_futures.product.strategy import FixedStrategy
+from quant_futures.product.strategy import (ChannelBreakout, FixedStrategy, HoldStrategy,
+                                            MovingAverageCrossover)
+from quant_futures.risk.portfolio_engine import PortfolioRiskEngine
 from quant_futures.product.config import DataConfig
 
 from test_transition import (VERIFIED_DATA, authorized_coordinator, bar, config,
@@ -234,3 +236,86 @@ def test_replay_content_identity_fails_closed_and_explicit_fingerprint_is_allowe
     running_lifecycle(empty, "missing")
     PaperTransitionCoordinator("missing", missing, FixedStrategy(0.0),
                                TransitionJournal(empty), data_fingerprint=VERIFIED_DATA)
+
+
+def test_peak_drawdown_survives_restart_and_repeated_restart(tmp_path):
+    cfg = config()
+    uninterrupted_path = tmp_path / "all"; uninterrupted_path.mkdir()
+    restarted_path = tmp_path / "restarted"; restarted_path.mkdir()
+    uninterrupted = authorized_coordinator(
+        "peak", cfg, FixedStrategy(1.0), TransitionJournal(uninterrupted_path))
+    restarted = authorized_coordinator(
+        "peak", cfg, FixedStrategy(1.0), TransitionJournal(restarted_path))
+    for index, close in enumerate((100.0, 150.0, 100.0, 90.0)):
+        expected = uninterrupted.transition(bar(index, close=close))
+        actual = restarted.transition(bar(index, close=close))
+        # Reopen at every committed boundary, including while below the old peak.
+        restarted = PaperTransitionCoordinator(
+            "peak", cfg, FixedStrategy(1.0), TransitionJournal(restarted_path),
+            data_fingerprint=VERIFIED_DATA)
+        assert actual.risk_snapshot == expected.risk_snapshot
+        assert restarted.state.risk_snapshot == expected.risk_snapshot
+    assert restarted._portfolio_risk.checkpoint_peak_equity() == 10_050.0
+
+
+def test_checkpoint_publication_never_reads_risk_history(tmp_path, monkeypatch):
+    coordinator = authorized_coordinator(
+        "no-risk-scan", config(), FixedStrategy(1.0), TransitionJournal(tmp_path))
+    monkeypatch.setattr(PortfolioRiskEngine, "history",
+                        lambda self: (_ for _ in ()).throw(AssertionError("history scan")))
+    for index in range(80):
+        coordinator.transition(bar(index, close=100 + index))
+
+
+@pytest.mark.parametrize("mutation", [
+    "strategy_close", "pending_quantity", "pending_timestamp", "pending_price",
+    "coordinated_counters", "portfolio", "account", "risk", "peak",
+])
+def test_journal_bound_state_rejects_canonical_type_valid_tampering(tmp_path, mutation):
+    cfg = config(timing="next_open" if mutation.startswith("pending_") else "current_close")
+    authorized_coordinator(
+        "digest", cfg, FixedStrategy(1.0), TransitionJournal(tmp_path)).transition(bar(0))
+    path = tmp_path / "checkpoint.json"
+    value = json.loads(path.read_bytes())
+    if mutation == "strategy_close": value["strategy"]["closes"][0] += 0.25
+    if mutation == "pending_quantity": value["execution"]["pending"]["quantity"] += 1.0
+    if mutation == "pending_timestamp": value["execution"]["pending"]["timestamp"] = bar(2).timestamp.isoformat().replace("+00:00", "Z")
+    if mutation == "pending_price": value["execution"]["pending"]["price"] += 1.0
+    if mutation == "coordinated_counters":
+        value["execution"]["orders"] += 1
+        value["counters"]["orders"] += 1
+    if mutation == "portfolio": value["portfolio"][0]["average_entry_price"] += 1.0
+    if mutation == "account": value["account"]["cash_flow"] += 1.0
+    if mutation == "risk": value["risk"]["drawdown"] = 0.01
+    if mutation == "peak": value["risk"]["peak_equity"] += 1.0
+    path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+    with pytest.raises(TransitionError, match="bounded state digest"):
+        PaperTransitionCoordinator("digest", cfg, FixedStrategy(1.0),
+                                   TransitionJournal(tmp_path), data_fingerprint=VERIFIED_DATA)
+
+
+@pytest.mark.parametrize("strategy", [
+    MovingAverageCrossover(2, 3), ChannelBreakout(2), HoldStrategy(),
+    FixedStrategy(1.0), FixedStrategy(0.0, name="flat"),
+])
+def test_product_strategy_codecs_restore(strategy, tmp_path):
+    authorized_coordinator("codec", config(), strategy, TransitionJournal(tmp_path)).transition(bar(0))
+    restored = PaperTransitionCoordinator(
+        "codec", config(), strategy, TransitionJournal(tmp_path), data_fingerprint=VERIFIED_DATA)
+    assert restored.state.input_cursor == 1
+
+
+def test_stateful_custom_strategy_without_codec_fails_closed(tmp_path):
+    class Stateful:
+        name = "custom_stateful"
+        version = "1"
+        calls = 0
+        def target(self, context):
+            self.calls += 1
+            return float(self.calls % 2)
+
+    running_lifecycle(tmp_path, "unsupported")
+    with pytest.raises(TransitionError, match="no bounded checkpoint codec"):
+        PaperTransitionCoordinator("unsupported", config(), Stateful(),
+                                   TransitionJournal(tmp_path), data_fingerprint=VERIFIED_DATA)
+    assert not (tmp_path / "checkpoint.json").exists()
