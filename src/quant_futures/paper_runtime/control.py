@@ -146,10 +146,14 @@ def _status_for_record(record: LifecycleRecord, journal_tail: object | None = No
             "counters": {"inputs": 0, "orders": 0, "fills": 0}}
 
 
-def start(root: str | Path) -> Path:
+def start(root: str | Path, *, _test_run_id: str | None = None) -> Path:
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    run_id = uuid.uuid4().hex
+    run_id = uuid.uuid4().hex if _test_run_id is None else _test_run_id
+    if _test_run_id is not None and (
+        len(run_id) != 32 or any(character not in "0123456789abcdef" for character in run_id)
+    ):
+        raise LifecycleError("test run ID must be 32 lowercase hexadecimal characters")
     directory = root / run_id
     directory.mkdir(mode=0o700)
     lifecycle = Lifecycle(directory)
@@ -368,6 +372,8 @@ def recover(
           from .operations import RecoveryAttempts
           attempts = RecoveryAttempts(directory)
           current = lifecycle.current()
+          if current.state is LifecycleState.COMPLETED:
+              raise LifecycleError("completed runtime cannot be recovered")
           run_id = current.run_id
           desired = _desired_recovery_disposition(lifecycle)
           inject = failure_injector or (lambda _boundary: None)

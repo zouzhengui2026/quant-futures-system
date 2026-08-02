@@ -72,7 +72,16 @@ def main(argv: list[str] | None = None) -> int:
                     raise ConfigError("--pace must be a non-negative duration in seconds, for example 1s")
                 if not Path(args.replay).is_file():
                     raise ConfigError(f"replay input does not exist: {args.replay}")
-                directory = paper_control.start(Path(config.output_directory) / "paper-runtime")
+                # Opt-in process-test overrides let two independent CLI runs use
+                # the same deterministic run identity while keeping their
+                # authorities in separate directories.  They are deliberately
+                # inert in ordinary operation.
+                runtime_root = Path(os.environ.get(
+                    "QFS_RUNTIME_TEST_ROOT",
+                    str(Path(config.output_directory) / "paper-runtime"),
+                ))
+                run_id = os.environ.get("QFS_RUNTIME_TEST_RUN_ID")
+                directory = paper_control.start(runtime_root, _test_run_id=run_id)
                 print(f"run_directory: {directory}", flush=True)
                 replay_path = Path(args.replay).resolve()
                 config_path = Path(args.config).resolve()
@@ -112,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
             elif args.paper_command == "resume":
                 if (Path(args.run_directory) / "runtime.json").exists():
                     status = paper_control.project_status(args.run_directory)
+                    if status["lifecycle"] == LifecycleState.COMPLETED.value:
+                        raise LifecycleError("completed runtime cannot be resumed")
                     if status["lifecycle"] == LifecycleState.PAUSED.value:
                         paper_control.resume_runtime(args.run_directory,
                                                      install_signals=True)

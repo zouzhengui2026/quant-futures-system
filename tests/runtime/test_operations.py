@@ -173,6 +173,46 @@ def _fresh_cli(*arguments: str, timeout: float = 20) -> subprocess.CompletedProc
     )
 
 
+def _checkpoint_product_core(checkpoint):
+    """Exclude only operational lineage while retaining all Product authority."""
+    return {key: value for key, value in checkpoint.items()
+            if key not in {"lifecycle", "recovery_counter", "recovery_digest"}}
+
+
+def _assert_terminal_authority(run):
+    from quant_futures.paper_runtime import (CheckpointStore, Lifecycle,
+                                               LifecycleState,
+                                               RuntimeConsumerLease)
+    from quant_futures.paper_runtime import control as paper_control
+
+    records = TransitionJournal(run).records()
+    checkpoint = CheckpointStore(run).read()
+    assert Lifecycle(run).current().state is LifecycleState.COMPLETED
+    assert records[-1].stage == "transition_committed"
+    assert (records[-1].sequence, records[-1].digest) == (
+        checkpoint["journal"]["sequence"], checkpoint["journal"]["digest"])
+    for identities in (
+        [record.journal_event_id for record in records],
+        [record.product_transition_id for record in records
+         if record.stage == "transition_started"],
+        [record.payload["input_event_id"] for record in records
+         if record.stage == "transition_started"],
+        [record.payload["order_id"] for record in records
+         if record.stage == "order_submitted"],
+        [record.payload["fill_id"] for record in records
+         if record.stage == "fill_committed"],
+    ):
+        assert len(identities) == len(set(identities))
+    status = paper_control.project_status(run)
+    assert status["lifecycle"] == "COMPLETED"
+    assert status["consumer_owner"] == "relinquished"
+    assert paper_control.audit(run)
+    assert json.loads((run / "status.json").read_text()) == status
+    assert list(run.glob(".checkpoint.json.*.tmp")) == []
+    assert not RuntimeConsumerLease.is_owned(run)
+    return records, checkpoint
+
+
 def test_fresh_source_cli_pause_resume_status_audit_workflow(tmp_path):
     """Every control is a new process; installed-package CLI remains CP6 scope."""
     from quant_futures.paper_runtime import (Lifecycle, LifecycleState,
@@ -211,6 +251,46 @@ def test_fresh_source_cli_pause_resume_status_audit_workflow(tmp_path):
     assert list(run.glob(".checkpoint.json.*.tmp")) == []
     assert not RuntimeConsumerLease.is_owned(run)
 
+
+def test_fresh_source_cli_paused_stop_and_repeated_stop(tmp_path):
+    """A relinquished PAUSED run accepts stop idempotently in fresh processes."""
+    from quant_futures.paper_runtime import Lifecycle, LifecycleState, RuntimeConsumerLease
+
+    config_path, replay = _runtime_files(tmp_path)
+    config_path.write_text(config_path.read_text().replace(
+        "output_directory: .", f"output_directory: {tmp_path}"), encoding="utf-8")
+    repository, env = _source_cli_env()
+    owner = subprocess.Popen(
+        [sys.executable, "-m", "quant_futures.product.cli", "paper", "start",
+         "--config", str(config_path), "--replay", str(replay), "--pace", "5s"],
+        cwd=repository, env=env, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE)
+    assert owner.stdout is not None
+    run = Path(owner.stdout.readline().strip().split(": ", 1)[1])
+    assert _fresh_cli("paper", "pause", str(run)).returncode == 0
+    owner.communicate(timeout=15)
+    assert owner.returncode == 0
+    assert Lifecycle(run).current().state is LifecycleState.PAUSED
+    assert not RuntimeConsumerLease.is_owned(run)
+
+    product_before = {name: (run / name).read_bytes()
+                      for name in ("transitions.journal", "checkpoint.json")}
+    first = _fresh_cli("paper", "stop", str(run))
+    assert first.returncode == 0, first.stderr
+    assert Lifecycle(run).current().state is LifecycleState.COMPLETED
+    assert {name: (run / name).read_bytes() for name in product_before} == product_before
+    lifecycle_after_first = (run / "lifecycle.jsonl").read_bytes()
+
+    second = _fresh_cli("paper", "stop", str(run))
+    assert second.returncode == 0, second.stderr
+    assert (run / "lifecycle.jsonl").read_bytes() == lifecycle_after_first
+    assert {name: (run / name).read_bytes() for name in product_before} == product_before
+    status = json.loads(_fresh_cli("paper", "status", str(run)).stdout)
+    assert status["lifecycle"] == "COMPLETED"
+    assert status["consumer_owner"] == "relinquished"
+    assert _fresh_cli("paper", "audit", str(run)).returncode == 0
+    assert list(run.glob(".checkpoint.json.*.tmp")) == []
+    assert not RuntimeConsumerLease.is_owned(run)
 
 def test_fresh_source_cli_owner_death_status_recover_and_live_rejection(tmp_path):
     """A live owner rejects recovery; after death status stalls and recovery continues."""
@@ -252,79 +332,75 @@ def test_source_cli_actual_signals_stop_at_committed_boundary(
     tmp_path, signum, location,
 ):
     """Exercise actual signals in a source-tree CLI process, not a handler call."""
-    from quant_futures.paper_runtime import (CheckpointStore, Lifecycle,
-                                               LifecycleState,
-                                               RuntimeConsumerLease)
-    from quant_futures.paper_runtime import control as paper_control
-
     config_path, replay = _runtime_files(tmp_path)
-    config_path.write_text(config_path.read_text().replace(
-        "output_directory: .", f"output_directory: {tmp_path}"), encoding="utf-8")
-    reached, release = tmp_path / "reached", tmp_path / "release"
-    env = os.environ.copy()
     repository = Path(__file__).parents[2]
-    env["PYTHONPATH"] = str(repository / "src")
-    if location == "inside":
-        env.update({
-            "QFS_RUNTIME_BOUNDARY": "journal:strategy_committed",
-            "QFS_RUNTIME_BOUNDARY_REACHED": str(reached),
-            "QFS_RUNTIME_BOUNDARY_RELEASE": str(release),
-        })
-    process = subprocess.Popen(
-        [sys.executable, "-m", "quant_futures.product.cli", "paper", "start",
-         "--config", str(config_path), "--replay", str(replay), "--pace", "0.5s"],
-        cwd=repository, env=env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    assert process.stdout is not None
-    line = process.stdout.readline().strip()
-    assert line.startswith("run_directory: ")
-    run = Path(line.split(": ", 1)[1])
-    deadline = time.monotonic() + 10
-    if location == "inside":
-        while not reached.exists() and time.monotonic() < deadline:
+    run_id = "ab" * 16
+
+    def launch(kind, root):
+        reached, release = root / "reached", root / "release"
+        root.mkdir()
+        env = os.environ.copy()
+        env.update({"PYTHONPATH": str(repository / "src"),
+                    "QFS_RUNTIME_TEST_ROOT": str(root / "runs"),
+                    "QFS_RUNTIME_TEST_RUN_ID": run_id})
+        if location == "inside":
+            env.update({"QFS_RUNTIME_BOUNDARY": "journal:strategy_committed",
+                        "QFS_RUNTIME_BOUNDARY_REACHED": str(reached),
+                        "QFS_RUNTIME_BOUNDARY_RELEASE": str(release)})
+        process = subprocess.Popen(
+            [sys.executable, "-m", "quant_futures.product.cli", "paper", "start",
+             "--config", str(config_path), "--replay", str(replay), "--pace", "0.5s"],
+            cwd=repository, env=env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        assert process.stdout is not None
+        run = Path(process.stdout.readline().strip().split(": ", 1)[1])
+        deadline = time.monotonic() + 10
+        marker = reached if location == "inside" else run / "checkpoint.json"
+        while not marker.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert reached.exists()
-    else:
-        journal = run / "transitions.journal"
-        while (not journal.exists() or not journal.stat().st_size) and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert journal.exists() and journal.stat().st_size
-        time.sleep(0.05)  # paced wait after the first committed transition
-    process.send_signal(signum)
-    if location == "inside":
-        release.touch()
-    stdout, stderr = process.communicate(timeout=15)
-    assert process.returncode == 0, (stdout, stderr)
-    assert Lifecycle(run).current().state is LifecycleState.COMPLETED
-    assert (run / "checkpoint.json").is_file()
-    assert not RuntimeConsumerLease.is_owned(run)
-    records = TransitionJournal(run).records()
-    checkpoint = CheckpointStore(run).read()
-    assert records[-1].digest == checkpoint["journal"]["digest"]
-    assert records[-1].sequence == checkpoint["journal"]["sequence"]
-    assert records[-1].stage == "transition_committed"
-    for identities in (
-        [record.journal_event_id for record in records],
-        [record.product_transition_id for record in records
-         if record.stage == "transition_started"],
-        [record.payload["input_event_id"] for record in records
-         if record.stage == "transition_started"],
-        [record.payload["order_id"] for record in records
-         if record.stage == "order_submitted"],
-        [record.payload["fill_id"] for record in records
-         if record.stage == "fill_committed"],
-    ):
-        assert len(identities) == len(set(identities))
-    status = paper_control.project_status(run)
-    assert status["lifecycle"] == "COMPLETED"
-    assert status["consumer_owner"] == "relinquished"
-    assert status["health"] == "healthy"
-    assert status["stalled"] is False
-    assert status["last_durable_stage"] == "transition_committed"
-    assert paper_control.audit(run)
-    assert json.loads((run / "status.json").read_text()) == status
-    assert list(run.glob(".checkpoint.json.*.tmp")) == []
+        assert marker.exists()
+        if kind == "signal":
+            process.send_signal(signum)
+            control_process = None
+        else:
+            control_process = subprocess.Popen(
+                [sys.executable, "-m", "quant_futures.product.cli", "paper", "stop", str(run)],
+                cwd=repository, env=env, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+        if location == "inside":
+            release.touch()
+        stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == 0, (stdout, stderr)
+        if control_process is not None:
+            output, error = control_process.communicate(timeout=15)
+            assert control_process.returncode == 0, (output, error)
+        return run
+
+    signal_run = launch("signal", tmp_path / "signal")
+    baseline_run = launch("control", tmp_path / "baseline")
+    signal_records, signal_checkpoint = _assert_terminal_authority(signal_run)
+    baseline_records, baseline_checkpoint = _assert_terminal_authority(baseline_run)
+    assert (signal_run / "transitions.journal").read_bytes() == (
+        baseline_run / "transitions.journal").read_bytes()
+    assert signal_records == baseline_records
+    assert _checkpoint_product_core(signal_checkpoint) == _checkpoint_product_core(
+        baseline_checkpoint)
+    signal_lifecycle = [record.state.value for record in
+                        __import__("quant_futures.paper_runtime", fromlist=["Lifecycle"])
+                        .Lifecycle(signal_run).records()]
+    baseline_lifecycle = [record.state.value for record in
+                          __import__("quant_futures.paper_runtime", fromlist=["Lifecycle"])
+                          .Lifecycle(baseline_run).records()]
+    assert signal_lifecycle == baseline_lifecycle
+
+    # COMPLETED is terminal: public fresh-process continuation paths reject it
+    # without changing any authority or projection bytes.
+    protected = ("lifecycle.jsonl", "transitions.journal", "checkpoint.json", "status.json")
+    before = {name: (signal_run / name).read_bytes() for name in protected}
+    for command in ("resume", "recover"):
+        rejected = _fresh_cli("paper", command, str(signal_run))
+        assert rejected.returncode == 2
+        assert {name: (signal_run / name).read_bytes() for name in protected} == before
 
 
 def test_fresh_runtime_pause_resume_baselines_consumed_request(tmp_path):
