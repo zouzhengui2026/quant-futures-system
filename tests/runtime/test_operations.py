@@ -40,6 +40,21 @@ def test_operational_requests_are_monotonic_and_idempotent_at_boundary(tmp_path)
     assert result.state.input_cursor == 1
 
 
+def test_committed_pause_terminates_runtime_ownership(tmp_path):
+    """PAUSED is reopenable because the old consumer has already returned."""
+    from quant_futures.paper_runtime import Lifecycle, LifecycleState
+
+    coordinator = authorized_coordinator(
+        "pause-owner", config(), FixedStrategy(0.0), TransitionJournal(tmp_path))
+    OperationalRequests(tmp_path).request("pause")
+    result = PaperRuntime(coordinator).run((bar(0), bar(1)))
+
+    assert result.stopped
+    assert result.processed == 0
+    assert result.state.input_cursor == 0
+    assert Lifecycle(tmp_path).current().state is LifecycleState.PAUSED
+
+
 def test_recovery_attempt_authority_is_monotonic_and_hash_chained(tmp_path):
     attempts = RecoveryAttempts(tmp_path)
     assert attempts.append_held("run", "started") == 1
@@ -47,6 +62,31 @@ def test_recovery_attempt_authority_is_monotonic_and_hash_chained(tmp_path):
     records = attempts.read()
     assert [record["sequence"] for record in records] == [1, 2]
     assert records[1]["previous_digest"] == records[0]["digest"]
+
+
+@pytest.mark.parametrize("cut", ["after_started", "after_suffix_checkpoint", "after_outcome"])
+def test_recovery_publication_protocol_reconciles_each_durable_cut(tmp_path, cut):
+    from quant_futures.paper_runtime.checkpoint import CheckpointStore
+    from quant_futures.paper_runtime.control import (
+        _publish_recovery_commitment_held, _reconcile_recovery_publication_held)
+
+    store = CheckpointStore(tmp_path)
+    store._write_held({"recovery_counter": 0, "recovery_digest": None})
+    attempts = RecoveryAttempts(tmp_path)
+    attempts.append_held("run", "started")
+    if cut == "after_suffix_checkpoint":
+        _publish_recovery_commitment_held(tmp_path)
+    elif cut == "after_outcome":
+        attempts.append_held("run", "recovered")
+
+    _reconcile_recovery_publication_held(tmp_path, "run")
+    records = attempts.read()
+    assert [record["outcome"] for record in records] == [
+        "started", "recovered" if cut == "after_suffix_checkpoint" else
+        ("recovered" if cut == "after_outcome" else "failed")]
+    checkpoint = store.read()
+    assert checkpoint["recovery_counter"] == 1
+    assert checkpoint["recovery_digest"] == records[-1]["digest"]
 
 @pytest.mark.parametrize("stage", [
     "transition_started", "input_committed", "strategy_committed", "order_submitted",

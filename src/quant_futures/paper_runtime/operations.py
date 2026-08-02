@@ -136,6 +136,11 @@ class PaperRuntime:
                 if command == "pause" and record.state is LifecycleState.RUNNING:
                     lifecycle._transition_held(LifecycleState.PAUSED, "boundary-safe pause requested")
                     _write_status_held(lifecycle, self.coordinator.state.journal_snapshot)
+                    # A committed pause relinquishes runtime ownership.  PAUSED
+                    # therefore always means that ``paper resume`` may safely
+                    # reopen exactly one coordinator; there is no sleeping live
+                    # consumer competing for the remaining replay.
+                    return True
                 elif command == "resume" and record.state is LifecycleState.PAUSED:
                     lifecycle._transition_held(LifecycleState.RUNNING, "resume requested")
                     _write_status_held(lifecycle, self.coordinator.state.journal_snapshot)

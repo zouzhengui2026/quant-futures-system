@@ -231,6 +231,58 @@ def _publish_recovery_commitment_held(directory: Path) -> None:
     store._write_held(document)
 
 
+def _reconcile_recovery_publication_held(directory: Path, run_id: str) -> None:
+    """Finish the previous recovery publication protocol before a new attempt.
+
+    Recovery has two durable authorities and an atomic checkpoint commitment.
+    Consequently a process may stop after either JSONL append, or after the
+    checkpoint replacement whose directory fsync reported an indeterminate
+    result.  Only the exact old/new commitment states below are admissible;
+    every other lineage is ambiguous and fails closed.
+    """
+    from .operations import OperationalError, RecoveryAttempts
+
+    attempts = RecoveryAttempts(directory)
+    records = attempts.read()
+    store = CheckpointStore(directory)
+    if not store.path.exists():
+        if records and records[-1]["outcome"] == "started":
+            attempts.append_held(run_id, "failed")
+        return
+    checkpoint = store.read()
+    count = checkpoint.get("recovery_counter")
+    digest = checkpoint.get("recovery_digest")
+    actual_count = sum(record["outcome"] == "started" for record in records)
+    tail_digest = records[-1]["digest"] if records else None
+    if (count, digest) == (actual_count, tail_digest):
+        # A checkpoint naming an open start can only have been produced after
+        # successful suffix reconstruction.  Complete that invocation once.
+        if records and records[-1]["outcome"] == "started":
+            attempts.append_held(run_id, "recovered")
+            _publish_recovery_commitment_held(directory)
+        return
+    if not records:
+        raise OperationalError("recovery checkpoint commitment is ambiguous")
+    last = records[-1]
+    if last["outcome"] == "started":
+        previous_digest = records[-2]["digest"] if len(records) > 1 else None
+        if (count, digest) != (actual_count - 1, previous_digest):
+            raise OperationalError("recovery start commitment is ambiguous")
+        attempts.append_held(run_id, "failed")
+        _publish_recovery_commitment_held(directory)
+        return
+    # The outcome append is durable but the commitment is still allowed to
+    # name its immediately preceding start.  Publish it; do not append again.
+    previous = records[-2] if len(records) > 1 else None
+    before_start_digest = records[-3]["digest"] if len(records) > 2 else None
+    allowed = {(actual_count, previous["digest"] if previous else None),
+               (actual_count - 1, before_start_digest)}
+    if (previous is None or previous["outcome"] != "started"
+            or (count, digest) not in allowed):
+        raise OperationalError("recovery outcome commitment is ambiguous")
+    _publish_recovery_commitment_held(directory)
+
+
 def _desired_recovery_disposition(lifecycle: Lifecycle) -> LifecycleState:
     """Preserve the last operational disposition across arbitrarily many retries."""
     for record in reversed(lifecycle.records()):
@@ -249,18 +301,8 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
         current = lifecycle.current()
         run_id = current.run_id
         desired = _desired_recovery_disposition(lifecycle)
-        # Validate the last atomic publication before mutation.  A process cut
-        # after ``started`` is closed as failed so the next invocation remains
-        # admissible without resetting its attempt number.
-        try:
-            attempts.validate_checkpoint_anchor()
-        except Exception:
-            records = attempts.read()
-            if not records or records[-1]["outcome"] != "started":
-                raise
-            attempts.append_held(run_id, "failed")
-            _publish_recovery_commitment_held(directory)
-            attempts.validate_checkpoint_anchor()
+        _reconcile_recovery_publication_held(directory, run_id)
+        attempts.validate_checkpoint_anchor()
         attempts.append_held(run_id, "started")
         closed = False
 
