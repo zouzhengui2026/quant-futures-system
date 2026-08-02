@@ -9,6 +9,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from .lifecycle import Lifecycle, LifecycleError, LifecycleRecord, LifecycleState
 from .journal import JournalError, JournalSnapshot, TransitionJournal
@@ -272,10 +273,12 @@ def request_stop(run_directory: str | Path) -> LifecycleRecord | dict[str, objec
         raise LifecycleError(f"runtime stop is illegal from {state.value}")
 
 
-def _publish_recovery_commitment_held(directory: Path) -> None:
+def _publish_recovery_commitment_held(
+    directory: Path, failure_injector: Callable[[str], None] | None = None,
+) -> None:
     """Atomically bind the completed recovery invocation into the checkpoint."""
     from .operations import RecoveryAttempts
-    store = CheckpointStore(directory)
+    store = CheckpointStore(directory, failure_injector)
     if not store.path.exists():
         return
     document = store.read()
@@ -285,7 +288,10 @@ def _publish_recovery_commitment_held(directory: Path) -> None:
     store._write_held(document)
 
 
-def _reconcile_recovery_publication_held(directory: Path, run_id: str) -> None:
+def _reconcile_recovery_publication_held(
+    directory: Path, run_id: str,
+    failure_injector: Callable[[str], None] | None = None,
+) -> None:
     """Finish the previous recovery publication protocol before a new attempt.
 
     Recovery has two durable authorities and an atomic checkpoint commitment.
@@ -313,7 +319,7 @@ def _reconcile_recovery_publication_held(directory: Path, run_id: str) -> None:
         # successful suffix reconstruction.  Complete that invocation once.
         if records and records[-1]["outcome"] == "started":
             attempts.append_held(run_id, "recovered")
-            _publish_recovery_commitment_held(directory)
+            _publish_recovery_commitment_held(directory, failure_injector)
         return
     if not records:
         raise OperationalError("recovery checkpoint commitment is ambiguous")
@@ -323,7 +329,7 @@ def _reconcile_recovery_publication_held(directory: Path, run_id: str) -> None:
         if (count, digest) != (actual_count - 1, previous_digest):
             raise OperationalError("recovery start commitment is ambiguous")
         attempts.append_held(run_id, "failed")
-        _publish_recovery_commitment_held(directory)
+        _publish_recovery_commitment_held(directory, failure_injector)
         return
     # The outcome append is durable but the commitment is still allowed to
     # name its immediately preceding start.  Publish it; do not append again.
@@ -334,7 +340,7 @@ def _reconcile_recovery_publication_held(directory: Path, run_id: str) -> None:
     if (previous is None or previous["outcome"] != "started"
             or (count, digest) not in allowed):
         raise OperationalError("recovery outcome commitment is ambiguous")
-    _publish_recovery_commitment_held(directory)
+    _publish_recovery_commitment_held(directory, failure_injector)
 
 
 def _desired_recovery_disposition(lifecycle: Lifecycle) -> LifecycleState:
@@ -345,7 +351,11 @@ def _desired_recovery_disposition(lifecycle: Lifecycle) -> LifecycleState:
     return LifecycleState.RUNNING
 
 
-def recover(run_directory: str | Path) -> LifecycleRecord:
+def recover(
+    run_directory: str | Path,
+    *,
+    failure_injector: Callable[[str], None] | None = None,
+) -> LifecycleRecord:
     """Close exactly one durable recovery attempt and publish its commitment."""
     directory = Path(run_directory)
     # Recovery is itself a consumer.  Fail before lifecycle, journal,
@@ -360,9 +370,11 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
           current = lifecycle.current()
           run_id = current.run_id
           desired = _desired_recovery_disposition(lifecycle)
-          _reconcile_recovery_publication_held(directory, run_id)
+          inject = failure_injector or (lambda _boundary: None)
+          _reconcile_recovery_publication_held(directory, run_id, inject)
           attempts.validate_checkpoint_anchor()
           attempts.append_held(run_id, "started")
+          inject("recovery_started_durable")
           closed = False
 
           def close(outcome: str) -> None:
@@ -370,8 +382,10 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
               if closed:
                   raise LifecycleError("recovery invocation already closed")
               attempts.append_held(run_id, outcome)
+              inject("recovery_outcome_durable")
               closed = True
-              _publish_recovery_commitment_held(directory)
+              _publish_recovery_commitment_held(directory, inject)
+              inject("recovery_commitment_published")
 
           try:
               metadata = _runtime_metadata(directory) if (directory / "runtime.json").exists() else None
@@ -401,6 +415,7 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
                   if metadata is None:
                       raise LifecycleError("runtime metadata required for product recovery")
                   _recover_product_suffix_held(directory, run_id, journal, journal_snapshot, checkpoint)
+                  inject("recovery_suffix_checkpoint_durable")
                   journal_snapshot = journal._snapshot_held()
                   lifecycle._transition_held(desired, "product authority recovered")
                   close("recovered")
@@ -428,7 +443,7 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
                       # This may legitimately fail when the checkpoint itself is corrupt;
                       # the closed attempt chain still permits the next repair attempt.
                       try:
-                          _publish_recovery_commitment_held(directory)
+                          _publish_recovery_commitment_held(directory, inject)
                       except (CheckpointError, OSError, ValueError):
                           pass
               raise

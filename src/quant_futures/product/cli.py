@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,6 +18,24 @@ from .config import ConfigError, load_config
 from .orchestrator import audit, run
 from .data import load_bars
 from .strategy import build_strategy
+
+
+def _process_boundary_hook(boundary: str) -> None:
+    """Optional deterministic process barrier used by crash/signal acceptance.
+
+    The hook is inert unless both paths are explicitly supplied.  It writes
+    the reached boundary atomically enough for a supervising process, then
+    waits for that process to publish the release file.  Signal handlers remain
+    free to set their process-local flag while the transition lock is held.
+    """
+    reached = os.environ.get("QFS_RUNTIME_BOUNDARY_REACHED")
+    release = os.environ.get("QFS_RUNTIME_BOUNDARY_RELEASE")
+    expected = os.environ.get("QFS_RUNTIME_BOUNDARY")
+    if not reached or not release or boundary != expected:
+        return
+    Path(reached).write_text(boundary, encoding="utf-8")
+    while not Path(release).exists():
+        time.sleep(0.005)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -73,7 +93,8 @@ def main(argv: list[str] | None = None) -> int:
                 coordinator = PaperTransitionCoordinator(
                     str(run_id), effective,
                     build_strategy(effective.strategy.name, effective.strategy.parameters),
-                    TransitionJournal(directory), data_fingerprint=f"sha256:{fingerprint}")
+                    TransitionJournal(directory), failure_injector=_process_boundary_hook,
+                    data_fingerprint=f"sha256:{fingerprint}")
                 stop_flag = StopFlag(); stop_flag.install()
                 PaperRuntime(coordinator, pace_seconds=pace_seconds,
                              stop_flag=stop_flag,

@@ -1,6 +1,11 @@
 import json
 import signal
 import multiprocessing
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 import pytest
 
 from quant_futures.paper_runtime import (OperationalRequests, PaperRuntime,
@@ -150,6 +155,58 @@ def _runtime_files(root):
         "strategy:\n  name: flat\n  parameters: {}\n"
         "fill_timing: current_close\noutput_directory: .\n", encoding="utf-8")
     return config_path, replay
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("location", ["inside", "waiting"])
+def test_source_cli_actual_signals_stop_at_committed_boundary(
+    tmp_path, signum, location,
+):
+    """Exercise actual signals in a source-tree CLI process, not a handler call."""
+    from quant_futures.paper_runtime import Lifecycle, LifecycleState, RuntimeConsumerLease
+
+    config_path, replay = _runtime_files(tmp_path)
+    config_path.write_text(config_path.read_text().replace(
+        "output_directory: .", f"output_directory: {tmp_path}"), encoding="utf-8")
+    reached, release = tmp_path / "reached", tmp_path / "release"
+    env = os.environ.copy()
+    repository = Path(__file__).parents[2]
+    env["PYTHONPATH"] = str(repository / "src")
+    if location == "inside":
+        env.update({
+            "QFS_RUNTIME_BOUNDARY": "journal:strategy_committed",
+            "QFS_RUNTIME_BOUNDARY_REACHED": str(reached),
+            "QFS_RUNTIME_BOUNDARY_RELEASE": str(release),
+        })
+    process = subprocess.Popen(
+        [sys.executable, "-m", "quant_futures.product.cli", "paper", "start",
+         "--config", str(config_path), "--replay", str(replay), "--pace", "0.5s"],
+        cwd=repository, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    line = process.stdout.readline().strip()
+    assert line.startswith("run_directory: ")
+    run = Path(line.split(": ", 1)[1])
+    deadline = time.monotonic() + 10
+    if location == "inside":
+        while not reached.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert reached.exists()
+    else:
+        journal = run / "transitions.journal"
+        while (not journal.exists() or not journal.stat().st_size) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert journal.exists() and journal.stat().st_size
+        time.sleep(0.05)  # paced wait after the first committed transition
+    process.send_signal(signum)
+    if location == "inside":
+        release.touch()
+    stdout, stderr = process.communicate(timeout=15)
+    assert process.returncode == 0, (stdout, stderr)
+    assert Lifecycle(run).current().state is LifecycleState.COMPLETED
+    assert (run / "checkpoint.json").is_file()
+    assert not RuntimeConsumerLease.is_owned(run)
 
 
 def test_fresh_runtime_pause_resume_baselines_consumed_request(tmp_path):

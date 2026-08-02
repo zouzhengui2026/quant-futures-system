@@ -56,14 +56,39 @@ def _produce_product_cut(directory: str, config_path: str, replay: str,
     os._exit(0)
 
 
-def _recover_product_process(directory: str, repeat: bool = True) -> None:
+def _recover_product_process(directory: str) -> None:
     from quant_futures.paper_runtime import control
 
     control.recover(directory)
-    if repeat:
-        control.recover(directory)
+    os._exit(0)
+
+
+def _continue_product_process(directory: str) -> None:
+    from quant_futures.paper_runtime import control
+
     control.continue_runtime(directory)
     os._exit(0)
+
+
+def _crash_public_recovery(directory: str, boundary: str) -> None:
+    """Crash through the public recovery API, never a reconciliation helper."""
+    from quant_futures.paper_runtime import control
+
+    def cut(name: str) -> None:
+        if name == boundary:
+            os._exit(94)
+
+    control.recover(directory, failure_injector=cut)
+    os._exit(0)
+
+
+def _recover_twice_then_continue(directory: Path) -> None:
+    """Run each recovery attempt and continuation in a fresh OS process."""
+    for target in (_recover_product_process, _recover_product_process,
+                   _continue_product_process):
+        process = multiprocessing.Process(target=target, args=(str(directory),))
+        process.start(); process.join(30)
+        assert process.exitcode == 0
 
 
 def _write_product_fixture(root, timing):
@@ -241,9 +266,7 @@ def test_fresh_process_product_recovery_matrix(tmp_path, timing, cut_index):
     )
     producer.start(); producer.join(20)
     assert producer.exitcode == 0
-    recovery = multiprocessing.Process(target=_recover_product_process, args=(str(expected),))
-    recovery.start(); recovery.join(20)
-    assert recovery.exitcode == 0
+    _recover_twice_then_continue(expected)
 
     expected_records = TransitionJournal(expected).records()
     # Select by the one-based transition cursor rather than relying on stage names.
@@ -267,10 +290,7 @@ def test_fresh_process_product_recovery_matrix(tmp_path, timing, cut_index):
         # The cut happened after the named record became durable.
         assert TransitionJournal(recovered).records()[-1].stage == stage
 
-        restarter = multiprocessing.Process(
-            target=_recover_product_process, args=(str(recovered),))
-        restarter.start(); restarter.join(20)
-        assert restarter.exitcode == 0
+        _recover_twice_then_continue(recovered)
 
         actual_records = TransitionJournal(recovered).records()
         assert (recovered / "transitions.journal").read_bytes() == (
@@ -292,3 +312,66 @@ def test_fresh_process_product_recovery_matrix(tmp_path, timing, cut_index):
         assert len(input_ids) == len(set(input_ids))
         assert len(order_ids) == len(set(order_ids))
         assert len(fill_ids) == len(set(fill_ids))
+        transition_ids = [record.product_transition_id for record in actual_records
+                          if record.stage == "transition_started"]
+        assert len(transition_ids) == len(set(transition_ids))
+
+
+@pytest.mark.parametrize("boundary", [
+    "recovery_started_durable",
+    "recovery_suffix_checkpoint_durable",
+    "recovery_outcome_durable",
+    "checkpoint_temporary_written",
+    "checkpoint_file_flush_completed",
+    "checkpoint_file_fsync_completed",
+    "checkpoint_atomic_replace_completed",
+    "checkpoint_directory_fsync_completed",
+    "checkpoint_post_directory_fsync_published",
+    "recovery_commitment_published",
+])
+def test_public_recovery_publication_cuts_converge_in_fresh_processes(
+    tmp_path, boundary,
+):
+    """Every public recovery publication cut is restartable and lease-clean."""
+    from quant_futures.paper_runtime import RecoveryAttempts, RuntimeConsumerLease
+
+    config, replay = _write_product_fixture(tmp_path, "current_close")
+    run = tmp_path / "recovery-publication"
+    _initialize_product_run(str(run), str(config), str(replay))
+    producer = multiprocessing.Process(
+        target=_produce_product_cut,
+        args=(str(run), str(config), str(replay), 1, "strategy_committed"),
+    )
+    producer.start(); producer.join(20)
+    assert producer.exitcode == 93
+
+    crashed = multiprocessing.Process(
+        target=_crash_public_recovery, args=(str(run), boundary))
+    crashed.start(); crashed.join(30)
+    assert crashed.exitcode == 94
+    assert not RuntimeConsumerLease.is_owned(run)
+
+    # A second crash while reconciling the prior invocation, followed by two
+    # entirely fresh coherent attempts and a separate continuation process.
+    second = multiprocessing.Process(
+        target=_crash_public_recovery,
+        args=(str(run), "recovery_started_durable"),
+    )
+    second.start(); second.join(30)
+    assert second.exitcode in {0, 94}
+    _recover_twice_then_continue(run)
+
+    records = RecoveryAttempts(run).read()
+    assert len(records) % 2 == 0
+    assert [record["outcome"] for record in records[::2]] == [
+        "started"
+    ] * (len(records) // 2)
+    assert all(record["outcome"] in {"recovered", "no-op", "failed"}
+               for record in records[1::2])
+    assert all(records[index + 1]["previous_digest"] == records[index]["digest"]
+               for index in range(len(records) - 1))
+    checkpoint = CheckpointStore(run).read()
+    assert checkpoint["recovery_counter"] == len(records) // 2
+    assert checkpoint["recovery_digest"] == records[-1]["digest"]
+    assert len(list(run.glob(".checkpoint.json.*.tmp"))) <= 1
+    assert not RuntimeConsumerLease.is_owned(run)
