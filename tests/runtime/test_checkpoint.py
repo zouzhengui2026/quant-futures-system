@@ -305,6 +305,90 @@ def test_product_strategy_codecs_restore(strategy, tmp_path):
     assert restored.state.input_cursor == 1
 
 
+def test_flat_committed_position_restores_and_continues_exactly(tmp_path):
+    cfg = config()
+    uninterrupted_path = tmp_path / "all-flat"; uninterrupted_path.mkdir()
+    restarted_path = tmp_path / "restart-flat"; restarted_path.mkdir()
+    uninterrupted = authorized_coordinator(
+        "flat-restore", cfg, MovingAverageCrossover(1, 2),
+        TransitionJournal(uninterrupted_path))
+    restarted = authorized_coordinator(
+        "flat-restore", cfg, MovingAverageCrossover(1, 2),
+        TransitionJournal(restarted_path))
+
+    # Warm up, open long, then make the fast and slow averages equal to close flat.
+    for index, close in enumerate((100.0, 110.0, 110.0)):
+        uninterrupted.transition(bar(index, close=close))
+        flat = restarted.transition(bar(index, close=close))
+    assert flat.portfolio_snapshot.positions[0].side.value == "flat"
+    checkpoint = json.loads((restarted_path / "checkpoint.json").read_bytes())
+    assert checkpoint["account"]["mark_price"] is None
+
+    restarted = PaperTransitionCoordinator(
+        "flat-restore", cfg, MovingAverageCrossover(1, 2),
+        TransitionJournal(restarted_path), data_fingerprint=VERIFIED_DATA)
+    expected = uninterrupted.transition(bar(3, close=120.0))
+    actual = restarted.transition(bar(3, close=120.0))
+
+    assert actual.portfolio_snapshot == expected.portfolio_snapshot
+    assert actual.account_snapshot == expected.account_snapshot
+    assert actual.risk_snapshot == expected.risk_snapshot
+    assert actual.counters == expected.counters
+    assert (restarted_path / "transitions.journal").read_bytes() == (
+        uninterrupted_path / "transitions.journal").read_bytes()
+    assert (restarted_path / "checkpoint.json").read_bytes() == (
+        uninterrupted_path / "checkpoint.json").read_bytes()
+
+
+@pytest.mark.parametrize("claimed_name, attributes", [
+    ("hold", {}),
+    ("fixed", {"value": 1.0}),
+    ("flat", {"value": 0.0}),
+    ("moving_average_crossover", {"fast": 1, "slow": 2}),
+    ("channel_breakout", {"lookback": 2}),
+])
+def test_builtin_strategy_codec_names_cannot_be_spoofed(tmp_path, claimed_name, attributes):
+    class StatefulLookalike:
+        name = claimed_name
+        version = "1"
+
+        def __init__(self):
+            self.hidden_calls = 0
+            for name, value in attributes.items():
+                setattr(self, name, value)
+
+        def target(self, context):
+            self.hidden_calls += 1
+            return float(self.hidden_calls % 2)
+
+    running_lifecycle(tmp_path, "spoofed-codec")
+    with pytest.raises(TransitionError, match="no bounded checkpoint codec"):
+        PaperTransitionCoordinator(
+            "spoofed-codec", config(), StatefulLookalike(), TransitionJournal(tmp_path),
+            data_fingerprint=VERIFIED_DATA)
+    assert not (tmp_path / "transitions.journal").exists()
+    assert not (tmp_path / "checkpoint.json").exists()
+
+
+@pytest.mark.parametrize("strategy", [
+    MovingAverageCrossover(1, 2), ChannelBreakout(2), FixedStrategy(1.0),
+])
+def test_builtin_strategy_codec_revalidates_mutable_parameters(tmp_path, strategy):
+    if type(strategy) is MovingAverageCrossover:
+        strategy.slow = strategy.fast
+    elif type(strategy) is ChannelBreakout:
+        strategy.lookback = 1
+    else:
+        strategy.value = 0.5
+    running_lifecycle(tmp_path, "invalid-codec")
+    with pytest.raises(TransitionError, match="no bounded checkpoint codec"):
+        PaperTransitionCoordinator(
+            "invalid-codec", config(), strategy, TransitionJournal(tmp_path),
+            data_fingerprint=VERIFIED_DATA)
+    assert not (tmp_path / "transitions.journal").exists()
+    assert not (tmp_path / "checkpoint.json").exists()
+
+
 def test_stateful_custom_strategy_without_codec_fails_closed(tmp_path):
     class Stateful:
         name = "custom_stateful"

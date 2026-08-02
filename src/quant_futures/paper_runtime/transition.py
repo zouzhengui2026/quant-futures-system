@@ -26,7 +26,14 @@ from quant_futures.portfolio.models import PortfolioSnapshot, PositionSnapshot
 from quant_futures.product.config import ProductConfig
 from quant_futures.product.data import Bar
 from quant_futures.product.engine import _candidate, _position
-from quant_futures.product.strategy import Strategy, StrategyContext
+from quant_futures.product.strategy import (
+    ChannelBreakout,
+    FixedStrategy,
+    HoldStrategy,
+    MovingAverageCrossover,
+    Strategy,
+    StrategyContext,
+)
 from quant_futures.risk import RiskEngine
 from quant_futures.risk.policies import ThresholdRiskPolicy
 from quant_futures.risk.portfolio_engine import PortfolioRiskEngine
@@ -257,9 +264,13 @@ class PaperTransitionCoordinator:
         self._ledger.restore_checkpoint(portfolio)
         self._portfolio_snapshot = self._ledger.snapshot()
         mark_price = account.get("mark_price")
-        marks = (() if not portfolio.positions else (MarketDataRecord(
-            MarketDataKind.MARK_PRICE, portfolio.positions[0].symbol,
-            portfolio.positions[0].source, self._last_committed_timestamp,
+        open_positions = tuple(
+            position for position in portfolio.positions
+            if position.side is not PositionSide.FLAT
+        )
+        marks = (() if not open_positions else (MarketDataRecord(
+            MarketDataKind.MARK_PRICE, open_positions[0].symbol,
+            open_positions[0].source, self._last_committed_timestamp,
             {"price": _finite_number(mark_price, "mark price")}),))
         self._account_snapshot = self._account.value(portfolio, marks, cash_flow=self._cash_flow)
         self._portfolio_risk.restore_checkpoint_peak(
@@ -507,11 +518,11 @@ def _time(value: datetime) -> str:
 
 def _strategy_bound(strategy: Strategy, *, allow_unsupported: bool = False) -> int:
     """Fixed documented maximum close window required by Product v0.1 strategies."""
-    if strategy.name == "moving_average_crossover":
-        return int(getattr(strategy, "slow"))
-    if strategy.name == "channel_breakout":
-        return int(getattr(strategy, "lookback")) + 1
-    if strategy.name in {"fixed", "flat", "hold"}:
+    if type(strategy) is MovingAverageCrossover:
+        return strategy.slow
+    if type(strategy) is ChannelBreakout:
+        return strategy.lookback + 1
+    if type(strategy) in {FixedStrategy, HoldStrategy}:
         return 1
     if allow_unsupported:
         return 1
@@ -520,21 +531,35 @@ def _strategy_bound(strategy: Strategy, *, allow_unsupported: bool = False) -> i
 
 def _strategy_codec(strategy: Strategy) -> str:
     """Validate the explicit Product v0.1 bounded restoration contract."""
-    supported = {"moving_average_crossover", "channel_breakout", "fixed", "flat", "hold"}
-    if (strategy.name not in supported or strategy.version != "1"
-            or (strategy.name in {"fixed", "flat"} and not hasattr(strategy, "value"))):
+    valid = False
+    if type(strategy) is MovingAverageCrossover:
+        valid = (strategy.name == "moving_average_crossover" and strategy.version == "1"
+                 and type(strategy.fast) is int and type(strategy.slow) is int
+                 and 0 < strategy.fast < strategy.slow)
+    elif type(strategy) is ChannelBreakout:
+        valid = (strategy.name == "channel_breakout" and strategy.version == "1"
+                 and type(strategy.lookback) is int and strategy.lookback >= 2)
+    elif type(strategy) is FixedStrategy:
+        valid = (strategy.name in {"fixed", "flat"} and strategy.version == "1"
+                 and type(strategy.value) in {int, float} and isfinite(strategy.value)
+                 and strategy.value in {-1.0, 0.0, 1.0}
+                 and (strategy.name != "flat" or strategy.value == 0.0))
+    elif type(strategy) is HoldStrategy:
+        valid = strategy.name == "hold" and strategy.version == "1"
+    if not valid:
         raise TransitionError("strategy has no bounded checkpoint codec")
     return f"product-v0.1/{strategy.name}/1"
 
 
 def _strategy_codec_state(strategy: Strategy) -> dict[str, object]:
-    if strategy.name == "moving_average_crossover":
-        return {"fast": int(getattr(strategy, "fast")), "slow": int(getattr(strategy, "slow"))}
-    if strategy.name == "channel_breakout":
-        return {"lookback": int(getattr(strategy, "lookback"))}
-    if strategy.name in {"fixed", "flat"}:
-        return {"value": float(getattr(strategy, "value"))}
-    if strategy.name == "hold":
+    # Admission is sealed by _strategy_codec before this serializer is used.
+    if type(strategy) is MovingAverageCrossover:
+        return {"fast": strategy.fast, "slow": strategy.slow}
+    if type(strategy) is ChannelBreakout:
+        return {"lookback": strategy.lookback}
+    if type(strategy) is FixedStrategy:
+        return {"value": float(strategy.value)}
+    if type(strategy) is HoldStrategy:
         return {}
     return {}
 
