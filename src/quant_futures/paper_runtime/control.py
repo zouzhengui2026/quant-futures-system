@@ -546,13 +546,35 @@ def continue_runtime(run_directory: str | Path, *, install_signals: bool = False
 
 
 def audit(run_directory: str | Path) -> bool:
-    """Validate lifecycle authority and require the projection to match it exactly."""
+    """Validate every runtime authority and its disposable projection.
+
+    Audit is deliberately stricter than recovery: it never repairs an
+    interrupted publication.  Exact protocol temporary files are evidence of
+    an unresolved publication and therefore make the run fail closed.
+    """
     from .operations import OperationalError
     try:
         with RunDirectoryLock(run_directory):
-            expected = _project_status_held(Lifecycle(run_directory))
-            actual = json.loads((Path(run_directory) / "status.json").read_text(encoding="utf-8"))
-    except (LifecycleError, JournalError, OSError, UnicodeDecodeError,
+            directory = Path(run_directory)
+            lifecycle = Lifecycle(directory)
+            expected = _project_status_held(lifecycle)
+            actual = json.loads((directory / "status.json").read_text(encoding="utf-8"))
+            # Runtime metadata is recovery-critical authority.  Cross-check
+            # both content hashes even for an otherwise terminal run.
+            if (directory / "runtime.json").exists():
+                _runtime_metadata(directory)
+            # These exact names are created by our atomic publication
+            # protocols.  Similarly named operator files are not rejected.
+            temporary_patterns = (
+                ".checkpoint.json.*.tmp",
+                ".status.json.*.tmp",
+                ".runtime.json.*.tmp",
+                ".control-request.json.*.tmp",
+            )
+            if any(candidate.is_file() for pattern in temporary_patterns
+                   for candidate in directory.glob(pattern)):
+                return False
+    except (LifecycleError, JournalError, CheckpointError, OSError, UnicodeDecodeError,
             json.JSONDecodeError, ValueError, OperationalError):
         return False
     return actual == expected

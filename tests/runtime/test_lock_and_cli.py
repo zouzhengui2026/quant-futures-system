@@ -207,6 +207,27 @@ def test_paper_audit_accepts_missing_or_empty_checkpoint_two_journal(tmp_path: P
     assert paper_control.audit(directory)
 
 
+@pytest.mark.parametrize("name", [
+    ".checkpoint.json.crash.tmp",
+    ".status.json.crash.tmp",
+    ".runtime.json.crash.tmp",
+    ".control-request.json.crash.tmp",
+])
+def test_paper_audit_rejects_protocol_temporary_artifacts(
+    tmp_path: Path, name: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory = start(tmp_path)
+    (directory / name).write_bytes(b"forged-or-leftover")
+    assert main(["paper", "audit", str(directory)]) == 3
+    assert "paper runtime audit: mismatch" in capsys.readouterr().out
+
+
+def test_paper_audit_does_not_reject_similarly_named_operator_file(tmp_path: Path) -> None:
+    directory = start(tmp_path)
+    (directory / ".checkpoint.json.operator-note").write_text("not protocol", encoding="utf-8")
+    assert paper_control.audit(directory)
+
+
 @pytest.mark.parametrize("corruption", ["tamper", "truncate", "duplicate", "reorder"])
 def test_paper_audit_journal_corruption_returns_exit_three(
     tmp_path: Path, corruption: str, capsys: pytest.CaptureFixture[str],

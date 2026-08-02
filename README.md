@@ -26,9 +26,9 @@ quant-futures paper --config examples/btc_ma_paper.yaml --replay examples/data/b
 `paper --replay` is a **finite historical replay preview**, not paced or
 restartable paper trading. Interrupted-run continuation is not supported.
 
-### Paper Runtime control plane (Phase 14, checkpoint 1)
+### Restart-safe Paper Runtime operator guide
 
-Checkpoint 1 also installs the scriptable lifecycle control surface:
+The installed console script provides the finite, single-symbol Paper Runtime:
 
 ```bash
 quant-futures paper start --config examples/btc_ma_paper.yaml --replay examples/data/btc_usdt_1h.csv --pace 1s
@@ -40,39 +40,62 @@ quant-futures paper recover RUN_DIRECTORY
 quant-futures paper audit RUN_DIRECTORY
 ```
 
-The runtime now also provides a durable `transitions.journal` foundation. Its versioned,
-protected framed canonical-JSON envelope records deterministic journal and product transition
-identities, stage, event type, effective market time, input cursor, payload, and SHA-256 lineage.
-Startup validates the committed prefix in one streaming pass without retaining its history;
-steady-state appends use constant-sized tail metadata, and streaming and validated-tail APIs
-avoid materializing history for control operations. Protected headers and commit footers allow
-the run-locked recovery path to truncate and fsync only a provably incomplete final append before
-changing lifecycle state. Completed-frame corruption, invalid schema,
-reordering, duplication, modification, and oversized frames fail closed. `paper audit` validates
-this authority (a missing or empty journal is valid during Checkpoint 2) and projects its sequence
-and tail digest from a lock-consistent snapshot. Incremental market-event transitions reuse the
-Product strategy, execution, portfolio, account, and risk authorities under one writer lock.
-After each durable `transition_committed` record, a versioned canonical `checkpoint.json` is
-published with atomic same-directory replacement, file and directory fsync. It records the
-committed cursor/order key, a fixed strategy-lookback window, pending execution, bounded
-portfolio/account/risk authority, counters/cash flow, lifecycle and journal lineage, and
-configuration/data identities. Checkpoint size and publication work therefore do not grow with
-processed bars. Replay identity is bound to a streaming SHA-256 content digest, or to an explicit
-externally verified SHA-256 fingerprint; unreadable replay content never silently downgrades the
-identity. A fresh coordinator validates those identities and restores the real Product authorities
-including a pending next-open order, before accepting the next input. Corrupt, stale, foreign,
-or incomplete checkpoints fail closed rather than falling back to empty state. `recover` is legal
-only for a persisted
-`FAILED_RECOVERABLE` lifecycle and validates or safely repairs journal framing before lifecycle
-mutation. Reconciliation of a crash inside a partially journaled transition, signal-driven
-continuation, and exactly-once recovery remain later checkpoints and are not claimed here.
-Invalid or repeated transitions fail closed with exit code 2, while an audit mismatch exits 3.
+`start` prints the run directory immediately, then owns and consumes the replay. Use a nonzero
+pace when another process must issue controls. `pause` takes effect only after the current input
+has committed, checkpoints that boundary, and makes the owner exit. `resume` reopens that same
+directory and consumes only the remaining inputs. A paused `stop` records
+`STOPPING -> COMPLETED`; repeating `stop` is a successful no-op. `SIGINT` and `SIGTERM` merely set
+a process-local flag: the runtime performs the same boundary-safe terminal stop as an operator
+request. Terminal runs reject resume and recovery.
 
-`lifecycle.jsonl` is the checkpoint-one lifecycle authority. `status.json` is explicitly a
-disposable, non-authoritative projection rebuilt from that log. Mutating commands acquire an
-OS-backed, non-blocking `.paper-runtime.lock`; a concurrent writer is rejected rather than
-waiting or racing. This control plane does not introduce accounting or risk state and does not
-claim exactly-once processing or restart safety.
+Only one consumer may own a run. A separate OS-released lifetime lease makes a competing
+start/continue/recover fail before Product mutation. Status distinguishes a live RUNNING owner,
+relinquished PAUSED/terminal runs, and an ownerless RUNNING run (`stalled`). `recover` rejects a
+live owner; for a stalled or partial run it validates all authority, completes at most one legal
+transition suffix, publishes the matching checkpoint, and continues the remaining replay.
+
+#### Run-directory authority
+
+| Artifact | Role |
+| --- | --- |
+| `lifecycle.jsonl` | Append-only lifecycle authority and legal operational lineage. |
+| `transitions.journal` | Protected framed Product-stage authority with deterministic IDs and SHA-256 chain. |
+| `checkpoint.json` | Atomic, bounded canonical Product state at the last committed transition. |
+| `recovery-attempts.jsonl` | Hash-chained recovery invocations, committed back into the checkpoint. |
+| `runtime.json` | Immutable config/replay paths, content hashes, and pacing needed to reopen. |
+| `control-request.json` | Monotonic boundary request; operational, not trading authority. |
+| `status.json` | Disposable projection only. It may be rebuilt and must exactly match authority. |
+| `.paper-runtime.lock`, `.paper-runtime-consumer.lock` | Transaction lock and lifetime lease; never Product state. |
+
+Each Product input is journaled in causal stages. The cursor advances only at durable
+`transition_committed`, after which the bounded checkpoint is atomically replaced and directory
+fsynced. Recovery recomputes already-written stages through the same Product strategy, execution,
+portfolio, account, and risk engines, verifies their protected payloads, and appends only the
+missing suffix. This gives exactly-once Product authority for the supported finite replay model,
+including current-close and carried next-open fills, fixed commission/slippage, explicit-row
+funding, cash flow, peak equity, and drawdown. It does not promise exactly-once effects in an
+external exchange or filesystem durability beyond the host OS/storage guarantees.
+
+`paper audit` is read-only and fail-closed. It validates lifecycle, journal framing/digests,
+checkpoint/recovery commitments, replay/config content identity, status equality, and absence of
+protocol temporary artifacts. Audit never invents or repairs Product state. Recovery may remove
+only a provably incomplete final journal frame and exact-pattern orphan checkpoint temporaries;
+completed-frame corruption, a malformed or ambiguous suffix, stale authority, or identity change
+requires preserving the directory for investigation. Do not hand-edit authority files.
+
+Deterministic command exit codes are: **0** success (including idempotent controls), **2** invalid
+input/state, contention, terminal rejection, or other operational failure, and **3** audit
+mismatch. Commands emit concise errors on stderr and scriptable JSON/status text on stdout.
+
+Troubleshooting order: run `paper status`, verify no other owner is live, copy the directory,
+then run `paper audit`. Use `recover` only for a stalled/recoverable run. A changed config or CSV,
+corrupt checkpoint/journal/recovery chain, forged protocol temporary, or terminal run fails closed.
+Never delete a recovery record or replace a replay file in place.
+
+The runtime is a local deterministic simulator: no exchange credentials, private APIs,
+WebSockets, live feeds, real orders, multi-symbol coordination, leverage, margin, liquidation,
+order-book liquidity, or crash-atomic external side effects are provided. It is not a daemon,
+HA service, trading recommendation, or production exchange connector.
 
 Each command prints its deterministic run ID, directory, return, drawdown, trade count,
 and final equity. Remove or select a different `output_directory` before repeating an
