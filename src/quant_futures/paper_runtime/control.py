@@ -67,12 +67,18 @@ def _project_status_held(
             "last_committed_ordering_key": checkpoint.get("last_committed_ordering_key"),
         })
     from .operations import RecoveryAttempts
-    attempts = RecoveryAttempts(lifecycle.run_directory).read()
-    status["recovery_attempts"] = len(attempts)
-    status["health"] = "healthy" if record.state in {
+    attempts = RecoveryAttempts(lifecycle.run_directory)
+    status["recovery_attempts"] = attempts.attempt_count()
+    coherent = (journal_tail is None and checkpoint is None) or (
+        checkpoint is not None and journal_tail is not None
+        and checkpoint.get("journal", {}).get("digest") == journal_tail.digest)
+    status["last_durable_stage"] = getattr(journal_tail, "stage", None)
+    status["recoverable"] = bool(journal_tail is not None and not coherent)
+    status["terminal"] = record.state is LifecycleState.FAILED_TERMINAL
+    status["health"] = "healthy" if coherent and record.state in {
         LifecycleState.RUNNING, LifecycleState.PAUSED, LifecycleState.COMPLETED
     } else "attention"
-    status["stalled"] = False
+    status["stalled"] = not coherent
     return status
 
 
@@ -116,6 +122,17 @@ def start(root: str | Path) -> Path:
     return directory
 
 
+def write_runtime_metadata(run_directory: str | Path, config: Path, replay: Path) -> None:
+    """Persist immutable reopen identities before the runtime consumes input."""
+    directory = Path(run_directory)
+    with RunDirectoryLock(directory):
+        path = directory / "runtime.json"
+        if path.exists():
+            raise LifecycleError("runtime metadata already exists")
+        _atomic_projection(path, {"schema_version": 1, "config": str(config),
+                                  "replay": str(replay)})
+
+
 def transition(run_directory: str | Path, target: LifecycleState, reason: str) -> LifecycleRecord:
     lifecycle = Lifecycle(run_directory)
     with RunDirectoryLock(run_directory):
@@ -129,8 +146,7 @@ def stop(run_directory: str | Path) -> LifecycleRecord:
     with RunDirectoryLock(run_directory):
         lifecycle._transition_held(LifecycleState.STOPPING, "stop requested")
         record = lifecycle._transition_held(
-            LifecycleState.COMPLETED, "checkpoint-one control plane stopped"
-        )
+            LifecycleState.COMPLETED, "checkpoint-one control plane stopped")
         _write_status_held(lifecycle)
         return record
 
@@ -152,6 +168,21 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
         journal_tail = journal_snapshot.tail
         if journal_tail is not None and journal_tail.run_id != current.run_id:
             raise JournalError("journal run ID does not match lifecycle authority")
+        checkpoint = CheckpointStore(run_directory).read() if CheckpointStore(run_directory).path.exists() else None
+        checkpoint_digest = (checkpoint.get("journal", {}).get("digest")
+                             if isinstance(checkpoint, dict) else None)
+        if (journal_tail is not None and journal_tail.digest != checkpoint_digest
+                and (Path(run_directory) / "runtime.json").exists()):
+            try:
+                _recover_product_suffix_held(Path(run_directory), current.run_id,
+                                             journal, journal_snapshot, checkpoint)
+                journal_snapshot = journal._snapshot_held()
+                attempts.append_held(current.run_id, "recovered")
+                _write_status_held(lifecycle, journal_snapshot)
+                return lifecycle.current()
+            except BaseException:
+                attempts.append_held(current.run_id, "failed")
+                raise
         if current.state is LifecycleState.RUNNING:
             attempts.append_held(current.run_id, "no-op")
             _write_status_held(lifecycle, journal_snapshot)
@@ -163,12 +194,58 @@ def recover(run_directory: str | Path) -> LifecycleRecord:
         return record
 
 
+def _recover_product_suffix_held(directory: Path, run_id: str,
+                                 journal: TransitionJournal,
+                                 snapshot: JournalSnapshot,
+                                 checkpoint: dict[str, object] | None) -> None:
+    """Validate and deterministically finish the sole journal suffix."""
+    from quant_futures.product.config import load_config
+    from quant_futures.product.data import Bar, load_bars
+    from quant_futures.product.strategy import build_strategy
+    from .transition import PaperTransitionCoordinator, TransitionError
+    from dataclasses import replace
+
+    try:
+        metadata = json.loads((directory / "runtime.json").read_text(encoding="utf-8"))
+        if (not isinstance(metadata, dict) or set(metadata) != {"schema_version", "config", "replay"}
+                or metadata["schema_version"] != 1):
+            raise TransitionError("invalid runtime metadata")
+        config = load_config(str(metadata["config"]))
+        config = replace(config, data=replace(config.data, path=str(Path(str(metadata["replay"])).resolve())))
+        bars, fingerprint = load_bars(str(metadata["replay"]), config.data.schema,
+                                      start=config.data.start, end=config.data.end,
+                                      timeframe=config.data.timeframe)
+        strategy = build_strategy(config.strategy.name, config.strategy.parameters)
+        base_sequence = int(checkpoint["journal"]["sequence"]) if checkpoint else 0
+        records = tuple(journal.iter_records())
+        if base_sequence < 0 or base_sequence > len(records):
+            raise TransitionError("checkpoint journal cursor is outside the journal")
+        base = JournalSnapshot(records[base_sequence - 1] if base_sequence else None)
+        suffix = records[base_sequence:]
+        if not suffix or len({r.product_transition_id for r in suffix}) != 1:
+            raise TransitionError("recovery requires exactly one incomplete transition suffix")
+        cursor = (int(checkpoint["cursor"]) if checkpoint else 0) + 1
+        if cursor > len(bars):
+            raise TransitionError("recovery cursor exceeds replay input")
+        bar: Bar = bars[cursor - 1]
+        coordinator = PaperTransitionCoordinator(
+            run_id, config, strategy, journal,
+            data_fingerprint=f"sha256:{fingerprint}", _recovery_base=base,
+            _recover_from_empty=checkpoint is None, _lock_held=True,
+        )
+        coordinator._transition_held(bar, suffix)
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise TransitionError(f"cannot recover product transition: {exc}") from exc
+
+
 def audit(run_directory: str | Path) -> bool:
     """Validate lifecycle authority and require the projection to match it exactly."""
+    from .operations import OperationalError
     try:
         with RunDirectoryLock(run_directory):
             expected = _project_status_held(Lifecycle(run_directory))
             actual = json.loads((Path(run_directory) / "status.json").read_text(encoding="utf-8"))
-    except (LifecycleError, JournalError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (LifecycleError, JournalError, OSError, UnicodeDecodeError,
+            json.JSONDecodeError, ValueError, OperationalError):
         return False
     return actual == expected

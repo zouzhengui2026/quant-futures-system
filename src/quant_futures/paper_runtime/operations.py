@@ -126,7 +126,11 @@ class PaperRuntime:
                 if command == "stop" or final:
                     if record.state in {LifecycleState.RUNNING, LifecycleState.PAUSED}:
                         lifecycle._transition_held(LifecycleState.STOPPING, "boundary-safe stop requested")
-                        lifecycle._transition_held(LifecycleState.COMPLETED, "final checkpoint committed")
+                        checkpoint_exists = (directory / "checkpoint.json").is_file()
+                        lifecycle._transition_held(
+                            LifecycleState.COMPLETED,
+                            "final checkpoint committed" if checkpoint_exists
+                            else "input completed without a committed product checkpoint")
                     _write_status_held(lifecycle, self.coordinator.state.journal_snapshot)
                     return True
                 if command == "pause" and record.state is LifecycleState.RUNNING:
@@ -147,7 +151,13 @@ class RecoveryAttempts:
     filename = "recovery-attempts.jsonl"
 
     def __init__(self, run_directory: str | Path) -> None:
-        self.path = Path(run_directory) / self.filename
+        self.run_directory = Path(run_directory)
+        self.path = self.run_directory / self.filename
+
+    def append(self, run_id: str, outcome: str = "started") -> int:
+        """Record one attempt through the public lock-enforced API."""
+        with RunDirectoryLock(self.run_directory):
+            return self.append_held(run_id, outcome)
 
     def append_held(self, run_id: str, outcome: str) -> int:
         records = self.read()
@@ -162,6 +172,10 @@ class RecoveryAttempts:
             stream.flush(); os.fsync(stream.fileno())
         _fsync_directory(self.path.parent)
         return sequence
+
+    def attempt_count(self) -> int:
+        """Return attempts, rather than the number of outcome records."""
+        return sum(record["outcome"] == "started" for record in self.read())
 
     def read(self) -> list[dict[str, object]]:
         if not self.path.exists():

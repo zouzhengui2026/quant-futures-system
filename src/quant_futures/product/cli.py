@@ -5,13 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
-from quant_futures.paper_runtime import LifecycleError, LifecycleState, RunLockError
+from quant_futures.paper_runtime import (LifecycleError, LifecycleState, OperationalError,
+                                         RunLockError)
 from quant_futures.paper_runtime import control as paper_control
 
 from .config import ConfigError, load_config
 from .orchestrator import audit, run
+from .data import load_bars
+from .strategy import build_strategy
 
 
 def parser() -> argparse.ArgumentParser:
@@ -49,17 +53,46 @@ def main(argv: list[str] | None = None) -> int:
                 if not Path(args.replay).is_file():
                     raise ConfigError(f"replay input does not exist: {args.replay}")
                 directory = paper_control.start(Path(config.output_directory) / "paper-runtime")
-                print(f"run_directory: {directory}")
+                print(f"run_directory: {directory}", flush=True)
+                replay_path = Path(args.replay).resolve()
+                config_path = Path(args.config).resolve()
+                paper_control.write_runtime_metadata(directory, config_path, replay_path)
+                effective = replace(config, data=replace(config.data, path=str(replay_path)))
+                bars, fingerprint = load_bars(replay_path, effective.data.schema,
+                    start=effective.data.start, end=effective.data.end,
+                    timeframe=effective.data.timeframe)
+                from quant_futures.paper_runtime import (PaperRuntime,
+                    PaperTransitionCoordinator, StopFlag, TransitionJournal)
+                run_id = paper_control.project_status(directory)["run_id"]
+                coordinator = PaperTransitionCoordinator(
+                    str(run_id), effective,
+                    build_strategy(effective.strategy.name, effective.strategy.parameters),
+                    TransitionJournal(directory), data_fingerprint=f"sha256:{fingerprint}")
+                stop_flag = StopFlag(); stop_flag.install()
+                PaperRuntime(coordinator, pace_seconds=float(args.pace[:-1]),
+                             stop_flag=stop_flag).run(bars)
                 return 0
             if args.paper_command == "status":
                 print(json.dumps(paper_control.project_status(args.run_directory), sort_keys=True))
                 return 0
             if args.paper_command == "pause":
-                paper_control.transition(args.run_directory, LifecycleState.PAUSED, "pause requested")
+                if (Path(args.run_directory) / "runtime.json").exists():
+                    from quant_futures.paper_runtime import OperationalRequests
+                    OperationalRequests(args.run_directory).request("pause")
+                else:
+                    paper_control.transition(args.run_directory, LifecycleState.PAUSED, "pause requested")
             elif args.paper_command == "resume":
-                paper_control.transition(args.run_directory, LifecycleState.RUNNING, "resume requested")
+                if (Path(args.run_directory) / "runtime.json").exists():
+                    from quant_futures.paper_runtime import OperationalRequests
+                    OperationalRequests(args.run_directory).request("resume")
+                else:
+                    paper_control.transition(args.run_directory, LifecycleState.RUNNING, "resume requested")
             elif args.paper_command == "stop":
-                paper_control.stop(args.run_directory)
+                if (Path(args.run_directory) / "runtime.json").exists():
+                    from quant_futures.paper_runtime import OperationalRequests
+                    OperationalRequests(args.run_directory).request("stop")
+                else:
+                    paper_control.stop(args.run_directory)
             elif args.paper_command == "recover":
                 paper_control.recover(args.run_directory)
             else:
@@ -83,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         identifier, directory, summary = run(config, getattr(args, "replay", None))
         print(f"run_id: {identifier}\noutput_directory: {directory}\ntotal_return: {summary['total_return']:.8f}\nmaximum_drawdown: {summary['maximum_drawdown']:.8f}\ntrade_count: {summary['trade_count']}\nfinal_equity: {summary['final_equity']:.8f}")
         return 0
-    except (ConfigError, LifecycleError, RunLockError, ValueError, OSError) as exc:
+    except (ConfigError, LifecycleError, OperationalError, RunLockError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

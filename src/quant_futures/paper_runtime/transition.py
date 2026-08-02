@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from math import isfinite
 from typing import Callable
+from contextlib import nullcontext
 
 from quant_futures.account import AccountEquityEngine
 from quant_futures.alpha import AlphaDirection
@@ -130,7 +131,9 @@ class PaperTransitionCoordinator:
                  *, config_digest: str | None = None,
                  data_fingerprint: str | None = None,
                  restore_checkpoint: bool = True,
-                 _publish_checkpoints: bool = True) -> None:
+                 _publish_checkpoints: bool = True,
+                 _recovery_base: JournalSnapshot | None = None,
+                 _lock_held: bool = False, _recover_from_empty: bool = False) -> None:
         if not run_id.strip():
             raise TransitionError("run ID must be non-empty")
         self.run_id, self.config, self.strategy, self.journal = run_id, config, strategy, journal
@@ -164,21 +167,33 @@ class PaperTransitionCoordinator:
         self._orders = self._fills = self._events = 0
         self._poisoned = False
         self._last_committed_timestamp: datetime | None = None
-        with RunDirectoryLock(journal.run_directory):
+        with (nullcontext() if _lock_held else RunDirectoryLock(journal.run_directory)):
             snapshot = journal._snapshot_held()
             if snapshot.tail is not None and snapshot.tail.run_id != run_id:
                 raise TransitionError("journal/lifecycle run ID mismatch")
             if snapshot.tail is not None:
+                if _recover_from_empty:
+                    self._journal_snapshot = snapshot
+                    self._portfolio_snapshot = self._ledger.snapshot()
+                    self._account_snapshot = self._account.value(self._portfolio_snapshot, ())
+                    self._risk_snapshot = self._portfolio_risk.evaluate(self._account_snapshot)
+                    return
                 if not restore_checkpoint:
                     raise TransitionError("non-empty journal requires authoritative restoration")
-                self._restore_held(snapshot)
+                self._restore_held(_recovery_base or snapshot,
+                                   authority_snapshot=snapshot if _recovery_base else None)
+                # During recovery canonical state names the checkpoint boundary,
+                # while append lineage must name the actual durable suffix tail.
+                if _recovery_base is not None:
+                    self._journal_snapshot = snapshot
                 return
         self._journal_snapshot = snapshot
         self._portfolio_snapshot = self._ledger.snapshot()
         self._account_snapshot = self._account.value(self._portfolio_snapshot, ())
         self._risk_snapshot = self._portfolio_risk.evaluate(self._account_snapshot)
 
-    def _restore_held(self, snapshot: JournalSnapshot) -> None:
+    def _restore_held(self, snapshot: JournalSnapshot, *,
+                      authority_snapshot: JournalSnapshot | None = None) -> None:
         """Restore bounded Product authority without replaying historical transitions."""
         try:
             store = CheckpointStore(self.journal.run_directory)
@@ -188,7 +203,7 @@ class PaperTransitionCoordinator:
             _validate_checkpoint(value, self, snapshot, lifecycle_before)
             self._install_bounded_state(value)
             if (store.path.read_bytes() != checkpoint_bytes
-                    or self.journal._snapshot_held() != snapshot
+                    or self.journal._snapshot_held() != (authority_snapshot or snapshot)
                     or Lifecycle(self.journal.run_directory).current() != lifecycle_before):
                 raise CheckpointError("authority changed during restoration")
             self._journal_snapshot = snapshot
@@ -336,7 +351,23 @@ class PaperTransitionCoordinator:
                 self._poisoned = True
                 raise
 
-    def _transition_held(self, bar: Bar) -> PaperTransitionState:
+    def recover_transition(self, bar: Bar, durable: tuple[object, ...]) -> PaperTransitionState:
+        """Recompute a single durable prefix and append only its missing suffix.
+
+        The coordinator must have been restored from the checkpoint immediately
+        preceding ``durable``.  Payload comparison is exact and every canonical
+        mutation is applied once in this fresh process.
+        """
+        if self._poisoned:
+            raise TransitionError("coordinator is unusable after a partial transition")
+        with RunDirectoryLock(self.journal.run_directory):
+            try:
+                return self._transition_held(bar, durable)
+            except BaseException:
+                self._poisoned = True
+                raise
+
+    def _transition_held(self, bar: Bar, durable: tuple[object, ...] = ()) -> PaperTransitionState:
         persisted = self.journal._snapshot_held()
         if persisted != self._journal_snapshot:
             raise TransitionError("journal advanced outside this coordinator")
@@ -362,15 +393,30 @@ class PaperTransitionCoordinator:
         )
         transition_id = deterministic_id(self.run_id, input_id, "transition", cursor)
         protocol = StageProtocol()
+        durable_index = 0
 
         def emit(stage: str, payload: dict[str, object]) -> None:
+            nonlocal durable_index
             protocol.accept(stage)
             self._failure_injector(f"journal:{stage}")
-            record = self.journal._append_held(
-                self.run_id, transition_id, stage, "paper_market_transition", timestamp,
-                cursor if stage == "transition_committed" else self._cursor,
-                {"input_event_id": input_id, **payload},
-            )
+            expected_payload = {"input_event_id": input_id, **payload}
+            if durable_index < len(durable):
+                record = durable[durable_index]
+                expected_cursor = cursor if stage == "transition_committed" else self._cursor
+                if (getattr(record, "run_id", None) != self.run_id
+                        or getattr(record, "product_transition_id", None) != transition_id
+                        or getattr(record, "stage", None) != stage
+                        or getattr(record, "effective_market_timestamp", None) != timestamp
+                        or getattr(record, "input_cursor", None) != expected_cursor
+                        or getattr(record, "payload", None) != expected_payload):
+                    raise TransitionError(f"durable recovery stage mismatch: {stage}")
+                durable_index += 1
+            else:
+                record = self.journal._append_held(
+                    self.run_id, transition_id, stage, "paper_market_transition", timestamp,
+                    cursor if stage == "transition_committed" else self._cursor,
+                    expected_payload,
+                )
             self._events += 1
             self._failure_injector(f"durable:{stage}")
 
@@ -475,6 +521,8 @@ class PaperTransitionCoordinator:
         emit("transition_committed", {"orders": self._orders, "fills": self._fills,
                                       "state_digest": state_digest})
         protocol.complete()
+        if durable_index != len(durable):
+            raise TransitionError("durable recovery suffix contains extra or illegal stages")
         self._cursor = cursor
         self._last_committed_timestamp = bar.timestamp
         self._journal_snapshot = self.journal._snapshot_held()
