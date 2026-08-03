@@ -156,6 +156,19 @@ def _eventually(cli: InstalledCLI, *arguments: str) -> subprocess.CompletedProce
         time.sleep(0.02)
 
 
+def _wait_checkpoint(cli: InstalledCLI, run: Path, predicate, timeout: float = 20) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            checkpoint = cli.inspect(run)["checkpoint"]
+            if predicate(checkpoint):
+                return checkpoint
+        except (AssertionError, FileNotFoundError, json.JSONDecodeError):
+            pass
+        time.sleep(0.02)
+    raise AssertionError(f"checkpoint predicate not reached for {run}")
+
+
 def _assert_clean(cli: InstalledCLI, run: Path, lifecycle: str = "COMPLETED") -> None:
     status = cli.run("paper", "status", str(run))
     assert status.returncode == 0 and status.stderr == ""
@@ -173,29 +186,42 @@ def _product_core(document: dict[str, object]) -> dict[str, object]:
             if key not in {"lifecycle", "recovery_counter", "recovery_digest"}}
 
 
+def _product_authority(document: dict[str, object]) -> dict[str, object]:
+    """Name the Product authorities whose equality is the acceptance contract."""
+    core = _product_core(document)
+    required = {"cursor", "strategy", "execution", "counters", "portfolio",
+                "account", "risk", "last_committed_ordering_key", "journal"}
+    assert required <= core.keys()
+    return {name: core[name] for name in sorted(required)}
+
+
 def _assert_product_equal(cli: InstalledCLI, expected: Path, actual: Path) -> None:
     left, right = cli.inspect(expected), cli.inspect(actual)
     assert (expected / "transitions.journal").read_bytes() == (
         actual / "transitions.journal").read_bytes()
     assert left["records"] == right["records"]
     assert _product_core(left["checkpoint"]) == _product_core(right["checkpoint"])
+    assert _product_authority(left["checkpoint"]) == _product_authority(right["checkpoint"])
     records = right["records"]
     for field, stage in (("journal_event_id", None),
                          ("product_transition_id", "transition_started")):
         values = [record[field] for record in records
                   if stage is None or record["stage"] == stage]
         assert len(values) == len(set(values))
-    for field in ("order_id", "fill_id"):
-        values = [record["payload"][field] for record in records
-                  if field in record["payload"]]
-        # One deterministic ID legitimately appears in multiple causal stages;
-        # its payload must always describe the same authority object.
-        by_id: dict[str, set[str]] = {}
-        for record in records:
-            if field in record["payload"]:
-                by_id.setdefault(record["payload"][field], set()).add(
-                    json.dumps(record["payload"], sort_keys=True))
-        assert values and all(by_id.values())
+    submitted = {record["payload"]["order_id"]: record["payload"]
+                 for record in records if record["stage"] == "order_submitted"}
+    prepared = {record["payload"]["fill_id"]: record["payload"]
+                for record in records if record["stage"] == "fill_prepared"}
+    committed = {record["payload"]["fill_id"]: record["payload"]
+                 for record in records if record["stage"] == "fill_committed"}
+    assert len(submitted) == sum(r["stage"] == "order_submitted" for r in records)
+    assert len(prepared) == sum(r["stage"] == "fill_prepared" for r in records)
+    assert len(committed) == sum(r["stage"] == "fill_committed" for r in records)
+    assert prepared.keys() == committed.keys()
+    for fill_id, fill in committed.items():
+        assert fill["order_id"] in submitted
+        assert prepared[fill_id]["order_id"] == fill["order_id"]
+        assert prepared[fill_id]["fill_price"] == fill["fill_price"]
 
 
 def test_installed_operator_pause_resume_and_paused_stop(installed_cli: InstalledCLI,
@@ -207,6 +233,22 @@ def test_installed_operator_pause_resume_and_paused_stop(installed_cli: Installe
     before = (run / "lifecycle.jsonl").read_bytes()
     rejected = installed_cli.run("paper", "recover", str(run))
     assert rejected.returncode == 2 and rejected.stdout == "" and rejected.stderr.startswith("error: ")
+    assert (run / "lifecycle.jsonl").read_bytes() == before
+    # This is a distinct installed consumer process, not the live-recover
+    # rejection above.  Reusing the deterministic run identity makes a second
+    # installed start target the live run and fail before any authority write.
+    config, replay = _files(tmp_path / "second-consumer-input")
+    contender_env = installed_cli.env | {
+        "QFS_RUNTIME_TEST_ROOT": str(tmp_path / "resume" / "runs"),
+        "QFS_RUNTIME_TEST_RUN_ID": "1" * 32,
+    }
+    contender = subprocess.run(
+        [str(installed_cli.console), "paper", "start", "--config", str(config),
+         "--replay", str(replay), "--pace", "1s"], cwd=installed_cli.cwd,
+        env=contender_env, text=True, capture_output=True, timeout=10)
+    assert contender.returncode == 2
+    assert contender.stdout == ""
+    assert contender.stderr == f"error: [Errno 17] File exists: '{run}'\n"
     assert (run / "lifecycle.jsonl").read_bytes() == before
     _eventually(installed_cli, "paper", "pause", str(run))
     output, error = owner.communicate(timeout=20)
@@ -320,6 +362,7 @@ def test_installed_recovery_of_recovery_has_deterministic_exit(installed_cli: In
     recovery_reached = run.parent / "recovery_started_durable.reached"
     first = installed_cli.recover_process(run, boundary="recovery_started_durable")
     _wait(recovery_reached); first.kill(); first.communicate(timeout=10)
+    assert first.returncode == -signal.SIGKILL
     second = installed_cli.run("paper", "recover", str(run), timeout=30)
     assert second.returncode == 0, second.stderr
     records = [json.loads(line) for line in (run / "recovery-attempts.jsonl").read_text().splitlines()]
@@ -327,6 +370,47 @@ def test_installed_recovery_of_recovery_has_deterministic_exit(installed_cli: In
     checkpoint = installed_cli.inspect(run)["checkpoint"]
     assert checkpoint["recovery_counter"] == 2
     assert checkpoint["recovery_digest"] == records[-1]["digest"]
+    _assert_clean(installed_cli, run)
+
+
+@pytest.mark.parametrize("boundary", [
+    "recovery_outcome_durable",
+    "checkpoint_temporary_written",
+    "checkpoint_file_flush_completed",
+    "checkpoint_file_fsync_completed",
+    "checkpoint_atomic_replace_completed",
+    "checkpoint_directory_fsync_completed",
+    "checkpoint_post_directory_fsync_published",
+    "recovery_commitment_published",
+])
+def test_installed_recovery_publication_boundaries(
+    installed_cli: InstalledCLI, tmp_path: Path, boundary: str,
+) -> None:
+    """Installed recovery reconciles every outcome/commit publication cut."""
+    files = _files(tmp_path / "inputs", fill_timing="current_close")
+    owner, run = _launch(
+        installed_cli, tmp_path / "run", "c" * 32, pace="0s", files=files,
+        extra={"QFS_RUNTIME_BOUNDARY": "durable:fill_committed",
+               "QFS_RUNTIME_BOUNDARY_REACHED": str(tmp_path / "product.reached"),
+               "QFS_RUNTIME_BOUNDARY_RELEASE": str(tmp_path / "product.release")})
+    _wait(tmp_path / "product.reached"); owner.kill(); owner.communicate(timeout=10)
+    recovery = installed_cli.recover_process(run, boundary=boundary)
+    _wait(run.parent / f"{boundary}.reached")
+    recovery.kill(); recovery.communicate(timeout=10)
+    assert recovery.returncode == -signal.SIGKILL
+    retried = installed_cli.run("paper", "recover", str(run), timeout=30)
+    assert retried.returncode == 0, retried.stderr
+    attempts = [json.loads(line) for line in
+                (run / "recovery-attempts.jsonl").read_text().splitlines()]
+    assert [record["sequence"] for record in attempts] == list(range(1, len(attempts) + 1))
+    assert all(record["previous_digest"] == (attempts[index - 1]["digest"] if index else None)
+               for index, record in enumerate(attempts))
+    assert [record["outcome"] for record in attempts[::2]] == ["started"] * (len(attempts) // 2)
+    assert all(record["outcome"] in {"recovered", "no-op", "failed"}
+               for record in attempts[1::2])
+    checkpoint = installed_cli.inspect(run)["checkpoint"]
+    assert checkpoint["recovery_counter"] == len(attempts) // 2
+    assert checkpoint["recovery_digest"] == attempts[-1]["digest"]
     _assert_clean(installed_cli, run)
 
 
@@ -355,15 +439,9 @@ def test_installed_long_replay_bounded_checkpoint_and_audit_tampers(
         "journal-truncated": lambda p: p.write_bytes(p.read_bytes()[:-1]),
         "checkpoint-corrupt": lambda p: p.write_text("{}\n", encoding="utf-8"),
         "checkpoint-missing": lambda p: p.unlink(),
-        "lifecycle-corrupt": lambda p: p.write_text("{}\n", encoding="utf-8"),
-        "status-stale": lambda p: p.write_text("{}\n", encoding="utf-8"),
-        "runtime-mismatch": lambda p: p.write_text("{}\n", encoding="utf-8"),
-        "recovery-invalid": lambda p: p.write_text("{}\n", encoding="utf-8"),
     }
     names = {"journal-truncated": "transitions.journal", "checkpoint-corrupt": "checkpoint.json",
-             "checkpoint-missing": "checkpoint.json",
-             "lifecycle-corrupt": "lifecycle.jsonl", "status-stale": "status.json",
-             "runtime-mismatch": "runtime.json", "recovery-invalid": "recovery-attempts.jsonl"}
+             "checkpoint-missing": "checkpoint.json"}
     for label, mutate in cases.items():
         copy = tmp_path / f"tamper-{label}"
         shutil.copytree(run, copy)
@@ -397,11 +475,38 @@ def test_installed_restart_restore_soak_matches_uninterrupted(installed_cli: Ins
         committed = int(installed_cli.inspect(restarted)["checkpoint"]["cursor"])
         checkpoint_sizes.append((committed, (restarted / "checkpoint.json").stat().st_size))
         owner = installed_cli.popen("paper", "resume", str(restarted))
-    time.sleep(1.0)
+    # First true owner death is deliberately taken while next-open execution
+    # is carried across the restart boundary.
+    pending = _wait_checkpoint(
+        installed_cli, restarted,
+        lambda value: (value["cursor"] > checkpoint_sizes[-1][0]
+                       and value["execution"]["pending_order_id"] is not None))
     owner.kill(); owner.communicate(timeout=10)
+    assert owner.returncode == -signal.SIGKILL
+    frozen = installed_cli.inspect(restarted)["checkpoint"]
+    assert frozen == pending
     stalled = json.loads(installed_cli.run("paper", "status", str(restarted)).stdout)
     assert stalled["stalled"] is True
-    assert installed_cli.run("paper", "recover", str(restarted), timeout=45).returncode == 0
+    # Recovery is itself killed at a materially later committed cursor.  This
+    # proves a second real owner-death/recovery cycle, rather than repeatedly
+    # restoring the same cut.
+    recovery = installed_cli.popen("paper", "recover", str(restarted))
+    later = _wait_checkpoint(
+        installed_cli, restarted,
+        lambda value: value["cursor"] >= pending["cursor"] + 6)
+    recovery.kill(); recovery.communicate(timeout=10)
+    assert recovery.returncode == -signal.SIGKILL
+    assert later["cursor"] > pending["cursor"]
+    assert later["risk"]["peak_equity"] >= pending["risk"]["peak_equity"]
+    # Drawdown/account continuity is checkpoint authority at both intermediate
+    # cuts, not inferred only from terminal equality.
+    for value in (pending, later):
+        assert value["risk"]["drawdown"] >= 0
+        assert value["risk"]["peak_equity"] >= value["account"]["equity"]
+    stalled = json.loads(installed_cli.run("paper", "status", str(restarted)).stdout)
+    assert stalled["stalled"] is True
+    final_recovery = installed_cli.run("paper", "recover", str(restarted), timeout=45)
+    assert final_recovery.returncode == 0, final_recovery.stderr
 
     authority = installed_cli.inspect(restarted)
     committed = [record for record in authority["records"]
@@ -411,6 +516,7 @@ def test_installed_restart_restore_soak_matches_uninterrupted(installed_cli: Ins
         range(1, len(authority["records"]) + 1))
     assert len({record["product_transition_id"] for record in committed}) == 64
     assert checkpoint_sizes[0][0] < checkpoint_sizes[1][0]
+    assert checkpoint_sizes[1][0] < pending["cursor"] < later["cursor"]
     assert abs(checkpoint_sizes[1][1] - checkpoint_sizes[0][1]) < 2_000
     assert (restarted / "checkpoint.json").stat().st_size < 20_000
     _assert_product_equal(installed_cli, baseline, restarted)
@@ -463,7 +569,44 @@ def test_installed_audit_semantic_foreign_and_reordered_authority(
     shutil.copy2(foreign / "checkpoint.json", foreign_checkpoint / "checkpoint.json")
     (foreign_checkpoint / "status.json").write_text("{}\n")
 
-    for directory in (content, reordered, stale, foreign_checkpoint):
+    invalid_lifecycle = copied("lifecycle-invalid-lineage")
+    lifecycle_lines = (invalid_lifecycle / "lifecycle.jsonl").read_text().splitlines()
+    lifecycle_lines[-1], lifecycle_lines[-2] = lifecycle_lines[-2], lifecycle_lines[-1]
+    (invalid_lifecycle / "lifecycle.jsonl").write_text("\n".join(lifecycle_lines) + "\n")
+
+    mismatched_runtime = copied("runtime-foreign-identity")
+    runtime_doc = json.loads((mismatched_runtime / "runtime.json").read_text())
+    runtime_doc["config_sha256"] = "0" * 64
+    (mismatched_runtime / "runtime.json").write_text(
+        json.dumps(runtime_doc, sort_keys=True, separators=(",", ":")) + "\n")
+
+    stale_status = copied("status-foreign")
+    shutil.copy2(foreign / "status.json", stale_status / "status.json")
+
+    # Produce a real, schema-valid recovery chain, then reorder its start and
+    # outcome records.  This isolates semantic recovery lineage from generic
+    # malformed JSON rejection.
+    recovery_root = tmp_path / "recovery-authority"
+    reached = recovery_root / "reached"; release = recovery_root / "release"
+    recovery_root.mkdir()
+    owner, recovered = _launch(
+        installed_cli, recovery_root, "d" * 32, pace="0s", files=files,
+        extra={"QFS_RUNTIME_BOUNDARY": "durable:strategy_committed",
+               "QFS_RUNTIME_BOUNDARY_REACHED": str(reached),
+               "QFS_RUNTIME_BOUNDARY_RELEASE": str(release)})
+    _wait(reached); owner.kill(); owner.communicate(timeout=10)
+    result = installed_cli.run("paper", "recover", str(recovered), timeout=30)
+    assert result.returncode == 0, result.stderr
+    invalid_recovery = tmp_path / "recovery-invalid-lineage"
+    shutil.copytree(recovered, invalid_recovery)
+    recovery_lines = (invalid_recovery / "recovery-attempts.jsonl").read_text().splitlines()
+    assert len(recovery_lines) == 2
+    recovery_lines.reverse()
+    (invalid_recovery / "recovery-attempts.jsonl").write_text(
+        "\n".join(recovery_lines) + "\n")
+
+    for directory in (content, reordered, stale, foreign_checkpoint, invalid_lifecycle,
+                      mismatched_runtime, stale_status, invalid_recovery):
         result = installed_cli.run("paper", "audit", str(directory))
         assert result.returncode == 3
         assert result.stdout == "paper runtime audit: mismatch\n"
