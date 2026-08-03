@@ -105,6 +105,7 @@ class PortfolioLedger:
     _committed_identity: dict[str, _CommittedIdentity] = field(init=False, repr=False)
     _lock: RLock = field(init=False, repr=False)
     _transition_active: bool = field(init=False, repr=False)
+    _checkpoint_positions: dict[tuple[str, str], PositionSnapshot] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.event_bus, EventBus):
@@ -115,6 +116,7 @@ class PortfolioLedger:
         self._committed_identity = {}
         self._lock = RLock()
         self._transition_active = False
+        self._checkpoint_positions = {}
         _LEDGER_ANCHORS[self] = _LedgerAnchor(
             self._lock, ref(self.event_bus), self._committed_identity, {}, {})
 
@@ -202,8 +204,11 @@ class PortfolioLedger:
                     for field_name in _CommittedIdentity.__dataclass_fields__
                 )):
                     raise PortfolioLedgerError("identity commitment entry was replaced")
-            if set(self._positions) != set(self._history):
+            if set(self._positions) != set(self._history) | set(self._checkpoint_positions):
                 raise PortfolioLedgerError("position and history keys must match")
+            if any(key not in self._history and self._positions.get(key) is not value
+                   for key, value in self._checkpoint_positions.items()):
+                raise PortfolioLedgerError("checkpoint position authority changed")
             seen: dict[str, PositionUpdate] = {}
             for key, history in self._history.items():
                 if not isinstance(history, list) or not history:
@@ -218,8 +223,9 @@ class PortfolioLedger:
                     if current_key != key:
                         raise PortfolioLedgerError("history update key does not match its key")
                     if previous_update is None:
-                        if update.previous_position is not None:
-                            raise PortfolioLedgerError("first update must not have a previous position")
+                        baseline = self._checkpoint_positions.get(key)
+                        if update.previous_position is not baseline:
+                            raise PortfolioLedgerError("first update does not follow checkpoint position")
                     else:
                         if update.previous_position is not previous_update.current_position:
                             raise PortfolioLedgerError("history position identity chain is broken")
@@ -304,6 +310,16 @@ class PortfolioLedger:
     def snapshot(self) -> PortfolioSnapshot:
         with _anchor_for(self).lock:
             return self._make_snapshot(self._positions)
+
+    def restore_checkpoint(self, snapshot: PortfolioSnapshot) -> None:
+        """Install a validated bounded committed-position authority on a fresh ledger."""
+        snapshot.validate()
+        with _anchor_for(self).lock:
+            if self._positions or self._history or self._processed:
+                raise PortfolioLedgerError("checkpoint restore requires a fresh portfolio ledger")
+            restored = {(p.source, p.symbol): p for p in snapshot.positions}
+            self._positions.update(restored)
+            self._checkpoint_positions.update(restored)
 
     @staticmethod
     def _account(previous: PositionSnapshot | None,
