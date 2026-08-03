@@ -180,6 +180,18 @@ def _assert_clean(cli: InstalledCLI, run: Path, lifecycle: str = "COMPLETED") ->
     assert not list(run.glob(".*.tmp"))
 
 
+_RUNTIME_AUTHORITIES = (
+    "lifecycle.jsonl", "transitions.journal", "checkpoint.json",
+    "recovery-attempts.jsonl", "control-request.json", "status.json",
+)
+
+
+def _authority_bytes(run: Path) -> dict[str, bytes | None]:
+    """Snapshot authoritative and disposable runtime publications, including absence."""
+    return {name: path.read_bytes() if (path := run / name).exists() else None
+            for name in _RUNTIME_AUTHORITIES}
+
+
 def _product_core(document: dict[str, object]) -> dict[str, object]:
     """Remove only separately validated control-plane recovery metadata."""
     return {key: value for key, value in document.items()
@@ -230,26 +242,12 @@ def test_installed_operator_pause_resume_and_paused_stop(installed_cli: Installe
     status = installed_cli.run("paper", "status", str(run))
     assert status.returncode == 0 and json.loads(status.stdout)["consumer_owner"] == "live"
     # A live recovery/second consumer is rejected before authority mutation.
-    before = (run / "lifecycle.jsonl").read_bytes()
+    before = _authority_bytes(run)
     rejected = installed_cli.run("paper", "recover", str(run))
-    assert rejected.returncode == 2 and rejected.stdout == "" and rejected.stderr.startswith("error: ")
-    assert (run / "lifecycle.jsonl").read_bytes() == before
-    # This is a distinct installed consumer process, not the live-recover
-    # rejection above.  Reusing the deterministic run identity makes a second
-    # installed start target the live run and fail before any authority write.
-    config, replay = _files(tmp_path / "second-consumer-input")
-    contender_env = installed_cli.env | {
-        "QFS_RUNTIME_TEST_ROOT": str(tmp_path / "resume" / "runs"),
-        "QFS_RUNTIME_TEST_RUN_ID": "1" * 32,
-    }
-    contender = subprocess.run(
-        [str(installed_cli.console), "paper", "start", "--config", str(config),
-         "--replay", str(replay), "--pace", "1s"], cwd=installed_cli.cwd,
-        env=contender_env, text=True, capture_output=True, timeout=10)
-    assert contender.returncode == 2
-    assert contender.stdout == ""
-    assert contender.stderr == f"error: [Errno 17] File exists: '{run}'\n"
-    assert (run / "lifecycle.jsonl").read_bytes() == before
+    assert rejected.returncode == 2 and rejected.stdout == ""
+    assert rejected.stderr == f"error: run directory is already controlled by another writer: {run}\n"
+    assert _authority_bytes(run) == before
+    assert owner.poll() is None
     _eventually(installed_cli, "paper", "pause", str(run))
     output, error = owner.communicate(timeout=20)
     assert owner.returncode == 0, (output, error)
@@ -341,12 +339,17 @@ def test_installed_crash_recovery_golden_product_authority(
     owner.kill(); owner.communicate(timeout=10)
     first = installed_cli.run("paper", "recover", str(recovered), timeout=30)
     assert first.returncode == 0, first.stderr
-    # A terminal completed run rejects another invocation deterministically;
-    # recovery-of-recovery publication itself is covered by the physical suite.
-    assert installed_cli.run("paper", "recover", str(recovered)).returncode == 2
-
     _assert_product_equal(installed_cli, baseline, recovered)
     _assert_clean(installed_cli, recovered)
+    # Terminal controls must reject without changing any authority or disposable
+    # publication. Recovery-of-recovery publication is covered by the physical
+    # recovery-boundary matrix below.
+    terminal = _authority_bytes(recovered)
+    for command in ("resume", "recover"):
+        rejected = installed_cli.run("paper", command, str(recovered))
+        assert rejected.returncode == 2 and rejected.stdout == ""
+        assert rejected.stderr.startswith("error: completed runtime cannot be ")
+        assert _authority_bytes(recovered) == terminal
 
 
 def test_installed_recovery_of_recovery_has_deterministic_exit(installed_cli: InstalledCLI,
@@ -374,6 +377,7 @@ def test_installed_recovery_of_recovery_has_deterministic_exit(installed_cli: In
 
 
 @pytest.mark.parametrize("boundary", [
+    "recovery_started_durable",
     "recovery_outcome_durable",
     "checkpoint_temporary_written",
     "checkpoint_file_flush_completed",
@@ -388,6 +392,10 @@ def test_installed_recovery_publication_boundaries(
 ) -> None:
     """Installed recovery reconciles every outcome/commit publication cut."""
     files = _files(tmp_path / "inputs", fill_timing="current_close")
+    baseline_owner, baseline = _launch(
+        installed_cli, tmp_path / "baseline", "c" * 32, pace="0s", files=files)
+    baseline_owner.communicate(timeout=30)
+    assert baseline_owner.returncode == 0
     owner, run = _launch(
         installed_cli, tmp_path / "run", "c" * 32, pace="0s", files=files,
         extra={"QFS_RUNTIME_BOUNDARY": "durable:fill_committed",
@@ -411,7 +419,14 @@ def test_installed_recovery_publication_boundaries(
     checkpoint = installed_cli.inspect(run)["checkpoint"]
     assert checkpoint["recovery_counter"] == len(attempts) // 2
     assert checkpoint["recovery_digest"] == attempts[-1]["digest"]
+    _assert_product_equal(installed_cli, baseline, run)
     _assert_clean(installed_cli, run)
+    terminal = _authority_bytes(run)
+    for command in ("resume", "recover"):
+        rejected = installed_cli.run("paper", command, str(run))
+        assert rejected.returncode == 2 and rejected.stdout == ""
+        assert rejected.stderr.startswith("error: completed runtime cannot be ")
+        assert _authority_bytes(run) == terminal
 
 
 def test_installed_long_replay_bounded_checkpoint_and_audit_tampers(
