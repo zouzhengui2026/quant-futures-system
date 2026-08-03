@@ -48,6 +48,24 @@ class InstalledCLI:
                         "QFS_RUNTIME_BOUNDARY_RELEASE": str(release)})
         return self.popen("paper", "recover", str(run), env=env)
 
+    def continuation_contender(self, run: Path, provenance: Path) -> subprocess.CompletedProcess[str]:
+        """Enter the installed continuation consumer without using CLI prechecks."""
+        code = (
+            "import json,sys; from pathlib import Path; "
+            "import quant_futures.paper_runtime.control as c; "
+            "from quant_futures.paper_runtime.lock import RunLockError; "
+            "Path(sys.argv[2]).write_text(json.dumps({"
+            "'module':c.__file__,'python':sys.executable},sort_keys=True)); "
+            "\ntry: c.continue_runtime(Path(sys.argv[1]))"
+            "\nexcept RunLockError as exc:"
+            "\n sys.stderr.write(f'error: {exc}\\n'); raise SystemExit(73)"
+        )
+        return subprocess.run(
+            [str(self.python), "-c", code, str(run), str(provenance)],
+            cwd=self.cwd, env=self.env, text=True, capture_output=True,
+            timeout=30, check=False,
+        )
+
     def inspect(self, run: Path) -> dict[str, object]:
         """Read authority with the installed package, never the checkout."""
         code = (
@@ -238,16 +256,45 @@ def _assert_product_equal(cli: InstalledCLI, expected: Path, actual: Path) -> No
 
 def test_installed_operator_pause_resume_and_paused_stop(installed_cli: InstalledCLI,
                                                          tmp_path: Path) -> None:
-    owner, run = _launch(installed_cli, tmp_path / "resume", "1" * 32)
-    status = installed_cli.run("paper", "status", str(run))
-    assert status.returncode == 0 and json.loads(status.stdout)["consumer_owner"] == "live"
-    # A live recovery/second consumer is rejected before authority mutation.
+    owner_root = tmp_path / "resume"
+    reached, release = owner_root / "owner.reached", owner_root / "owner.release"
+    owner_root.mkdir()
+    owner, run = _launch(
+        installed_cli, owner_root, "1" * 32,
+        extra={"QFS_RUNTIME_BOUNDARY": "journal:strategy_committed",
+               "QFS_RUNTIME_BOUNDARY_REACHED": str(reached),
+               "QFS_RUNTIME_BOUNDARY_RELEASE": str(release)},
+    )
+    _wait(reached)
+    lifecycle = [json.loads(line)["state"]
+                 for line in (run / "lifecycle.jsonl").read_text().splitlines()]
+    assert lifecycle[-1] == "RUNNING"
+    # Live recovery remains its own required rejection case.
     before = _authority_bytes(run)
     rejected = installed_cli.run("paper", "recover", str(run))
     assert rejected.returncode == 2 and rejected.stdout == ""
     assert rejected.stderr == f"error: run directory is already controlled by another writer: {run}\n"
     assert _authority_bytes(run) == before
     assert owner.poll() is None
+
+    # A distinct installed helper enters continue_runtime() and contends on the
+    # lifetime consumer lease.  It is deliberately not another same-ID start,
+    # which would fail earlier at run-directory creation.
+    provenance_path = owner_root / "continuation-provenance.json"
+    before = _authority_bytes(run)
+    contender = installed_cli.continuation_contender(run, provenance_path)
+    assert contender.returncode == 73
+    assert contender.stdout == ""
+    assert contender.stderr == (
+        f"error: run directory is already controlled by another writer: {run}\n")
+    assert _authority_bytes(run) == before
+    provenance = json.loads(provenance_path.read_text())
+    assert Path(provenance["python"]).resolve() == installed_cli.python.resolve()
+    assert installed_cli.python.parent.parent.resolve() in Path(provenance["module"]).resolve().parents
+    assert installed_cli.repository.resolve() not in Path(provenance["module"]).resolve().parents
+    assert owner.poll() is None
+
+    release.touch()
     _eventually(installed_cli, "paper", "pause", str(run))
     output, error = owner.communicate(timeout=20)
     assert owner.returncode == 0, (output, error)
@@ -352,43 +399,20 @@ def test_installed_crash_recovery_golden_product_authority(
         assert _authority_bytes(recovered) == terminal
 
 
-def test_installed_recovery_of_recovery_has_deterministic_exit(installed_cli: InstalledCLI,
-                                                               tmp_path: Path) -> None:
-    files = _files(tmp_path / "inputs", fill_timing="current_close")
-    root = tmp_path / "crashed"; root.mkdir()
-    reached, release = root / "product.reached", root / "product.release"
-    owner, run = _launch(installed_cli, root, "8" * 32, pace="0s", files=files,
-                         extra={"QFS_RUNTIME_BOUNDARY": "durable:fill_committed",
-                                "QFS_RUNTIME_BOUNDARY_REACHED": str(reached),
-                                "QFS_RUNTIME_BOUNDARY_RELEASE": str(release)})
-    _wait(reached); owner.kill(); owner.communicate(timeout=10)
-    recovery_reached = run.parent / "recovery_started_durable.reached"
-    first = installed_cli.recover_process(run, boundary="recovery_started_durable")
-    _wait(recovery_reached); first.kill(); first.communicate(timeout=10)
-    assert first.returncode == -signal.SIGKILL
-    second = installed_cli.run("paper", "recover", str(run), timeout=30)
-    assert second.returncode == 0, second.stderr
-    records = [json.loads(line) for line in (run / "recovery-attempts.jsonl").read_text().splitlines()]
-    assert [record["outcome"] for record in records] == ["started", "failed", "started", "recovered"]
-    checkpoint = installed_cli.inspect(run)["checkpoint"]
-    assert checkpoint["recovery_counter"] == 2
-    assert checkpoint["recovery_digest"] == records[-1]["digest"]
-    _assert_clean(installed_cli, run)
-
-
-@pytest.mark.parametrize("boundary", [
-    "recovery_started_durable",
-    "recovery_outcome_durable",
-    "checkpoint_temporary_written",
-    "checkpoint_file_flush_completed",
-    "checkpoint_file_fsync_completed",
-    "checkpoint_atomic_replace_completed",
-    "checkpoint_directory_fsync_completed",
-    "checkpoint_post_directory_fsync_published",
-    "recovery_commitment_published",
+@pytest.mark.parametrize(("boundary", "expected_outcomes"), [
+    ("recovery_started_durable", ["started", "failed", "started", "recovered"]),
+    ("recovery_outcome_durable", ["started", "recovered", "started", "no-op"]),
+    ("checkpoint_temporary_written", ["started", "recovered", "started", "no-op"]),
+    ("checkpoint_file_flush_completed", ["started", "recovered", "started", "no-op"]),
+    ("checkpoint_file_fsync_completed", ["started", "recovered", "started", "no-op"]),
+    ("checkpoint_atomic_replace_completed", ["started", "recovered", "started", "no-op"]),
+    ("checkpoint_directory_fsync_completed", ["started", "recovered", "started", "no-op"]),
+    ("checkpoint_post_directory_fsync_published", ["started", "recovered", "started", "no-op"]),
+    ("recovery_commitment_published", ["started", "recovered", "started", "no-op"]),
 ])
 def test_installed_recovery_publication_boundaries(
     installed_cli: InstalledCLI, tmp_path: Path, boundary: str,
+    expected_outcomes: list[str],
 ) -> None:
     """Installed recovery reconciles every outcome/commit publication cut."""
     files = _files(tmp_path / "inputs", fill_timing="current_close")
@@ -413,9 +437,21 @@ def test_installed_recovery_publication_boundaries(
     assert [record["sequence"] for record in attempts] == list(range(1, len(attempts) + 1))
     assert all(record["previous_digest"] == (attempts[index - 1]["digest"] if index else None)
                for index, record in enumerate(attempts))
-    assert [record["outcome"] for record in attempts[::2]] == ["started"] * (len(attempts) // 2)
-    assert all(record["outcome"] in {"recovered", "no-op", "failed"}
-               for record in attempts[1::2])
+    assert [record["outcome"] for record in attempts] == expected_outcomes
+    lifecycle = [
+        (record["state"], record["reason"])
+        for record in map(json.loads, (run / "lifecycle.jsonl").read_text().splitlines())
+    ]
+    assert lifecycle == [
+        ("CREATED", "run created"),
+        ("STARTING", "start requested"),
+        ("RUNNING", "checkpoint-one control plane initialized"),
+        ("FAILED_RECOVERABLE", "incomplete durable product transition detected"),
+        ("RECOVERING", "recovery requested"),
+        ("RUNNING", "product authority recovered"),
+        ("STOPPING", "boundary-safe stop requested"),
+        ("COMPLETED", "final checkpoint committed"),
+    ]
     checkpoint = installed_cli.inspect(run)["checkpoint"]
     assert checkpoint["recovery_counter"] == len(attempts) // 2
     assert checkpoint["recovery_digest"] == attempts[-1]["digest"]
