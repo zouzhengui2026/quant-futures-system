@@ -102,7 +102,8 @@ def main(argv: list[str] | None = None) -> int:
                 coordinator = PaperTransitionCoordinator(
                     str(run_id), effective,
                     build_strategy(effective.strategy.name, effective.strategy.parameters),
-                    TransitionJournal(directory), failure_injector=_process_boundary_hook,
+                    TransitionJournal(directory, failure_injector=_process_boundary_hook),
+                    failure_injector=_process_boundary_hook,
                     data_fingerprint=f"sha256:{fingerprint}")
                 stop_flag = StopFlag(); stop_flag.install()
                 PaperRuntime(coordinator, pace_seconds=pace_seconds,
@@ -137,7 +138,8 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     paper_control.stop(args.run_directory)
             elif args.paper_command == "recover":
-                paper_control.recover(args.run_directory)
+                paper_control.recover(args.run_directory,
+                                      failure_injector=_process_boundary_hook)
                 paper_control.continue_runtime(args.run_directory, install_signals=True)
             else:
                 valid = paper_control.audit(args.run_directory)
