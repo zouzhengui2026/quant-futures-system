@@ -581,11 +581,19 @@ def audit(run_directory: str | Path) -> bool:
             if journal.tail is not None and product_protocol:
                 checkpoint = CheckpointStore(directory).read()
                 authority = checkpoint.get("journal")
+                # Validate the protected Product-state commitment independently
+                # of the disposable projection.  This catches type-valid edits
+                # to nested checkpoint authority as well as malformed bytes.
+                from .transition import _bounded_state_digest
+                state_digest = checkpoint.get("state_digest")
                 if (not isinstance(authority, dict)
                         or authority.get("sequence") != journal.tail.sequence
                         or authority.get("digest") != journal.tail.digest
                         or checkpoint.get("run_id") != lifecycle.current().run_id
-                        or authority.get("input_cursor") != journal.tail.input_cursor):
+                        or authority.get("input_cursor") != journal.tail.input_cursor
+                        or not isinstance(state_digest, str)
+                        or state_digest != _bounded_state_digest(checkpoint)
+                        or journal.tail.payload.get("state_digest") != state_digest):
                     return False
             elif checkpoint_path.exists() and journal.tail is None:
                 # A checkpoint without a committed product journal has no
